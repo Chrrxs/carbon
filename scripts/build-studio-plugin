@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+PLUGIN="${REPO}/studio-plugin"
+OUTPUT="${1:-${REPO}/target/Carbon.rbxm}"
+BUILD_VERSION="${CARBON_BUILD_VERSION:-$(${SCRIPT_DIR}/build-version)}"
+if [[ "$OUTPUT" != /* ]]; then
+	OUTPUT="${PWD}/${OUTPUT}"
+fi
+
+command -v wally >/dev/null 2>&1 || { echo "build-studio-plugin: wally is required" >&2; exit 2; }
+command -v rojo >/dev/null 2>&1 || { echo "build-studio-plugin: rojo is required" >&2; exit 2; }
+[[ "$BUILD_VERSION" =~ ^(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)\.([1-9][0-9]{4,5})$ ]] || {
+	echo "build-studio-plugin: invalid build version: $BUILD_VERSION" >&2
+	exit 2
+}
+
+stage="$(mktemp -d -t carbon-studio-plugin-XXXXXXXX)"
+cleanup() {
+	local exit_code=$?
+	trap - EXIT INT TERM
+	if [[ -d "$stage" && "$stage" == /tmp/carbon-studio-plugin-* ]]; then
+		rm -rf -- "$stage"
+	fi
+	exit "$exit_code"
+}
+trap cleanup EXIT INT TERM
+
+cp -a "${PLUGIN}/." "$stage/"
+sed -i "0,/^version = \"[^\"]*\"/s//version = \"${BUILD_VERSION}\"/" "$stage/wally.toml"
+mkdir -p "$(dirname "$OUTPUT")"
+(
+	cd "$stage"
+	wally install
+	rojo build default.project.json --output "$OUTPUT"
+)
+printf 'Built Carbon Studio plugin %s at %s\n' "$BUILD_VERSION" "$OUTPUT"

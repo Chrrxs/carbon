@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/lib/component-state.sh
+. "${SCRIPT_DIR}/lib/component-state.sh"
+
+die() {
+	echo "test-release-installer: $*" >&2
+	exit 1
+}
+
+root="$(mktemp -d -t carbon-release-installer-test-XXXXXXXX)"
+nested_root=""
+cleanup() {
+	if [[ -n "$root" && -d "$root" && "$root" == /tmp/carbon-release-installer-test-* ]]; then
+		rm -rf -- "$root"
+	fi
+	if [[ -n "$nested_root" && -d "$nested_root" && "$nested_root" == "${SCRIPT_DIR}/../qualification-artifacts/"fingerprint-tree-test-* ]]; then
+		rm -rf -- "$nested_root"
+	fi
+}
+trap cleanup EXIT INT TERM
+
+state_dir="${root}/state"
+artifact="${root}/qualified-carbon"
+target="${root}/bin/carbon"
+printf 'qualified-v1\n' > "$artifact"
+
+status="$(install_qualified_component "$artifact" "$target" 0755)"
+[[ "$status" == "updated" ]] || die "missing target was not updated"
+[[ "$(sha256sum "$artifact" | cut -d ' ' -f 1)" == "$(sha256sum "$target" | cut -d ' ' -f 1)" ]] ||
+	die "installed bytes differ from the qualified artifact"
+[[ "$(stat -c '%a' "$target")" == "755" ]] || die "installed CLI mode is not executable"
+
+unchanged_state="$(stat -c '%i:%y' "$target")"
+status="$(install_qualified_component "$artifact" "$target" 0755)"
+[[ "$status" == "up to date" ]] || die "identical target was unnecessarily reinstalled"
+[[ "$(stat -c '%i:%y' "$target")" == "$unchanged_state" ]] || die "up-to-date target metadata changed"
+
+printf 'qualified-v2\n' > "$artifact"
+status="$(install_qualified_component "$artifact" "$target" 0755)"
+[[ "$status" == "updated" ]] || die "stale target was not updated"
+[[ "$(sha256sum "$artifact" | cut -d ' ' -f 1)" == "$(sha256sum "$target" | cut -d ' ' -f 1)" ]] ||
+	die "updated bytes differ from the qualified artifact"
+
+runner="${root}/carbon-qualify"
+printf 'runner\n' > "$runner"
+write_component_stamp carbon source-fingerprint "$target" "$runner"
+component_is_current carbon source-fingerprint "$target" "$runner" || die "fresh component stamp was rejected"
+printf 'tampered\n' >> "$target"
+if component_is_current carbon source-fingerprint "$target" "$runner"; then
+	die "component stamp accepted a modified installed target"
+fi
+
+tree_artifact="${root}/qualified-rml"
+tree_target="${root}/state/rml/build"
+mkdir -p "${tree_artifact}/runtime"
+printf 'runtime-v1\n' > "${tree_artifact}/runtime/RML.Core.dll"
+tree_fingerprint="$(fingerprint_tree "$tree_artifact" .)"
+status="$(install_qualified_tree "$tree_artifact" "$tree_target" "$tree_fingerprint")"
+[[ "$status" == "updated" ]] || die "missing qualified tree was not installed"
+[[ "$(fingerprint_tree "$tree_target" .)" == "$tree_fingerprint" ]] || die "installed tree differs"
+tree_state="$(stat -c '%i:%y' "$tree_target")"
+status="$(install_qualified_tree "$tree_artifact" "$tree_target" "$tree_fingerprint")"
+[[ "$status" == "up to date" ]] || die "identical qualified tree was unnecessarily installed"
+[[ "$(stat -c '%i:%y' "$tree_target")" == "$tree_state" ]] || die "up-to-date tree metadata changed"
+printf 'runtime-v2\n' > "${tree_artifact}/runtime/RML.Core.dll"
+tree_fingerprint="$(fingerprint_tree "$tree_artifact" .)"
+status="$(install_qualified_tree "$tree_artifact" "$tree_target" "$tree_fingerprint")"
+[[ "$status" == "updated" ]] || die "stale qualified tree was not updated"
+[[ "$(fingerprint_tree "$tree_target" .)" == "$tree_fingerprint" ]] || die "updated tree differs"
+
+# Ignored artifact directories below the Carbon repository still resolve the
+# repository's HEAD. Their fingerprints must cover their own bytes rather than
+# incorrectly hashing an empty Git pathspec.
+mkdir -p "${SCRIPT_DIR}/../qualification-artifacts"
+nested_root="$(mktemp -d "${SCRIPT_DIR}/../qualification-artifacts/fingerprint-tree-test-XXXXXXXX")"
+printf 'nested-artifact\n' > "${nested_root}/bundle.dll"
+nested_fingerprint="$(fingerprint_tree "$nested_root" .)"
+[[ "$nested_fingerprint" != "$(printf '' | sha256sum | cut -d ' ' -f 1)" ]] ||
+	die "ignored nested artifact tree was fingerprinted as empty"
+
+echo "PASS: qualified component installer updates only stale targets"

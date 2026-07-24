@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  checks:
+    name: Pull Request Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Lint Rust
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Format Rust
+        run: cargo fmt --all -- --check
+      - name: Install pinned Rust advisory scanner
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit Rust dependencies
+        run: cargo audit --deny unsound --deny yanked
+      - name: Test Rust
+        run: cargo test --locked --all-targets --verbose
+      - name: Validate release suite
+        run: cargo run --locked --bin carbon-qualify -- validate qualification/suites/carbon-release.json
+      - name: Test repository workflows
+        run: |
+          ./scripts/test-build-optimization
+          ./scripts/test-rml-build-optimization
+          ./scripts/test-release-installer
+          ./scripts/test-release-workflow
+          ./scripts/test-public-readiness
+          ./scripts/test-production-readiness-isolation
+          ./scripts/test-change-workflow
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: "10.0.302"
+      - name: Test managed RML
+        run: |
+          dotnet test rml/code/dotnet/Runtime/Runtime.slnx -c Release --nologo
+          dotnet test rml/code/dotnet/Roblox/Roblox.slnx -c Release --nologo
+          dotnet test rml/code/dotnet/CarbonBridge.Tests/CarbonBridge.Tests.csproj -c Release --nologo
+
+      - name: Install Rokit
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/rokit-install.sh"
+          curl -sSfL \
+            https://raw.githubusercontent.com/rojo-rbx/rokit/2f2618428ef31279e2fc80b0b1d73485bc929ddd/scripts/install.sh \
+            -o "$installer"
+          echo "4f180e0e19494c02085d43765f731d03e1ae172e00dfcce0a56fbd6598a40b30  $installer" |
+            sha256sum --check
+          bash "$installer"
+          echo "$HOME/.rokit/bin" >> "$GITHUB_PATH"
+      - name: Install plugin toolchain
+        working-directory: studio-plugin
+        run: rokit install --no-trust-check
+      - name: Verify generated reflection database
+        working-directory: studio-plugin
+        run: lune run scripts/generate-database.luau -- --check
+      - name: Lint Studio plugin
+        working-directory: studio-plugin
+        run: selene src
+      - name: Format Studio plugin
+        working-directory: studio-plugin
+        run: stylua src scripts --check
+      - name: Build automatically versioned plugin
+        run: ./scripts/build-studio-plugin target/Carbon.rbxm

@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CHANGE="${SCRIPT_DIR}/change"
+# shellcheck source=scripts/lib/release-receipt.sh
+. "${SCRIPT_DIR}/lib/release-receipt.sh"
+# shellcheck source=scripts/lib/component-state.sh
+. "${SCRIPT_DIR}/lib/component-state.sh"
+# shellcheck source=scripts/lib/change-workflow.sh
+. "${SCRIPT_DIR}/lib/change-workflow.sh"
+
+die() {
+	echo "test-change-workflow: $*" >&2
+	exit 1
+}
+
+[[ -x "$CHANGE" ]] || die "scripts/change is not executable"
+
+help="$($CHANGE --help)"
+for command in red qualify status merge; do
+	grep -q "  $command" <<< "$help" || die "scripts/change help does not expose $command"
+done
+
+root="$(mktemp -d -t carbon-change-workflow-test-XXXXXXXX)"
+cleanup() {
+	if [[ -n "$root" && -d "$root" && "$root" == /tmp/carbon-change-workflow-test-* ]]; then
+		rm -rf -- "$root"
+	fi
+}
+trap cleanup EXIT INT TERM
+
+install_workflow() {
+	local repo="$1"
+	mkdir -p "${repo}/scripts"
+	ln -s "$CHANGE" "${repo}/scripts/change"
+	ln -s "${SCRIPT_DIR}/lib" "${repo}/scripts/lib"
+}
+
+init_repo() {
+	local repo="$1"
+	git init -q -b main "$repo"
+	git -C "$repo" config user.name Carbon
+	git -C "$repo" config user.email carbon@example.invalid
+	install_workflow "$repo"
+	printf '/scripts\n' >> "${repo}/.git/info/exclude"
+	printf 'baseline\n' > "${repo}/feature.txt"
+	git -C "$repo" add feature.txt
+	git -C "$repo" commit -qm baseline
+}
+
+expect_failure() {
+	local output="$1"
+	shift
+	set +e
+	"$@" > "$output" 2>&1
+	local exit_code=$?
+	set -e
+	((exit_code != 0)) || die "command unexpectedly succeeded: $*"
+}
+
+state="${root}/state"
+red_repo="${root}/red-repo"
+init_repo "$red_repo"
+printf 'failing regression\n' >> "${red_repo}/feature.txt"
+CARBON_CHANGE_STATE_DIR="$state" "${red_repo}/scripts/change" red -- bash -c 'echo expected-red; exit 9' >/dev/null
+red_record="${state}/worktrees/$(change_worktree_key "$red_repo")/red.json"
+[[ -f "$red_record" ]] || die "red did not create a worktree record"
+jq -e '.outcome == "expected-failure" and .exit_code == 9 and (.command | length == 3)' "$red_record" >/dev/null ||
+	die "red record does not attest the focused failure"
+status="$(CARBON_CHANGE_STATE_DIR="$state" "${red_repo}/scripts/change" status)"
+grep -q 'RED RECORDED' <<< "$status" || die "status did not report the red state"
+grep -q 'UNQUALIFIED TREE' <<< "$status" || die "status did not reject an unqualified tree"
+
+write_receipt() {
+	local repo="$1"
+	local revision="$2"
+	local fingerprint
+	local evidence
+	local phases='[]'
+	fingerprint="$(revision_tree_fingerprint "$repo" "$revision")"
+	evidence="${state}/evidence/${fingerprint}"
+	mkdir -p "$evidence" "${state}/receipts"
+	printf 'expected failure\n' > "${evidence}/red.log"
+	printf 'candidate\n' > "${evidence}/carbon"
+	printf 'qualifier\n' > "${evidence}/carbon-qualify"
+	printf 'plugin\n' > "${evidence}/Carbon.rbxm"
+	mkdir -p "${evidence}/rml"
+	printf 'rml\n' > "${evidence}/rml/runtime.dll"
+	printf '{"outcome":"pass"}\n' > "${evidence}/report.json"
+	printf '{"suite":"test"}\n' > "${evidence}/suite.json"
+	for phase in "${CHANGE_REQUIRED_PHASES[@]}"; do
+		printf 'PASS: %s\n' "$phase" > "${evidence}/${phase}.log"
+		phases="$(jq \
+			--arg id "$phase" \
+			--arg path "${evidence}/${phase}.log" \
+			--arg sha256 "$(sha256sum "${evidence}/${phase}.log" | cut -d ' ' -f 1)" \
+			'. + [{id: $id, outcome: "pass", log: {path: $path, sha256: $sha256}}]' <<< "$phases")"
+	done
+	jq -n \
+		--arg qualified_at "2026-01-01T00:00:00Z" \
+		--arg fingerprint "$fingerprint" \
+		--arg plan_sha256 "$(change_plan_fingerprint)" \
+		--arg suite_path "${evidence}/suite.json" \
+		--arg suite_sha256 "$(sha256sum "${evidence}/suite.json" | cut -d ' ' -f 1)" \
+		--arg candidate_path "${evidence}/carbon" \
+		--arg candidate_sha256 "$(sha256sum "${evidence}/carbon" | cut -d ' ' -f 1)" \
+		--arg qualifier_path "${evidence}/carbon-qualify" \
+		--arg qualifier_sha256 "$(sha256sum "${evidence}/carbon-qualify" | cut -d ' ' -f 1)" \
+		--arg plugin_path "${evidence}/Carbon.rbxm" \
+		--arg plugin_sha256 "$(sha256sum "${evidence}/Carbon.rbxm" | cut -d ' ' -f 1)" \
+		--arg rml_path "${evidence}/rml" \
+		--arg rml_sha256 "$(fingerprint_tree "${evidence}/rml" .)" \
+		--arg report_path "${evidence}/report.json" \
+		--arg report_sha256 "$(sha256sum "${evidence}/report.json" | cut -d ' ' -f 1)" \
+		--arg red_path "${evidence}/red.log" \
+		--arg red_sha256 "$(sha256sum "${evidence}/red.log" | cut -d ' ' -f 1)" \
+		--argjson phases "$phases" \
+		'{
+			schema_version: 5,
+			outcome: "pass",
+			qualified_at: $qualified_at,
+			tree_fingerprint: {kind: "git-tree-content-v1", sha256: $fingerprint},
+			source_fingerprint: {kind: "working-tree-content-v1", sha256: "product"},
+			suite: {path: $suite_path, sha256: $suite_sha256},
+			candidate: {path: $candidate_path, sha256: $candidate_sha256, version: "0.0.0+build.test", target: "test"},
+			components: {
+				carbon_cli: {
+					artifact_path: $candidate_path,
+					artifact_sha256: $candidate_sha256,
+					qualification_runner_path: $qualifier_path,
+					qualification_runner_sha256: $qualifier_sha256
+				},
+				studio_plugin: {source_path: "studio-plugin", artifact_path: $plugin_path, artifact_sha256: $plugin_sha256},
+				rml: {artifact_path: $rml_path, artifact_sha256: $rml_sha256, artifact_file_count: 1}
+			},
+			report: {path: $report_path, sha256: $report_sha256},
+			workflow: {
+				plan_sha256: $plan_sha256,
+				red: {outcome: "expected-failure", exit_code: 9, log: {path: $red_path, sha256: $red_sha256}},
+				phases: $phases
+			}
+		}' > "${state}/receipts/${fingerprint}.json"
+}
+
+merge_repo="${root}/merge-repo"
+init_repo "$merge_repo"
+git -C "$merge_repo" switch -q -c feature
+printf 'implemented\n' >> "${merge_repo}/feature.txt"
+dirty_fingerprint="$(repository_tree_fingerprint "$merge_repo")"
+git -C "$merge_repo" commit -qam feature
+committed_fingerprint="$(revision_tree_fingerprint "$merge_repo" feature)"
+[[ "$dirty_fingerprint" == "$committed_fingerprint" ]] ||
+	die "committing identical qualified bytes changed the complete-tree fingerprint"
+feature_commit="$(git -C "$merge_repo" rev-parse feature)"
+write_receipt "$merge_repo" feature
+git -C "$merge_repo" switch -q main
+CARBON_CHANGE_STATE_DIR="$state" "${merge_repo}/scripts/change" merge feature >/dev/null
+[[ "$(git -C "$merge_repo" rev-parse HEAD)" == "$feature_commit" ]] ||
+	die "qualified branch was not fast-forwarded"
+
+git -C "$merge_repo" switch -q -c docs-change
+write_receipt "$merge_repo" docs-change
+mkdir -p "${merge_repo}/docs"
+printf 'changed after qualification\n' > "${merge_repo}/docs/workflow.md"
+git -C "$merge_repo" add docs/workflow.md
+git -C "$merge_repo" commit -qm 'change docs after qualification'
+git -C "$merge_repo" switch -q main
+expect_failure "${root}/docs-change.out" env CARBON_CHANGE_STATE_DIR="$state" "${merge_repo}/scripts/change" merge docs-change
+grep -q 'no passing receipt' "${root}/docs-change.out" ||
+	die "merge did not explain that the complete changed tree lacked a receipt"
+
+git -C "$merge_repo" switch -q -c diverged
+printf 'branch\n' > "${merge_repo}/diverged.txt"
+git -C "$merge_repo" add diverged.txt
+git -C "$merge_repo" commit -qm diverged
+write_receipt "$merge_repo" diverged
+git -C "$merge_repo" switch -q main
+printf 'main\n' > "${merge_repo}/main.txt"
+git -C "$merge_repo" add main.txt
+git -C "$merge_repo" commit -qm 'advance main'
+expect_failure "${root}/diverged.out" env CARBON_CHANGE_STATE_DIR="$state" "${merge_repo}/scripts/change" merge diverged
+grep -q 'not a fast-forward' "${root}/diverged.out" || die "merge did not reject a divergent branch"
+
+echo "PASS: red records, full-tree receipts, and qualified fast-forward merges are enforced"

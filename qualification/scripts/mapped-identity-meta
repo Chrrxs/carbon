@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+operation="${1:-}"
+meta_path="${2:-}"
+backup_path="${3:-}"
+
+[[ -n "$operation" && -n "$meta_path" ]] || {
+	echo "usage: mapped-identity-meta OPERATION META_PATH [BACKUP_PATH]" >&2
+	exit 2
+}
+
+verify_identity() {
+	jq -e '.id | type == "string" and length > 0' "$meta_path" >/dev/null
+}
+
+replace_meta() {
+	local filter="$1"
+	local temporary
+	temporary="$(mktemp "${meta_path}.qualification.XXXXXX")"
+	trap 'rm -f -- "$temporary"' RETURN
+	jq "$filter" "$meta_path" > "$temporary"
+	mv -f -- "$temporary" "$meta_path"
+	trap - RETURN
+}
+
+case "$operation" in
+	verify-and-backup)
+		[[ -n "$backup_path" ]] || {
+			echo "verify-and-backup requires a backup path" >&2
+			exit 2
+		}
+		verify_identity
+		mkdir -p -- "$(dirname "$backup_path")"
+		cp -- "$meta_path" "$backup_path"
+		echo "mapped identity metadata persisted and backed up"
+		;;
+	verify-generator-and-backup)
+		[[ -n "$backup_path" ]] || {
+			echo "verify-generator-and-backup requires a backup path" >&2
+			exit 2
+		}
+		verify_identity
+		jq -e '.attributes.CarbonQualificationMetadata == "preserved"' "$meta_path" >/dev/null
+		[[ -f "$(dirname "$meta_path")/init.luau" ]]
+		grep -F 'Generator.OnGenerate' "$(dirname "$meta_path")/init.luau" >/dev/null
+		mkdir -p -- "$(dirname "$backup_path")"
+		cp -- "$meta_path" "$backup_path"
+		echo "procedural generator identity appended without replacing metadata"
+		;;
+	remove)
+		verify_identity
+		replace_meta 'del(.id)'
+		jq -e 'has("id") | not' "$meta_path" >/dev/null
+		echo "mapped identity removed for strict build probe"
+		;;
+	restore)
+		[[ -n "$backup_path" && -f "$backup_path" ]] || {
+			echo "restore requires an existing backup path" >&2
+			exit 2
+		}
+		cp -- "$backup_path" "$meta_path"
+		verify_identity
+		echo "mapped identity restored"
+		;;
+	restore-if-present)
+		if [[ -n "$backup_path" && -f "$backup_path" ]]; then
+			cp -- "$backup_path" "$meta_path"
+			verify_identity
+		fi
+		echo "mapped identity cleanup complete"
+		;;
+	*)
+		echo "unknown mapped identity metadata operation: $operation" >&2
+		exit 2
+		;;
+esac

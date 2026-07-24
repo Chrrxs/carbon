@@ -1,0 +1,14 @@
+[package]
+name = "chrrxs/carbon"
+authors = ["Dervex", "Chrrxs"]
+description = "Studio companion for Carbon's filesystem and capture workflow"
+registry = "https://github.com/UpliftGames/wally-index"
+license = "MIT"
+version = "0.0.0"
+realm = "shared"
+private = true
+
+[dependencies]
+Fusion = "dervexhero/fusion-03-dev@0.3.0-dev.1"
+Promise = "lukadev-0/typed-promise@4.0.2"
+Highlighter = "boatbomber/highlighter@0.9.0"

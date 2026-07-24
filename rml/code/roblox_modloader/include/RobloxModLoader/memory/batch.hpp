@@ -1,0 +1,125 @@
+#pragma once
+
+#ifndef NOMINMAX
+	#define NOMINMAX
+#endif
+
+#ifndef WIN32_LEAN_AND_MEAN
+	#define WIN32_LEAN_AND_MEAN
+#endif
+
+#if defined(_WIN32)
+	#include <windows.h>
+#endif
+
+#include "RobloxModLoader/logger/logger.hpp"
+#include "pattern.hpp"
+#include "range.hpp"
+#include "signature.hpp"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <vector>
+
+namespace rml::memory
+{
+	template<size_t N>
+	struct batch
+	{
+		std::array<signature, N> m_entries;
+
+		constexpr batch(std::array<signature, N> entries)
+		{
+			m_entries = entries;
+		}
+	};
+
+	template<size_t N>
+	struct batch_and_hash
+	{
+		batch<N> m_batch;
+		uint32_t m_hash;
+	};
+
+	struct signature_hasher
+	{
+		static inline constexpr uint32_t FNV_PRIME_32 = 16777619u;
+		static inline constexpr uint32_t FNV_OFFSET_32 = 2166136261u;
+
+		static inline constexpr uint32_t fnv1a_32(const char* str, uint32_t hash = FNV_OFFSET_32) noexcept
+		{
+			return (str[0] == '\0') ? hash : fnv1a_32(&str[1], (hash ^ static_cast<uint32_t>(str[0])) * FNV_PRIME_32);
+		}
+
+		static inline constexpr uint32_t compute_hash(const signature& sig, uint32_t hash)
+		{
+			hash = fnv1a_32(sig.m_ida, hash);
+
+			return hash;
+		}
+	};
+
+	template<size_t N>
+	static inline constexpr auto make_batch(std::array<signature, N> entries)
+	{
+		uint32_t hash = signature_hasher::FNV_OFFSET_32;
+		for (const auto& entry : entries)
+			hash = signature_hasher::compute_hash(entry, hash);
+		return batch_and_hash<N>{memory::batch<N>(entries), hash};
+	}
+
+	struct batch_runner
+	{
+		inline static std::mutex s_entry_mutex;
+		inline static std::vector<std::future<bool>> g_futures;
+
+		template<size_t N>
+		inline static bool run(const memory::batch<N> batch, range region)
+		{
+			for (auto& entry : batch.m_entries)
+			{
+				g_futures.emplace_back(std::async(&scan_pattern_and_execute_callback, region, entry));
+			}
+
+			bool found_all_patterns = true;
+			for (auto& future : g_futures)
+			{
+				future.wait();
+
+				if (!future.get())
+					found_all_patterns = false;
+			}
+
+			g_futures.clear();
+
+			return found_all_patterns;
+		}
+
+		inline static bool scan_pattern_and_execute_callback(range region, signature entry)
+		{
+			if (auto result = region.scan(entry.m_ida); result.has_value())
+			{
+				if (entry.m_on_signature_found)
+				{
+					std::lock_guard<std::mutex> lock(s_entry_mutex); // Acquire a lock on the mutex to synchronize access.
+
+					std::invoke(std::move(entry.m_on_signature_found), result.value());
+
+					LOG_INFO("Found '{}' RobloxStudioBeta.exe+0x{:X}",
+					    entry.m_name,
+					    result.value().as<DWORD64>() - region.begin().as<DWORD64>());
+
+					return true;
+				}
+			}
+
+			LOG_INFO("Failed to find '{}'.", entry.m_name);
+
+			return false;
+		}
+	};
+}

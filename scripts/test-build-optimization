@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+BUILD_SCRIPT="${REPO}/cli/build.rs"
+
+failure=0
+
+if grep -Eq 'println!.*\.git/HEAD' "$BUILD_SCRIPT"; then
+	echo "FAIL: Cargo watches a nonexistent .git/HEAD inside linked worktrees" >&2
+	failure=1
+fi
+
+if ! cargo test --locked -p carbon \
+	project::tests::hybrid_build_reuses_written_composite_tree_without_changing_output -- --exact; then
+	failure=1
+fi
+
+if ! cargo test --locked -p carbon \
+	project::tests::hybrid_build_preserves_capture_attestation_and_seeds_managed_cache -- --exact; then
+	failure=1
+fi
+
+if ! cargo test --locked -p carbon \
+	project::tests::direct_build_cache_is_invalidated_by_the_validated_artifact_generation -- --exact; then
+	failure=1
+fi
+
+if ((failure != 0)); then
+	exit "$failure"
+fi
+
+echo "PASS: linked-worktree builds are fresh; capture, Source-only, and transport-only builds avoid redundant full reloads"

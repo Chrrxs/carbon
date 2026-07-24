@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+extra_args=()
+case "$1" in
+	watch)
+		extra_args=(
+			-ForbiddenProcessId "$3"
+			-ReadyPath "$(wslpath -w "$4")"
+			-DonePath "$(wslpath -w "$5")"
+		)
+		;;
+	wait)
+		extra_args=(-ReadyPath "$(wslpath -w "$3")")
+		;;
+	signal)
+		extra_args=(-DonePath "$(wslpath -w "$3")")
+		;;
+esac
+
+exec powershell.exe \
+	-NoProfile \
+	-NonInteractive \
+	-ExecutionPolicy Bypass \
+	-File "$(wslpath -w "${SCRIPT_DIR}/studio-foreground.ps1")" \
+	-Action "$1" \
+	-StudioProcessId "$2" \
+	"${extra_args[@]}"

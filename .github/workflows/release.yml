@@ -1,0 +1,51 @@
+name: Verify Qualified Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Published Qualified Bytes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the published executable identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)\.([1-9][0-9]{4,5})$ ]]; then
+            echo "release tag must be vYY.M.DHHMM" >&2
+            exit 1
+          fi
+
+          version="${TAG#v}"
+          short_year=$((10#${BASH_REMATCH[1]}))
+          month=$((10#${BASH_REMATCH[2]}))
+          stamp="${BASH_REMATCH[3]}"
+          day_length=$((${#stamp} - 4))
+          day=$((10#${stamp:0:day_length}))
+          hour=$((10#${stamp:day_length:2}))
+          minute=$((10#${stamp:day_length + 2:2}))
+          [[ "$version" == "$(printf '%d.%d.%d%02d%02d' \
+            "$short_year" "$month" "$day" "$hour" "$minute")" ]]
+          instant="$(printf '20%02d-%02d-%02dT%02d:%02d' \
+            "$short_year" "$month" "$day" "$hour" "$minute")"
+          [[ "$(TZ=America/New_York date -d "$instant" '+%Y-%m-%dT%H:%M')" == "$instant" ]]
+
+          mapfile -t assets < <(
+            gh release view "$TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name'
+          )
+          asset_name="carbon-${version}-linux-x86_64.gz"
+          [[ "${#assets[@]}" == 1 && "${assets[0]}" == "$asset_name" ]]
+          gh release download "$TAG" --repo "$REPOSITORY" --pattern "$asset_name"
+          gzip --test "$asset_name"
+          gzip -dc "$asset_name" > carbon
+          chmod 0755 carbon
+          [[ "$(./carbon --color never --version | awk '{print $NF}')" == "$version" ]]

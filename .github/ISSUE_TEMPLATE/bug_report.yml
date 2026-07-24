@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible Carbon defect
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove private place content, credentials, and tokens from all logs and examples.
+  - type: input
+    id: version
+    attributes:
+      label: Carbon version
+      description: Paste the output of `carbon --version` or provide the commit SHA.
+      placeholder: 26.7.231935
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Windows 11 with WSL2
+        - Windows 10 with WSL2
+        - Unsupported or development-only environment
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest safe project, commands, and steps that reproduce the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Paste sanitized CLI, Studio, or RML output. Do not include secrets or private place content.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials, tokens, and private place content.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

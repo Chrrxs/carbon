@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+
+die() {
+	echo "test-release-workflow: $*" >&2
+	exit 1
+}
+
+[[ -f "${SCRIPT_DIR}/lib/release-artifact.sh" ]] || die "qualified release artifact library is missing"
+# shellcheck source=scripts/lib/release-artifact.sh
+. "${SCRIPT_DIR}/lib/release-artifact.sh"
+
+(
+	cd "$REPO"
+	cargo test --locked -p carbon 'rml::tests::bundled_rml_files'
+)
+
+[[ -f "${SCRIPT_DIR}/lib/release-version.sh" ]] || die "release version library is missing"
+# shellcheck source=scripts/lib/release-version.sh
+. "${SCRIPT_DIR}/lib/release-version.sh"
+
+build_version="$(CARBON_BUILD_TIMESTAMP=2026-07-23T19:35 "${SCRIPT_DIR}/build-version")"
+[[ "$build_version" == "26.7.231935" ]] ||
+	die "automatic build version is not the expected Eastern timestamp: $build_version"
+build_identity="$(CARBON_BUILD_TIMESTAMP=2026-07-23T19:35 "${SCRIPT_DIR}/build-identity")"
+[[ "$build_identity" =~ ^0\.0\.0\+build\.[0-9a-f]{12}$ ]] ||
+	die "hidden build identity is not content-derived: $build_identity"
+[[ "$(release_version_from_build "$build_version")" == "26.7.231935" ]] ||
+	die "public timestamp version was not derived from the build version"
+[[ "$(canonical_release_tag "$build_version")" == "v26.7.231935" ]] ||
+	die "timestamp tag was not canonicalized"
+[[ "$(release_version_from_tag v26.7.231935)" == "$build_version" ]] ||
+	die "release tag did not recover the product version"
+for invalid in v26.7.231935 26.07.231935 26.7.0231935 26.13.231935 26.7.321935 26.7.232435 26.7.231960; do
+	if canonical_release_tag "$invalid" >/dev/null 2>&1; then
+		die "invalid timestamp release version was accepted: $invalid"
+	fi
+done
+
+help="$(${SCRIPT_DIR}/release --help)"
+grep -Fq 'scripts/release [options]' <<< "$help" || die "release help still requires a public version"
+grep -q './scripts/release' <<< "$help" || die "release help does not expose the one-command path"
+grep -q 'Eastern build timestamp' <<< "$help" || die "release help does not explain automatic timestamp versions"
+grep -q 'Rokit-compatible gzip asset' <<< "$help" ||
+	die "release help does not promise a Rokit-compatible gzip asset"
+
+artifact_root="$(mktemp -d -t carbon-release-artifact-test-XXXXXXXX)"
+cleanup() {
+	if [[ -n "$artifact_root" && -d "$artifact_root" && "$artifact_root" == /tmp/carbon-release-artifact-test-* ]]; then
+		rm -rf -- "$artifact_root"
+	fi
+}
+trap cleanup EXIT INT TERM
+
+candidate="${artifact_root}/qualified-carbon"
+receipt="${artifact_root}/receipt.json"
+first="${artifact_root}/first"
+second="${artifact_root}/second"
+printf '#!/usr/bin/env bash\nprintf "carbon 26.7.231935\\n"\n' > "$candidate"
+chmod 0755 "$candidate"
+candidate_sha256="$(sha256sum "$candidate" | cut -d ' ' -f 1)"
+jq -n \
+	--arg qualified_at "2026-07-23T00:00:00Z" \
+	--arg candidate_path "$candidate" \
+	--arg candidate_sha256 "$candidate_sha256" \
+	'{
+		schema_version: 5,
+		outcome: "pass",
+		qualified_at: $qualified_at,
+		source_fingerprint: {sha256: "source"},
+		candidate: {
+			path: $candidate_path,
+			sha256: $candidate_sha256,
+			version: "26.7.231935",
+			target: "x86_64-unknown-linux-gnu"
+		}
+	}' > "$receipt"
+
+asset_name="$(qualified_release_asset_name "26.7.231935")"
+[[ "$asset_name" == "carbon-26.7.231935-linux-x86_64.gz" ]] ||
+	die "release asset name is not Rokit-compatible: $asset_name"
+prepare_qualified_release_asset "$candidate" "$receipt" "$first"
+prepare_qualified_release_asset "$candidate" "$receipt" "$second"
+
+gzip -dc "${first}/${asset_name}" | cmp -s - "$candidate" ||
+	die "release asset does not contain the exact qualified executable"
+cmp -s "${first}/${asset_name}" "${second}/${asset_name}" ||
+	die "identical qualified bytes did not produce an identical gzip asset"
+[[ "$(find "$first" -maxdepth 1 -type f -printf '%f\n')" == "$asset_name" ]] ||
+	die "release staging does not contain exactly one Rokit-compatible asset"
+
+workflow="${REPO}/.github/workflows/release.yml"
+grep -Fq 'types: [published]' "$workflow" || die "release verification is not driven by publication"
+grep -Fq 'gh release download' "$workflow" || die "release verification does not inspect published assets"
+grep -Fq 'linux-x86_64.gz' "$workflow" || die "release verification does not select the Rokit-compatible asset"
+grep -Fq 'gzip -dc' "$workflow" || die "release verification does not inspect the compressed executable"
+if grep -Eq 'release\\.json|SHA256SUMS|\\.zip|cargo build|build-rml|CARBON_RML_BUNDLE|windows-latest|curl .*\| *bash' "$workflow"; then
+	die "release workflow still rebuilds or bootstraps mutable release inputs"
+fi
+grep -Fq 'prepare_qualified_release_asset' "${SCRIPT_DIR}/release" ||
+	die "release command does not stage the qualified executable as a Rokit-compatible asset"
+grep -Fq 'gh release create' "${SCRIPT_DIR}/release" ||
+	die "release command does not publish the qualified executable"
+if grep -Eq 'release\\.json|SHA256SUMS|\\.zip' "${SCRIPT_DIR}/release" "${SCRIPT_DIR}/lib/release-artifact.sh"; then
+	die "release command still produces sidecar or zip assets"
+fi
+
+if grep -R -Eq 'GIT_TAG +(master|main)|/archive/(master|main)|/rokit/main/' \
+	"${REPO}/rml/cmake" "${REPO}/.github/workflows"; then
+	die "release inputs still follow a mutable branch"
+fi
+for dependency in minhook spdlog toml polyhooks tracy; do
+	grep -Eq 'GIT_TAG +[0-9a-f]{40}' "${REPO}/rml/cmake/${dependency}.cmake" ||
+		die "${dependency} is not pinned to a full commit"
+done
+grep -Fq 'URL_HASH' "${REPO}/rml/cmake/zlib.cmake" ||
+	die "zlib wrapper archive is not content verified"
+grep -Fq 'URL_HASH' "${REPO}/rml/cmake/json.cmake" ||
+	die "JSON archive is not content verified"
+grep -Fq 'EXPECTED_HASH' "${REPO}/rml/cmake/cpm.cmake" ||
+	die "CPM bootstrap is not content verified"
+grep -Fq 'EXPECTED_HASH' "${REPO}/rml/cmake/dotnet_hosting.cmake" ||
+	die ".NET hosting downloads are not content verified"
+if grep -Fq 'https://dot.net/v1/dotnet-install.ps1' "${REPO}/scripts/build-rml.ps1"; then
+	die "RML build still bootstraps the mutable .NET installer"
+fi
+grep -Fq 'dotnet-sdk-10.0.302-win-x64.zip' "${REPO}/scripts/build-rml.ps1" ||
+	die "RML build does not pin the exact .NET SDK archive"
+grep -Fq '7d170ed75fa9af34c00646621d92011dbd71943952e2787cd15df9be78e6452b55dadef34d7eff77b802e6af4959e071a55855ac649afeac70901c3a2a258716' \
+	"${REPO}/scripts/build-rml.ps1" ||
+	die "RML build does not content-verify the pinned .NET SDK"
+while IFS= read -r action_ref; do
+	[[ "$action_ref" =~ ^[0-9a-f]{40}$ ]] ||
+		die "GitHub Action is not pinned to a full commit: ${action_ref}"
+done < <(sed -nE 's/^[[:space:]]*- uses: [^@]+@([0-9A-Za-z._-]+).*/\1/p' "${REPO}"/.github/workflows/*.yml)
+grep -Fq 'dotnet-version: "10.0.302"' "${REPO}/.github/workflows/ci.yml" ||
+	die "CI does not pin the exact .NET SDK patch version"
+grep -Fq '2f2618428ef31279e2fc80b0b1d73485bc929ddd/scripts/install.sh' \
+	"${REPO}/.github/workflows/ci.yml" ||
+	die "Rokit installer is not pinned to a full commit"
+grep -Fq '4f180e0e19494c02085d43765f731d03e1ae172e00dfcce0a56fbd6598a40b30' \
+	"${REPO}/.github/workflows/ci.yml" ||
+	die "Rokit installer is not content verified"
+
+# shellcheck source=scripts/lib/change-workflow.sh
+. "${SCRIPT_DIR}/lib/change-workflow.sh"
+printf '%s\n' "${CHANGE_REQUIRED_PHASES[@]}" | grep -Fxq rust-advisories ||
+	die "qualification does not require the Rust advisory gate"
+grep -Fq 'cargo audit' "${SCRIPT_DIR}/change" ||
+	die "qualification does not run cargo audit"
+grep -Fq 'cargo install cargo-audit --locked --version 0.22.2' "${REPO}/.github/workflows/ci.yml" ||
+	die "CI does not install the pinned advisory scanner"
+grep -Fq 'cargo audit' "${REPO}/.github/workflows/ci.yml" ||
+	die "CI does not run the advisory scanner"
+
+echo "PASS: one-command Eastern timestamp releases publish one Rokit-compatible gzip asset"

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+BUILD_SCRIPT="${SCRIPT_DIR}/build-rml.ps1"
+
+failure=0
+
+if ! grep -Fq -- '"-DRML_FORCE_INCLUDE_COMMON_WITHOUT_PCH=OFF"' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not enable PCH" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- '@("--build", $BuildDir, "--parallel", "--target", "roblox_modloader")' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not scope CMake to roblox_modloader" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Microsoft Visual Studio\Installer\vswhere.exe' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not discover Visual Studio with vswhere" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Get-Command cmake.exe' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not fall back to CMake on PATH" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Get-Command ninja.exe' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not fall back to Ninja on PATH" >&2
+	failure=1
+fi
+
+if ((failure != 0)); then
+	exit "$failure"
+fi
+
+echo "PASS: RML package build is optimized and discovers hosted Windows tools portably"

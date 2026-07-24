@@ -1,0 +1,5 @@
+std = "roblox"
+exclude = ["src/Lib/**"]
+
+[lints]
+shadowing = "allow"

@@ -1,0 +1,39 @@
+--!strict
+
+local fs = require("@lune/fs")
+
+local MsgPack = require("../src/Lib/MsgPack")
+local StyleRuleProperties = require("../src/Lib/Dom/StyleRuleProperties")
+
+local database = MsgPack.decode(fs.readFile("src/Lib/Dom/database.msgpack"))
+local descriptor = database.Classes.StyleRule.Properties.Properties
+assert(descriptor.Scriptability == "Custom", "StyleRule.Properties must use its custom interface")
+assert(
+	descriptor.Kind.Canonical.Serialization.SerializesAs == "PropertiesSerialize",
+	"the serialized alias must remain reflection-owned"
+)
+
+local values = {
+	Color = "red",
+	Transparency = 0.25,
+}
+local fake = {}
+function fake:GetProperties()
+	return table.clone(values)
+end
+function fake:SetProperty(name, value)
+	values[name] = value
+end
+
+local readSuccess, captured = StyleRuleProperties.read(fake :: any)
+assert(readSuccess and captured.Color == "red" and captured.Transparency == 0.25, "nonempty capture was lost")
+local writeSuccess = StyleRuleProperties.write(fake :: any, "Properties", { Color = "blue" })
+assert(writeSuccess and values.Color == "blue" and values.Transparency == nil, "sparse write did not reset stale items")
+assert(StyleRuleProperties.write(fake :: any, "Properties", {}), "empty reset failed")
+assert(next(values) == nil, "empty reset must remove every authored style property")
+
+local source = fs.readFile("src/Lib/Dom/customProperties.luau")
+assert(string.find(source, "Properties = StyleRuleProperties", 1, true), "canonical custom interface is missing")
+assert(not string.find(source, "PropertiesSerialize =", 1, true), "serialized alias must not replace the canonical key")
+
+print("PASS: StyleRule canonical custom property captures nonempty state and resets removed items")

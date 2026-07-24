@@ -1,0 +1,29 @@
+#pragma once
+#include "fwddec.hpp"
+#include "handle.hpp"
+
+#include <cstdint>
+#include <optional>
+#include <string_view>
+#include <vector>
+
+namespace rml::memory
+{
+	class RML_EXPORT pattern
+	{
+		friend pattern_batch;
+		friend range;
+
+	public:
+		pattern(std::string_view ida_sig);
+
+		explicit pattern(const void* bytes, std::string_view mask);
+
+		inline pattern(const char* ida_sig) :
+		    pattern(std::string_view(ida_sig))
+		{
+		}
+
+		std::vector<std::optional<uint8_t> > m_bytes;
+	};
+}

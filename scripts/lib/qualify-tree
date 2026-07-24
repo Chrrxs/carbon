@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+CARBON_REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# shellcheck source=scripts/lib/release-receipt.sh
+. "${SCRIPT_DIR}/lib/release-receipt.sh"
+# shellcheck source=scripts/lib/component-state.sh
+. "${SCRIPT_DIR}/lib/component-state.sh"
+# shellcheck source=scripts/lib/qualification-context.sh
+. "${SCRIPT_DIR}/lib/qualification-context.sh"
+
+usage() {
+	cat <<'EOF'
+Internal installed-stack qualification used by `scripts/change qualify`.
+
+Usage:
+  scripts/lib/qualify-tree --artifacts PATH
+
+Options:
+	--artifacts PATH     Required evidence directory owned by the workflow.
+	-h, --help           Show this help.
+
+Repository and install locations can be overridden with:
+  CARBON_QUALIFY_PROJECT
+  CARBON_QUALIFY_MCP_REPO
+  CARBON_QUALIFY_BIN_DIR
+  CARBON_QUALIFY_RML_BUILD_DIR
+  CARBON_QUALIFY_STATE_DIR
+  CARGO_TARGET_DIR
+  MCP_PLUGINS_DIR
+  ROBLOX_STUDIO_EXE
+  CARBON_QUALIFY_RML_CRASH_DIR
+  CARBON_QUALIFY_RML_LOG_DIR
+
+The robloxstudio-mcp Studio plugin is never built or installed here; its own
+updater owns that lifecycle. Warm runs coexist with other Studio instances and
+route every probe to the instance launched by this run. Each launch pins its
+versioned RobloxModLoader package; only the stable proxy bootstrap is shared.
+EOF
+}
+
+die() {
+	echo "qualify-tree: $*" >&2
+	exit 2
+}
+
+step() {
+	echo
+	echo "==> $*"
+}
+
+require_command() {
+	command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+project="${CARBON_QUALIFY_PROJECT:-}"
+data_dir="${CARBON_QUALIFY_DATA_DIR:-}"
+artifacts="${CARBON_QUALIFY_ARTIFACTS:-}"
+carbon_port="${CARBON_QUALIFY_PORT:-auto}"
+mcp_url="${CARBON_QUALIFY_MCP_URL:-http://127.0.0.1:58741}"
+
+while (($# > 0)); do
+	case "$1" in
+		--artifacts)
+			(($# >= 2)) || die "--artifacts requires a path"
+			artifacts="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			die "unknown option: $1"
+			;;
+	esac
+done
+
+[[ -n "$artifacts" ]] || die "--artifacts is required"
+
+if [[ "$carbon_port" != "auto" && "$carbon_port" != "0" ]]; then
+	[[ "$carbon_port" =~ ^[0-9]+$ ]] && ((carbon_port > 0 && carbon_port < 65536)) ||
+		die "invalid Carbon port: $carbon_port"
+fi
+if [[ "$mcp_url" =~ ^http://(127\.0\.0\.1|localhost):([0-9]+)$ ]]; then
+	mcp_port="${BASH_REMATCH[2]}"
+else
+	die "local MCP startup requires --mcp-url http://127.0.0.1:PORT"
+fi
+((mcp_port > 0 && mcp_port < 65536)) || die "invalid MCP port: $mcp_port"
+
+export NVM_DIR="${NVM_DIR:-${HOME}/.nvm}"
+if [[ -s "${NVM_DIR}/nvm.sh" ]]; then
+	# shellcheck source=/dev/null
+	. "${NVM_DIR}/nvm.sh"
+	nvm use --silent default >/dev/null 2>&1 || nvm use --silent node >/dev/null 2>&1 || true
+fi
+
+require_command cargo
+require_command cp
+require_command curl
+require_command env
+require_command find
+require_command flock
+require_command git
+require_command grep
+require_command jq
+require_command lsof
+require_command npm
+require_command powershell.exe
+require_command ps
+require_command realpath
+require_command rojo
+require_command rustc
+require_command setsid
+require_command sha256sum
+require_command wally
+require_command wc
+require_command wslpath
+
+[[ -n "$project" ]] || die "CARBON_QUALIFY_PROJECT is required; see qualification/README.md"
+[[ -n "${CARBON_QUALIFY_MCP_REPO:-}" ]] ||
+	die "CARBON_QUALIFY_MCP_REPO is required; see qualification/README.md"
+
+carbon_roblox_repo="${CARBON_REPO}/studio-plugin"
+rml_repo="${CARBON_REPO}/rml"
+mcp_repo="$(realpath "$CARBON_QUALIFY_MCP_REPO")"
+bin_dir="${CARBON_QUALIFY_BIN_DIR:-${HOME}/.local/bin}"
+
+project="$(realpath "$project")"
+if [[ -z "$data_dir" ]]; then
+	data_dir="${project%.json}.data"
+fi
+data_dir="$(realpath "$data_dir")"
+[[ -f "$project" ]] || die "qualification project does not exist: $project"
+[[ -d "$data_dir" ]] || die "qualification data directory does not exist: $data_dir"
+fixture_source_dir="$(dirname "$project")"
+[[ "$(dirname "$data_dir")" == "$fixture_source_dir" ]] ||
+	die "qualification project and data directory must be siblings for disposable staging"
+[[ -f "${carbon_roblox_repo}/default.project.json" ]] || die "monorepo Studio plugin is missing: $carbon_roblox_repo"
+[[ -f "${rml_repo}/CMakeLists.txt" ]] || die "monorepo RML source is missing: $rml_repo"
+[[ -f "${mcp_repo}/package-lock.json" ]] || die "invalid robloxstudio-mcp checkout: $mcp_repo"
+
+local_appdata_windows="$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("LocalApplicationData")' | tr -d '\r' | tail -n 1)"
+[[ -n "$local_appdata_windows" ]] || die "could not resolve Windows LOCALAPPDATA"
+local_appdata="$(wslpath -u "$local_appdata_windows")"
+plugins_dir="${MCP_PLUGINS_DIR:-${local_appdata}/Roblox/Plugins}"
+export MCP_PLUGINS_DIR="$plugins_dir"
+
+if [[ -n "${ROBLOX_STUDIO_EXE:-}" ]]; then
+	studio_exe="$(realpath "$ROBLOX_STUDIO_EXE")"
+else
+	studio_exe="$(
+		find "${local_appdata}/Roblox/Versions" -mindepth 2 -maxdepth 2 -type f -name RobloxStudioBeta.exe \
+			-printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d ' ' -f 2-
+	)"
+fi
+[[ -n "$studio_exe" && -f "$studio_exe" ]] || die "RobloxStudioBeta.exe was not found; set ROBLOX_STUDIO_EXE"
+studio_dir="$(dirname "$studio_exe")"
+
+state_dir="${CARBON_QUALIFY_STATE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/carbon-production-readiness}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${CARBON_REPO}/target}"
+worktree_key="$(qualification_worktree_key "$CARBON_REPO")"
+carbon_component="carbon-${worktree_key}"
+rml_component="rml-${worktree_key}"
+plugin_bundle_component="carbon-plugin-bundle-${worktree_key}"
+installed_candidate="${bin_dir}/carbon"
+built_candidate="${CARGO_TARGET_DIR}/release/carbon"
+built_qualifier="${CARGO_TARGET_DIR}/release/carbon-qualify"
+built_plugin="${CARGO_TARGET_DIR}/Carbon.rbxm"
+carbon_plugin="${plugins_dir}/Carbon.rbxm"
+mcp_dist="${mcp_repo}/packages/robloxstudio-mcp/dist/index.js"
+mcp_node_modules_marker="${mcp_repo}/node_modules/.package-lock.json"
+build_version="$(${SCRIPT_DIR}/build-version)"
+build_identity="$(${SCRIPT_DIR}/build-identity)"
+rml_package="${CARBON_RML_PACKAGE_DIR:-${HOME}/.carbon/rml/${build_identity}}"
+rml_package_files=(
+	"${rml_package}/dwmapi.dll"
+	"${rml_package}/RobloxModLoader/roblox_modloader.dll"
+	"${rml_package}/RobloxModLoader/runtime/RML.Core.dll"
+	"${rml_package}/RobloxModLoader/runtime/RML.NativeHost.dll"
+	"${rml_package}/RobloxModLoader/runtime/Roblox.dll"
+	"${rml_package}/RobloxModLoader/runtime/nethost.dll"
+	"${rml_package}/RobloxModLoader/runtime/RML.runtimeconfig.json"
+	"${rml_package}/RobloxModLoader/mods/carbon/dotnet/Carbon.RmlBridge.dll"
+	"${rml_package}/RobloxModLoader/carbon-rml.json"
+	"${rml_package}/RobloxModLoader/THIRD_PARTY_NOTICES.md"
+)
+
+carbon_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" Cargo.toml Cargo.lock cli rml studio-plugin qualification scripts)"
+carbon_fingerprint="$(
+	{
+		printf '%s\n' "$carbon_source_fingerprint"
+		printf '%s\n' "$build_version"
+		printf '%s\n' "$build_identity"
+	} | sha256sum | cut -d ' ' -f 1
+)"
+carbon_plugin_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" studio-plugin scripts/build-studio-plugin scripts/build-version)"
+carbon_plugin_fingerprint="$(printf '%s\n%s\n' "$carbon_plugin_source_fingerprint" "$build_version" | sha256sum | cut -d ' ' -f 1)"
+mcp_dependencies_fingerprint="$(fingerprint_tree "$mcp_repo" package.json package-lock.json)"
+mcp_server_fingerprint="$(fingerprint_tree "$mcp_repo" package.json package-lock.json tsconfig.json packages)"
+rml_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" rml scripts/build-rml.ps1 scripts/build-identity)"
+rml_fingerprint="$(
+	{
+		printf '%s\n' "$rml_source_fingerprint"
+		printf '%s\n' "$build_identity"
+	} | sha256sum | cut -d ' ' -f 1
+)"
+
+rml_installed_files=(
+	"${rml_package_files[@]}"
+)
+
+needs_carbon=0
+needs_plugin_bundle=0
+needs_carbon_plugin=0
+needs_mcp_dependencies=0
+needs_mcp_server=0
+needs_rml=0
+component_is_current "$carbon_component" "$carbon_fingerprint" "$built_candidate" "$built_qualifier" "$built_plugin" || needs_carbon=1
+component_is_current "$plugin_bundle_component" "$carbon_plugin_fingerprint" "$built_plugin" || needs_plugin_bundle=1
+component_is_current carbon-plugin "$carbon_plugin_fingerprint" "$carbon_plugin" || needs_carbon_plugin=1
+component_is_current mcp-dependencies "$mcp_dependencies_fingerprint" "$mcp_node_modules_marker" || needs_mcp_dependencies=1
+component_is_current mcp-server "$mcp_server_fingerprint" "$mcp_dist" || needs_mcp_server=1
+component_is_current "$rml_component" "$rml_fingerprint" "${rml_installed_files[@]}" || needs_rml=1
+((needs_mcp_dependencies == 0)) || needs_mcp_server=1
+
+mkdir -p "$plugins_dir" "$bin_dir" "$state_dir"
+if [[ -z "$artifacts" ]]; then
+	artifacts="${CARBON_REPO}/qualification-artifacts/manual-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+elif [[ "$artifacts" != /* ]]; then
+	artifacts="${PWD}/${artifacts}"
+fi
+mkdir -p "$artifacts"
+artifacts="$(realpath "$artifacts")"
+
+work_dir="$(mktemp -d -t carbon-production-readiness-XXXXXXXX)"
+qualification_context_init "$state_dir" "$CARBON_REPO" "$carbon_port" ||
+	die "could not lease an unused Carbon port (requested: $carbon_port)"
+carbon_port="$QUALIFICATION_PORT"
+candidate="${work_dir}/bin/carbon"
+qualifier="${work_dir}/bin/carbon-qualify"
+rml_runtime_cache="${work_dir}/rml-cache"
+embedded_rml_package="${rml_runtime_cache}/${build_identity}"
+mkdir -p "$(dirname "$candidate")"
+cleanup() {
+	local exit_code=$?
+	trap - EXIT INT TERM
+	qualification_context_release || true
+	if [[ -n "${stack_lock_fd:-}" ]]; then
+		flock -u "$stack_lock_fd" || true
+		exec {stack_lock_fd}>&-
+	fi
+	if [[ -n "$work_dir" && -d "$work_dir" && "$work_dir" == /tmp/carbon-production-readiness-* ]]; then
+		rm -rf -- "$work_dir"
+	fi
+	exit "$exit_code"
+}
+trap cleanup EXIT INT TERM
+
+step "Staging a disposable copy of the qualification fixture"
+fixture_dir="${work_dir}/fixture"
+mkdir -p "$fixture_dir"
+cp -a "${fixture_source_dir}/." "$fixture_dir/"
+project="${fixture_dir}/$(basename "$project")"
+data_dir="${fixture_dir}/$(basename "$data_dir")"
+[[ -f "$project" && -d "$data_dir" ]] || die "disposable qualification fixture was staged incompletely"
+rm -rf -- "$data_dir"
+mkdir -p "$data_dir"
+cp "${CARBON_REPO}/qualification/fixtures/StudioState/state.carbon" "${data_dir}/state.carbon"
+procedural_generator_dir="${fixture_dir}/src/ReplicatedStorage/Shared/ProceduralGenerator"
+[[ ! -e "$procedural_generator_dir" ]] || die "qualification fixture already contains ProceduralGenerator"
+cp -a "${CARBON_REPO}/qualification/fixtures/ProceduralGenerator" "$procedural_generator_dir"
+mapped_identity_meta="${fixture_dir}/src/ReplicatedStorage/Shared/meta.json"
+mapped_identity_strict_project="${artifacts}/mapped-identity-strict-fixture/$(basename "$project")"
+mapped_identity_strict_meta="${artifacts}/mapped-identity-strict-fixture/src/ReplicatedStorage/Shared/meta.json"
+mapped_identity_corrected_project="${artifacts}/mapped-identity-corrected-fixture/$(basename "$project")"
+mapped_identity_corrected_meta="${artifacts}/mapped-identity-corrected-fixture/src/ReplicatedStorage/Shared/meta.json"
+procedural_generator_meta="${procedural_generator_dir}/meta.json"
+procedural_generator_strict_project="${artifacts}/procedural-generator-strict-fixture/$(basename "$project")"
+procedural_generator_strict_meta="${artifacts}/procedural-generator-strict-fixture/src/ReplicatedStorage/Shared/ProceduralGenerator/meta.json"
+procedural_generator_partial_project="${artifacts}/procedural-generator-partial-fixture/$(basename "$project")"
+procedural_generator_partial_meta="${artifacts}/procedural-generator-partial-fixture/src/ReplicatedStorage/Shared/ProceduralGenerator/meta.json"
+procedural_generator_corrected_project="${artifacts}/procedural-generator-corrected-fixture/$(basename "$project")"
+procedural_generator_corrected_meta="${artifacts}/procedural-generator-corrected-fixture/src/ReplicatedStorage/Shared/ProceduralGenerator/meta.json"
+studio_data_model="CarbonQualification-${QUALIFICATION_RUN_ID}.rbxl"
+project_name_tmp="${work_dir}/project-name.json"
+jq --arg name "$studio_data_model" '.name = $name' "$project" > "$project_name_tmp"
+mv -f "$project_name_tmp" "$project"
+
+step "Building and testing this worktree's isolated RML package"
+# Release CLIs embed this package, so it must exist before Cargo links the
+# candidate. CMake and dotnet keep worktree-isolated incremental outputs.
+rml_build="${CARBON_QUALIFY_RML_BUILD_DIR:-$(qualification_rml_build_dir "$CARBON_REPO")}"
+powershell_script="$(wslpath -w "${SCRIPT_DIR}/build-rml.ps1")"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$powershell_script" \
+	-SourceDir "$(wslpath -w "$rml_repo")" \
+	-BuildDir "$(wslpath -w "$rml_build")" \
+	-PackageDir "$(wslpath -w "$rml_package")" \
+	-BuildVersion "$build_identity" | tr -d '\r'
+rml_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" rml scripts/build-rml.ps1 scripts/build-identity)"
+rml_fingerprint="$(
+	{
+		printf '%s\n' "$rml_source_fingerprint"
+		printf '%s\n' "$build_identity"
+	} | sha256sum | cut -d ' ' -f 1
+)"
+# The RML build runs for every qualification; let Cargo inspect the exact
+# output table even when the product sources themselves were already cached.
+needs_carbon=1
+
+if ((needs_plugin_bundle == 1)); then
+	step "Building this worktree's bundled Carbon Studio plugin"
+	CARBON_BUILD_VERSION="$build_version" "${SCRIPT_DIR}/build-studio-plugin" "$built_plugin"
+	carbon_plugin_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" studio-plugin scripts/build-studio-plugin scripts/build-version)"
+	carbon_plugin_fingerprint="$(printf '%s\n%s\n' "$carbon_plugin_source_fingerprint" "$build_version" | sha256sum | cut -d ' ' -f 1)"
+	write_component_stamp "$plugin_bundle_component" "$carbon_plugin_fingerprint" "$built_plugin"
+else
+	step "This worktree's bundled Carbon Studio plugin is up to date"
+fi
+
+if ((needs_carbon == 1)); then
+	step "Building this worktree's Carbon CLI and qualification runner"
+	(
+		cd "$CARBON_REPO"
+		CARBON_BUILD_VERSION="$build_version" \
+			CARBON_BUILD_IDENTITY="$build_identity" \
+		CARBON_STUDIO_PLUGIN_BUNDLE="$built_plugin" \
+			CARBON_RML_BUNDLE="$rml_package" \
+			cargo build --locked --release --bin carbon --bin carbon-qualify
+	)
+	carbon_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" Cargo.toml Cargo.lock cli rml studio-plugin qualification scripts)"
+	carbon_fingerprint="$(
+		{
+			printf '%s\n' "$carbon_source_fingerprint"
+			printf '%s\n' "$build_version"
+			printf '%s\n' "$build_identity"
+		} | sha256sum | cut -d ' ' -f 1
+	)"
+	write_component_stamp "$carbon_component" "$carbon_fingerprint" "$built_candidate" "$built_qualifier" "$built_plugin"
+else
+	step "This worktree's Carbon CLI and qualification runner are up to date"
+fi
+install -m 0755 "$built_candidate" "$candidate"
+install -m 0755 "$built_qualifier" "$qualifier"
+
+# The suite always executes the immutable per-run copy above. Updating the
+# conventional global CLI remains useful to other projects, but cannot change
+# the bytes under an already-running qualification.
+exec {cli_install_lock_fd}>"${state_dir}/cli-install.lock"
+flock -x "$cli_install_lock_fd"
+cli_install_status="$(install_qualified_component "$candidate" "$installed_candidate" 0755)"
+flock -u "$cli_install_lock_fd"
+exec {cli_install_lock_fd}>&-
+step "Global Carbon CLI is ${cli_install_status}"
+
+refresh_shared_component_status() {
+	needs_carbon_plugin=0
+	needs_mcp_dependencies=0
+	needs_mcp_server=0
+	needs_rml=0
+	if ! component_is_current carbon-plugin "$carbon_plugin_fingerprint" "$carbon_plugin" ||
+		qualified_component_needs_update "$built_plugin" "$carbon_plugin"; then
+		needs_carbon_plugin=1
+	fi
+	component_is_current mcp-dependencies "$mcp_dependencies_fingerprint" "$mcp_node_modules_marker" || needs_mcp_dependencies=1
+	component_is_current mcp-server "$mcp_server_fingerprint" "$mcp_dist" || needs_mcp_server=1
+	component_is_current "$rml_component" "$rml_fingerprint" "${rml_installed_files[@]}" || needs_rml=1
+	((needs_mcp_dependencies == 0)) || needs_mcp_server=1
+}
+
+mcp_is_healthy=0
+curl --silent --fail "http://127.0.0.1:${mcp_port}/health" >/dev/null 2>&1 && mcp_is_healthy=1
+shared_update_needed=0
+((needs_carbon_plugin == 0 && needs_mcp_dependencies == 0 && needs_mcp_server == 0)) || shared_update_needed=1
+((mcp_is_healthy == 1)) || shared_update_needed=1
+
+exec {stack_lock_fd}>"${state_dir}/installed-stack.lock"
+stack_lock_mode=shared
+if ((shared_update_needed == 1)); then
+	step "Waiting for exclusive access to update the installed Studio stack"
+	flock -x "$stack_lock_fd"
+	stack_lock_mode=exclusive
+else
+	flock -s "$stack_lock_fd"
+fi
+refresh_shared_component_status
+
+# A different run may have changed the component cache between the optimistic
+# status check and our shared lock. Upgrade before touching global components.
+if [[ "$stack_lock_mode" == shared ]] &&
+	((needs_carbon_plugin == 1 || needs_mcp_dependencies == 1 || needs_mcp_server == 1)); then
+	flock -u "$stack_lock_fd"
+	step "Waiting for exclusive access to refresh the installed Studio stack"
+	flock -x "$stack_lock_fd"
+	stack_lock_mode=exclusive
+	refresh_shared_component_status
+fi
+
+if ((needs_carbon_plugin == 1)); then
+	step "Updating the Carbon Studio plugin"
+	install -m 0644 "$built_plugin" "$carbon_plugin"
+	carbon_plugin_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" studio-plugin scripts/build-studio-plugin scripts/build-version)"
+	carbon_plugin_fingerprint="$(printf '%s\n%s\n' "$carbon_plugin_source_fingerprint" "$build_version" | sha256sum | cut -d ' ' -f 1)"
+	write_component_stamp carbon-plugin "$carbon_plugin_fingerprint" "$carbon_plugin"
+else
+	step "Carbon Studio plugin is up to date"
+fi
+
+mcp_rebuilt=0
+if ((needs_mcp_dependencies == 1)); then
+	step "Updating robloxstudio-mcp server dependencies"
+	(
+		cd "$mcp_repo"
+		npm ci
+	)
+	mcp_dependencies_fingerprint="$(fingerprint_tree "$mcp_repo" package.json package-lock.json)"
+	write_component_stamp mcp-dependencies "$mcp_dependencies_fingerprint" "$mcp_node_modules_marker"
+	needs_mcp_server=1
+else
+	step "robloxstudio-mcp server dependencies are up to date"
+fi
+
+if ((needs_mcp_server == 1)); then
+	step "Building the updated robloxstudio-mcp server"
+	(
+		cd "$mcp_repo"
+		npm run build
+	)
+	mcp_server_fingerprint="$(fingerprint_tree "$mcp_repo" package.json package-lock.json tsconfig.json packages)"
+	write_component_stamp mcp-server "$mcp_server_fingerprint" "$mcp_dist"
+	mcp_rebuilt=1
+else
+	step "robloxstudio-mcp server build is up to date"
+fi
+
+step "The candidate will extract and pin its embedded RML package when launching Studio"
+
+rml_crash_dir="${CARBON_QUALIFY_RML_CRASH_DIR:-${local_appdata}/RobloxModLoader/crashes}"
+rml_log_dir="${CARBON_QUALIFY_RML_LOG_DIR:-${embedded_rml_package}/RobloxModLoader/logs}"
+mkdir -p "$rml_crash_dir" "$rml_log_dir"
+
+mcp_is_healthy=0
+if curl --silent --fail "http://127.0.0.1:${mcp_port}/health" >/dev/null 2>&1; then
+	mcp_is_healthy=1
+fi
+
+if ((mcp_rebuilt == 0 && mcp_is_healthy == 1)); then
+	step "Reusing the healthy, up-to-date robloxstudio-mcp server"
+else
+	if [[ "$stack_lock_mode" == shared ]]; then
+		flock -u "$stack_lock_fd"
+		step "Waiting for exclusive access to start the shared robloxstudio-mcp server"
+		flock -x "$stack_lock_fd"
+		stack_lock_mode=exclusive
+	fi
+	if ((mcp_rebuilt == 1)); then
+		step "Starting the updated robloxstudio-mcp server"
+	else
+		step "Starting the up-to-date robloxstudio-mcp server"
+	fi
+	# Multiple stdio MCP sessions may be proxying to one primary. Stop the
+	# repository-owned primary's process tree; an existing proxy may promote,
+	# so repeat until the port is momentarily free for this server process.
+	for _ in {1..32}; do
+		listener_pid="$(lsof -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | sort -u | head -n 1 || true)"
+		[[ -n "$listener_pid" ]] || break
+		[[ -r "/proc/${listener_pid}/cmdline" ]] || die "cannot inspect process $listener_pid on MCP port $mcp_port"
+		listener_command="$(tr '\0' ' ' < "/proc/${listener_pid}/cmdline")"
+		[[ "$listener_command" == *"$mcp_repo"* ]] ||
+			die "MCP port $mcp_port is owned by an unrelated process: $listener_command"
+
+		listener_root="$listener_pid"
+		while :; do
+			listener_parent="$(ps -o ppid= -p "$listener_root" | tr -d ' ')"
+			[[ -n "$listener_parent" && -r "/proc/${listener_parent}/cmdline" ]] || break
+			parent_command="$(tr '\0' ' ' < "/proc/${listener_parent}/cmdline")"
+			[[ "$parent_command" == *"$mcp_repo"* ]] || break
+			listener_root="$listener_parent"
+		done
+
+		kill -TERM "$listener_root"
+		for _ in {1..100}; do
+			kill -0 "$listener_root" 2>/dev/null || break
+			sleep 0.05
+		done
+		kill -0 "$listener_root" 2>/dev/null && die "existing MCP process $listener_root did not stop"
+	done
+	lsof -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | grep -q . &&
+		die "could not free MCP port $mcp_port after stopping repository-owned primaries"
+
+	require_command node
+	mcp_daemon_log="${state_dir}/mcp-server-${mcp_port}.log"
+	mcp_node="$(command -v node)"
+	nohup setsid bash -c '
+		cd "$1"
+		tail -f /dev/null | env ROBLOX_STUDIO_PORT="$2" "$3" packages/robloxstudio-mcp/dist/index.js
+	' _ "$mcp_repo" "$mcp_port" "$mcp_node" >"$mcp_daemon_log" 2>&1 &
+	mcp_daemon_pid=$!
+	printf '%s\n' "$mcp_daemon_pid" > "${state_dir}/mcp-server-${mcp_port}.pid"
+
+	mcp_ready=0
+	for _ in {1..300}; do
+		kill -0 "$mcp_daemon_pid" 2>/dev/null || {
+			tail -n 80 "$mcp_daemon_log" >&2 || true
+			die "MCP server exited before becoming ready"
+		}
+		if curl --silent --fail "http://127.0.0.1:${mcp_port}/health" >/dev/null; then
+			mcp_ready=1
+			break
+		fi
+		sleep 0.1
+	done
+	((mcp_ready == 1)) || die "MCP server did not become ready; see $mcp_daemon_log"
+fi
+
+# From here through receipt creation, every run holds a shared lease on the
+# shared plugin/MCP stack. RML packages remain per-worktree and immutable.
+if [[ "$stack_lock_mode" == exclusive ]]; then
+	flock -s "$stack_lock_fd"
+	stack_lock_mode=shared
+fi
+
+step "Validating and running the production-readiness suite"
+suite="${CARBON_REPO}/qualification/suites/carbon-release.json"
+"$qualifier" validate "$suite"
+"$qualifier" run "$suite" \
+	--artifacts "$artifacts" \
+	--mcp-url "$mcp_url" \
+	--var "carbon=$candidate" \
+	--var "project=$project" \
+	--var "data_dir=$data_dir" \
+	--var "fixture_dir=$fixture_dir" \
+	--var "mapped_identity_meta=$mapped_identity_meta" \
+	--var "mapped_identity_strict_project=$mapped_identity_strict_project" \
+	--var "mapped_identity_strict_meta=$mapped_identity_strict_meta" \
+	--var "mapped_identity_corrected_project=$mapped_identity_corrected_project" \
+	--var "mapped_identity_corrected_meta=$mapped_identity_corrected_meta" \
+	--var "procedural_generator_meta=$procedural_generator_meta" \
+	--var "procedural_generator_strict_project=$procedural_generator_strict_project" \
+	--var "procedural_generator_strict_meta=$procedural_generator_strict_meta" \
+	--var "procedural_generator_partial_project=$procedural_generator_partial_project" \
+	--var "procedural_generator_partial_meta=$procedural_generator_partial_meta" \
+	--var "procedural_generator_corrected_project=$procedural_generator_corrected_project" \
+	--var "procedural_generator_corrected_meta=$procedural_generator_corrected_meta" \
+	--var "port=$carbon_port" \
+	--var "mcp_url=$mcp_url" \
+	--var "studio_data_model=$studio_data_model" \
+	--var "rml_cache=$rml_runtime_cache" \
+	--var "rml_crash_dir=$rml_crash_dir" \
+	--var "rml_log_dir=$rml_log_dir"
+
+component_is_current "$rml_component" "$rml_fingerprint" "${rml_installed_files[@]}" ||
+	write_component_stamp "$rml_component" "$rml_fingerprint" "${rml_installed_files[@]}"
+component_is_current "$rml_component" "$rml_fingerprint" "${rml_installed_files[@]}" ||
+	die "the candidate did not preserve the qualified RML package"
+[[ -f "${embedded_rml_package}/RobloxModLoader/carbon-rml.json" ]] ||
+	die "the candidate did not extract its embedded RML package"
+
+step "Recording the qualified release candidate"
+report="${artifacts}/report.json"
+[[ -f "$report" ]] || die "qualification passed without producing $report"
+carbon_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" Cargo.toml Cargo.lock cli rml studio-plugin qualification scripts)"
+carbon_fingerprint="$(
+	{
+		printf '%s\n' "$carbon_source_fingerprint"
+		printf '%s\n' "$build_version"
+		printf '%s\n' "$build_identity"
+	} | sha256sum | cut -d ' ' -f 1
+)"
+carbon_plugin_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" studio-plugin scripts/build-studio-plugin scripts/build-version)"
+carbon_plugin_fingerprint="$(printf '%s\n%s\n' "$carbon_plugin_source_fingerprint" "$build_version" | sha256sum | cut -d ' ' -f 1)"
+component_is_current "$carbon_component" "$carbon_fingerprint" "$built_candidate" "$built_qualifier" "$built_plugin" ||
+	die "Carbon sources or qualified outputs changed during qualification"
+component_is_current "$plugin_bundle_component" "$carbon_plugin_fingerprint" "$built_plugin" ||
+	die "bundled Carbon Studio plugin changed during qualification"
+component_is_current carbon-plugin "$carbon_plugin_fingerprint" "$carbon_plugin" ||
+	die "Carbon Studio plugin sources or installed output changed during qualification"
+component_is_current "$rml_component" "$rml_fingerprint" "${rml_installed_files[@]}" ||
+	die "RML sources or this worktree's bundle changed during qualification"
+qualified_candidate="${artifacts}/qualified-carbon"
+qualified_qualifier="${artifacts}/qualified-carbon-qualify"
+qualified_plugin="${artifacts}/qualified-Carbon.rbxm"
+qualified_rml="${artifacts}/qualified-rml"
+install -m 0755 "$candidate" "$qualified_candidate"
+install -m 0755 "$qualifier" "$qualified_qualifier"
+install -m 0644 "$built_plugin" "$qualified_plugin"
+cp -a "$embedded_rml_package" "$qualified_rml"
+rm -rf -- "${qualified_rml}/RobloxModLoader/logs"
+rml_artifact_sha256="$(fingerprint_tree "$qualified_rml" .)"
+rml_artifact_file_count="$(find "$qualified_rml" -type f -printf '.' | wc -c)"
+((rml_artifact_file_count > 0)) || die "qualified RML bundle contains no files"
+candidate_version="$("$candidate" --color never --version | awk '{print $NF}')"
+candidate_target="$(rustc --version --verbose | sed -n 's/^host: //p')"
+release_fingerprint="$(release_source_fingerprint "$CARBON_REPO" Cargo.toml Cargo.lock cli rml studio-plugin qualification scripts)"
+[[ -n "$candidate_version" ]] || die "could not read the qualified candidate version"
+[[ -n "$candidate_target" ]] || die "could not read the qualified candidate target"
+git_commit="$(git -C "$CARBON_REPO" rev-parse HEAD)"
+if [[ -z "$(git -C "$CARBON_REPO" status --porcelain=v1 --untracked-files=all)" ]]; then
+	git_clean=true
+else
+	git_clean=false
+fi
+receipt="${artifacts}/candidate-receipt.json"
+jq -n \
+	--arg qualified_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	--arg git_commit "$git_commit" \
+	--argjson git_clean "$git_clean" \
+	--arg source_fingerprint "$release_fingerprint" \
+	--arg suite_path "$suite" \
+	--arg suite_sha256 "$(sha256sum "$suite" | cut -d ' ' -f 1)" \
+	--arg candidate_path "$qualified_candidate" \
+	--arg candidate_sha256 "$(sha256sum "$qualified_candidate" | cut -d ' ' -f 1)" \
+	--arg candidate_version "$candidate_version" \
+	--arg candidate_target "$candidate_target" \
+	--arg candidate_install_path "$installed_candidate" \
+	--arg carbon_source_fingerprint "$carbon_fingerprint" \
+	--arg qualifier_path "$qualified_qualifier" \
+	--arg qualifier_sha256 "$(sha256sum "$qualified_qualifier" | cut -d ' ' -f 1)" \
+	--arg plugin_source_fingerprint "$carbon_plugin_fingerprint" \
+	--arg plugin_path "$qualified_plugin" \
+	--arg plugin_sha256 "$(sha256sum "$qualified_plugin" | cut -d ' ' -f 1)" \
+	--arg plugin_install_path "$carbon_plugin" \
+	--arg rml_source_fingerprint "$rml_fingerprint" \
+	--arg rml_path "$qualified_rml" \
+	--arg rml_sha256 "$rml_artifact_sha256" \
+	--argjson rml_file_count "$rml_artifact_file_count" \
+	--arg rml_install_path "$rml_package" \
+	--arg report_path "$report" \
+	--arg report_sha256 "$(sha256sum "$report" | cut -d ' ' -f 1)" \
+	'{
+		schema_version: 5,
+		outcome: "pass",
+		qualified_at: $qualified_at,
+		git: {
+			commit: $git_commit,
+			working_tree_clean: $git_clean
+		},
+		source_fingerprint: {
+			kind: "working-tree-content-v1",
+			sha256: $source_fingerprint
+		},
+		suite: {
+			path: $suite_path,
+			sha256: $suite_sha256
+		},
+		candidate: {
+			path: $candidate_path,
+			sha256: $candidate_sha256,
+			version: $candidate_version,
+			target: $candidate_target
+		},
+		components: {
+			carbon_cli: {
+				source_fingerprint: $carbon_source_fingerprint,
+				artifact_path: $candidate_path,
+				artifact_sha256: $candidate_sha256,
+				install_path: $candidate_install_path,
+				qualification_runner_path: $qualifier_path,
+				qualification_runner_sha256: $qualifier_sha256
+			},
+			studio_plugin: {
+				source_path: "studio-plugin",
+				source_fingerprint: $plugin_source_fingerprint,
+				artifact_path: $plugin_path,
+				artifact_sha256: $plugin_sha256,
+				install_path: $plugin_install_path
+			},
+			rml: {
+				source_fingerprint: $rml_source_fingerprint,
+				artifact_path: $rml_path,
+				artifact_sha256: $rml_sha256,
+				artifact_file_count: $rml_file_count,
+				install_path: $rml_install_path
+			}
+		},
+		report: {
+			path: $report_path,
+			sha256: $report_sha256
+		}
+	}' > "$receipt"
+
+echo
+echo "PASS: candidate stack is production-ready"
+echo "Evidence: $artifacts"
+echo "Candidate receipt: $receipt"

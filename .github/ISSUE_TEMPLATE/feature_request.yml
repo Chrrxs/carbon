@@ -1,0 +1,37 @@
+name: Feature proposal
+description: Propose a focused improvement to Carbon
+title: "[Proposal]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete Roblox development problem should Carbon solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the user-visible workflow and its boundaries.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What existing Carbon behavior or external tool did you consider?
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Format and compatibility impact
+      description: Note any project-format, artifact-format, Studio, or release-platform implications.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and documentation for this proposal.
+          required: true
+        - label: I can describe a focused regression or acceptance check for this behavior.
+          required: true

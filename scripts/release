@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# shellcheck source=scripts/lib/release-receipt.sh
+. "${SCRIPT_DIR}/lib/release-receipt.sh"
+# shellcheck source=scripts/lib/component-state.sh
+. "${SCRIPT_DIR}/lib/component-state.sh"
+# shellcheck source=scripts/lib/change-workflow.sh
+. "${SCRIPT_DIR}/lib/change-workflow.sh"
+# shellcheck source=scripts/lib/release-version.sh
+. "${SCRIPT_DIR}/lib/release-version.sh"
+# shellcheck source=scripts/lib/release-artifact.sh
+. "${SCRIPT_DIR}/lib/release-artifact.sh"
+
+usage() {
+	cat <<'EOF'
+Publish an exact qualified Carbon tree and its exact qualified executable.
+
+Usage:
+  scripts/release [options]
+
+Example:
+  ./scripts/release
+
+Options:
+  --receipt PATH  Qualification receipt to verify. Defaults to the receipt for
+                  the checkout's complete tree.
+  --remote NAME   Git remote that receives the tag (default: origin).
+  --branch NAME   Remote branch that must equal this checkout (default: main).
+  --dry-run       Verify and stage the release without publishing or tagging.
+  -h, --help      Show this help.
+
+The version is the qualified executable's Eastern build timestamp in
+YY.M.DHHMM form. The script never rebuilds or installs anything. It verifies
+the exact qualified tree, creates and pushes the matching tag, and publishes
+only one Rokit-compatible gzip asset containing the immutable
+receipt-qualified executable.
+EOF
+}
+
+die() {
+	echo "release: $*" >&2
+	exit 2
+}
+
+require_command() {
+	command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+artifact_dir=""
+cleanup() {
+	if [[ -n "$artifact_dir" && -d "$artifact_dir" && "$artifact_dir" == /tmp/carbon-release-assets-* ]]; then
+		rm -rf -- "$artifact_dir"
+	fi
+}
+trap cleanup EXIT INT TERM
+
+receipt=""
+remote=origin
+branch=main
+dry_run=0
+
+while (($# > 0)); do
+	case "$1" in
+		--receipt)
+			(($# >= 2)) || die "--receipt requires a path"
+			receipt="$2"
+			shift 2
+			;;
+		--remote)
+			(($# >= 2)) || die "--remote requires a name"
+			remote="$2"
+			shift 2
+			;;
+		--branch)
+			(($# >= 2)) || die "--branch requires a name"
+			branch="$2"
+			shift 2
+			;;
+		--dry-run)
+			dry_run=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-*) die "unknown option: $1" ;;
+		*) die "unexpected positional argument: $1; the release version comes from the qualified executable" ;;
+	esac
+done
+
+[[ "$remote" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid remote name: $remote"
+[[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid branch name: $branch"
+
+for command in awk cmp gh git gzip jq realpath sha256sum; do
+	require_command "$command"
+done
+
+[[ -z "$(git -C "$REPO" status --porcelain=v1 --untracked-files=all)" ]] ||
+	die "the current working tree is dirty; release only the exact qualified commit"
+tree_fingerprint="$(repository_tree_fingerprint "$REPO")"
+if [[ -z "$receipt" ]]; then
+	receipt="$(change_receipt_path "$tree_fingerprint")"
+fi
+[[ -f "$receipt" ]] ||
+	die "qualification receipt not found for tree $tree_fingerprint; run ./scripts/change qualify first"
+receipt="$(realpath "$receipt")"
+verify_change_receipt "$receipt" "$tree_fingerprint" ||
+	die "invalid or incomplete qualification receipt: $receipt"
+
+source_fingerprint="$(release_source_fingerprint "$REPO" Cargo.toml Cargo.lock cli rml studio-plugin qualification scripts)"
+[[ "$source_fingerprint" == "$(jq -er '.source_fingerprint.sha256' "$receipt")" ]] ||
+	die "release sources changed after qualification"
+candidate="$(jq -er '.candidate.path' "$receipt")"
+[[ -x "$candidate" ]] || die "qualified candidate is unavailable: $candidate"
+candidate_version="$("$candidate" --color never --version | awk '{print $NF}')"
+[[ "$candidate_version" == "$(jq -er '.candidate.version' "$receipt")" ]] ||
+	die "qualified candidate version does not match the qualification receipt"
+version="$(release_version_from_build "$candidate_version")" ||
+	die "qualified candidate version is not an Eastern YY.M.DHHMM timestamp: $candidate_version"
+tag="$(canonical_release_tag "$version")" ||
+	die "qualified candidate version cannot be represented by a release tag"
+candidate_target="$(jq -er '.candidate.target' "$receipt")"
+[[ "$candidate_target" == "x86_64-unknown-linux-gnu" ]] ||
+	die "the public release target must pass installed-stack qualification on x86_64-unknown-linux-gnu (got $candidate_target)"
+
+head_commit="$(git -C "$REPO" rev-parse HEAD)"
+remote_commit="$(git -C "$REPO" ls-remote --heads "$remote" "refs/heads/$branch" | awk 'NR == 1 {print $1}')"
+[[ "$remote_commit" == "$head_commit" ]] ||
+	die "$remote/$branch is ${remote_commit:-missing}, expected qualified commit $head_commit; push main first"
+
+qualified_at="$(jq -er '.qualified_at' "$receipt")"
+artifact_dir="$(mktemp -d -t carbon-release-assets-XXXXXXXX)"
+asset_name="$(qualified_release_asset_name "$version")" ||
+	die "failed to derive the Rokit-compatible release asset name"
+prepare_qualified_release_asset \
+	"$candidate" "$receipt" "$artifact_dir" ||
+	die "failed to stage the qualified release asset"
+
+local_tag_commit=""
+if git -C "$REPO" show-ref --verify --quiet "refs/tags/$tag"; then
+	local_tag_commit="$(git -C "$REPO" rev-list -n 1 "refs/tags/$tag")"
+	[[ "$local_tag_commit" == "$head_commit" ]] ||
+		die "local tag $tag points to $local_tag_commit instead of $head_commit"
+fi
+remote_tag_commit="$(
+	git -C "$REPO" ls-remote --tags "$remote" "refs/tags/$tag" "refs/tags/$tag^{}" |
+		awk '$2 ~ /\^\{\}$/ {peeled=$1} $2 !~ /\^\{\}$/ {direct=$1} END {print peeled != "" ? peeled : direct}'
+)"
+if [[ -n "$remote_tag_commit" ]]; then
+	[[ "$remote_tag_commit" == "$head_commit" ]] ||
+		die "remote tag $tag points to $remote_tag_commit instead of $head_commit"
+fi
+
+cat <<EOF
+PASS: exact qualified release is ready.
+  Version:         $version
+  Tag:             $tag
+  Commit:          $head_commit
+  Candidate target:$candidate_target
+  Candidate SHA256:$(jq -er '.candidate.sha256' "$receipt")
+  Qualified at:    $qualified_at
+  Receipt:         $receipt
+EOF
+
+if ((dry_run == 1)); then
+	echo "DRY RUN: would create and push $tag, then publish only $asset_name"
+	exit 0
+fi
+
+repository="$(git -C "$REPO" remote get-url "$remote" | sed -nE \
+	's#^(https://github\.com/|git@github\.com:)([^/]+/[^/.]+)(\.git)?$#\2#p')"
+[[ -n "$repository" ]] ||
+	die "$remote is not a supported GitHub repository URL"
+
+if gh release view "$tag" --repo "$repository" --json assets >/dev/null 2>&1; then
+	published_dir="${artifact_dir}/published"
+	mkdir -p "$published_dir"
+	mapfile -t published_assets < <(
+		gh release view "$tag" --repo "$repository" --json assets --jq '.assets[].name' | sort
+	)
+	[[ "${published_assets[*]}" == "$asset_name" ]] ||
+		die "existing $tag release does not contain exactly one asset named $asset_name"
+	gh release download "$tag" --repo "$repository" --pattern "$asset_name" --dir "$published_dir"
+	cmp -s "${artifact_dir}/${asset_name}" "${published_dir}/${asset_name}" ||
+		die "existing $tag asset differs from the exact qualified release asset"
+	echo "PASS: $tag already publishes this exact Rokit-compatible asset."
+	exit 0
+fi
+
+if [[ -z "$local_tag_commit" ]]; then
+	git -C "$REPO" tag -a "$tag" -m "Carbon $version (qualified $qualified_at)" "$head_commit"
+fi
+if [[ -z "$remote_tag_commit" ]]; then
+	git -C "$REPO" push "$remote" "refs/tags/$tag"
+fi
+gh release create "$tag" \
+	"${artifact_dir}/${asset_name}" \
+	--repo "$repository" \
+	--title "Carbon $version" \
+	--generate-notes \
+	--verify-tag
+echo "Published Carbon $version as $tag with only $asset_name."

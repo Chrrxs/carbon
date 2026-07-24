@@ -1,0 +1,5 @@
+#!/bin/bash
+
+wally install &&
+carbon sourcemap --output sourcemap.json &&
+wally-package-types --sourcemap sourcemap.json Packages

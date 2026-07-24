@@ -1,0 +1,14 @@
+[package]
+name = "profiling-procmacros"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0.48", features = ["full"] }
+proc-macro2 = "1.0.76"
+quote = "1.0.35"

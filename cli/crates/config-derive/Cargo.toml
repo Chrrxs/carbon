@@ -1,0 +1,18 @@
+[package]
+name = "config-derive"
+authors = ["Dervex"]
+description = "Macros to speed up your Config struct processing"
+license = "MIT"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.76"
+quote = "1.0.35"
+syn = "2.0.48"
+
+[dev-dependencies]
+serde = { version = "1.0.189", features = ["derive"] }

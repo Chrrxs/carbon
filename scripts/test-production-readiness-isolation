@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/lib/qualification-context.sh
+. "${SCRIPT_DIR}/lib/qualification-context.sh"
+# shellcheck source=scripts/lib/release-receipt.sh
+. "${SCRIPT_DIR}/lib/release-receipt.sh"
+# shellcheck source=scripts/lib/component-state.sh
+. "${SCRIPT_DIR}/lib/component-state.sh"
+
+die() {
+	echo "test-production-readiness-isolation: $*" >&2
+	exit 1
+}
+
+root="$(mktemp -d -t carbon-qualification-isolation-test-XXXXXXXX)"
+cleanup() {
+	if [[ -n "$root" && -d "$root" && "$root" == /tmp/carbon-qualification-isolation-test-* ]]; then
+		rm -rf -- "$root"
+	fi
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "${root}/worktree-a" "${root}/worktree-b"
+
+first_rml_build="$(qualification_rml_build_dir "${root}/worktree-a" "${root}/windows-cache")"
+second_rml_build="$(qualification_rml_build_dir "${root}/worktree-b" "${root}/windows-cache")"
+[[ "$first_rml_build" != "$second_rml_build" ]] || die "worktrees shared an RML CMake build directory"
+[[ "$first_rml_build" == "$(qualification_rml_build_dir "${root}/worktree-a" "${root}/windows-cache")" ]] ||
+	die "RML CMake build directory was not stable for one worktree"
+[[ "$(basename "$first_rml_build")" == "carbon-rml-build" ]] ||
+	die "RML CMake build directory does not satisfy the build-script safety guard"
+
+state_dir="${root}/component-state"
+first_rml_package="${root}/worktree-a/rml/roblox_modloader.dll"
+second_rml_package="${root}/worktree-b/rml/roblox_modloader.dll"
+mkdir -p "$(dirname "$first_rml_package")" "$(dirname "$second_rml_package")"
+printf 'worktree-a-rml\n' > "$first_rml_package"
+printf 'worktree-b-rml\n' > "$second_rml_package"
+first_rml_component="rml-$(qualification_worktree_key "${root}/worktree-a")"
+second_rml_component="rml-$(qualification_worktree_key "${root}/worktree-b")"
+[[ "$first_rml_component" != "$second_rml_component" ]] || die "worktrees shared an RML component identity"
+write_component_stamp "$first_rml_component" fingerprint-a "$first_rml_package"
+write_component_stamp "$second_rml_component" fingerprint-b "$second_rml_package"
+component_is_current "$first_rml_component" fingerprint-a "$first_rml_package" ||
+	die "first worktree's RML package stamp was not current"
+component_is_current "$second_rml_component" fingerprint-b "$second_rml_package" ||
+	die "second worktree's RML package stamp was not current"
+printf 'worktree-a-rml-updated\n' > "$first_rml_package"
+component_is_current "$second_rml_component" fingerprint-b "$second_rml_package" ||
+	die "updating one RML package invalidated another worktree"
+
+run_context_probe() {
+	local repository="$1"
+	local output="$2"
+	qualification_context_init "${root}/state" "$repository" auto || exit 10
+	printf '%s\n%s\n%s\n' "$QUALIFICATION_PORT" "$QUALIFICATION_PORT_LEASE" "$QUALIFICATION_WORKTREE_STATE" > "$output"
+	sleep 0.4
+	qualification_context_release
+}
+
+run_context_probe "${root}/worktree-a" "${root}/a.out" &
+first_pid=$!
+run_context_probe "${root}/worktree-b" "${root}/b.out" &
+second_pid=$!
+wait "$first_pid"
+wait "$second_pid"
+
+mapfile -t first < "${root}/a.out"
+mapfile -t second < "${root}/b.out"
+[[ "${first[0]}" != "${second[0]}" ]] || die "simultaneous contexts leased the same Carbon port"
+[[ "${first[1]}" != "${second[1]}" ]] || die "simultaneous contexts shared a port lease"
+[[ "${first[2]}" != "${second[2]}" ]] || die "worktrees shared mutable run state"
+[[ ! -d "${first[1]}" && ! -d "${second[1]}" ]] || die "released port leases remain on disk"
+
+qualification_context_init "${root}/state" "${root}/worktree-a" 53123 || die "explicit port was not leased"
+first_lease="$QUALIFICATION_PORT_LEASE"
+(
+	. "${SCRIPT_DIR}/lib/qualification-context.sh"
+	if qualification_context_init "${root}/state" "${root}/worktree-b" 53123; then
+		exit 1
+	fi
+)
+qualification_context_release
+[[ ! -d "$first_lease" ]] || die "explicit port lease was not released"
+
+mkdir -p "${root}/state/ports/53124.lease"
+printf '99999999\nstale-run\nstale-worktree\n' > "${root}/state/ports/53124.lease/owner"
+qualification_context_init "${root}/state" "${root}/worktree-a" 53124 || die "stale lease was not reclaimed"
+qualification_context_release
+[[ ! -d "${root}/state/ports/53124.lease" ]] || die "reclaimed lease remained on disk"
+
+fingerprint_repo="${root}/fingerprint-repo"
+git -C "$root" init -q fingerprint-repo
+mkdir -p "${fingerprint_repo}/cli" "${fingerprint_repo}/scripts"
+printf 'candidate bytes\n' > "${fingerprint_repo}/cli/input.rs"
+printf 'release bytes\n' > "${fingerprint_repo}/scripts/release"
+dirty_fingerprint="$(release_source_fingerprint "$fingerprint_repo" cli scripts)"
+git -C "$fingerprint_repo" add cli scripts
+git -C "$fingerprint_repo" -c user.name=Carbon -c user.email=carbon@example.invalid commit -qm "release inputs"
+committed_fingerprint="$(release_source_fingerprint "$fingerprint_repo" cli scripts)"
+[[ "$dirty_fingerprint" == "$committed_fingerprint" ]] ||
+	die "committing identical qualified bytes invalidated the receipt fingerprint"
+printf 'changed bytes\n' > "${fingerprint_repo}/cli/input.rs"
+changed_fingerprint="$(release_source_fingerprint "$fingerprint_repo" cli scripts)"
+[[ "$changed_fingerprint" != "$committed_fingerprint" ]] ||
+	die "release fingerprint ignored a source-content change"
+git -C "$fingerprint_repo" add cli/input.rs
+[[ "$(release_source_fingerprint "$fingerprint_repo" cli scripts)" == "$changed_fingerprint" ]] ||
+	die "staging unchanged bytes altered the receipt fingerprint"
+
+echo "PASS: production-readiness run contexts isolate ports, leases, and worktree state"

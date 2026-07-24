@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+
+fail() {
+	echo "public-readiness: $*" >&2
+	exit 1
+}
+
+required_files=(
+	README.md
+	USAGE.md
+	CONTRIBUTING.md
+	SECURITY.md
+	LICENSE.md
+	rml/THIRD_PARTY_NOTICES.md
+	.github/ISSUE_TEMPLATE/bug_report.yml
+	.github/ISSUE_TEMPLATE/feature_request.yml
+	.github/ISSUE_TEMPLATE/config.yml
+	.github/pull_request_template.md
+)
+
+for path in "${required_files[@]}"; do
+	[[ -f "${REPO}/${path}" ]] || fail "missing ${path}"
+done
+
+ignored_local_paths=(
+	docs/example.md
+	rml/docs/example.md
+	CONTEXT.md
+	AGENTS.md
+	.local/example.txt
+)
+
+for path in "${ignored_local_paths[@]}"; do
+	git -C "$REPO" check-ignore --no-index --quiet "$path" ||
+		fail "${path} is not covered by the local-only ignore policy"
+done
+
+if git -C "$REPO" ls-files --error-unmatch AGENTS.md CONTEXT.md >/dev/null 2>&1 ||
+	git -C "$REPO" ls-files docs rml/docs | grep -q .; then
+	fail "local-only documentation is still tracked"
+fi
+
+for path in CODE_OF_CONDUCT.md GOAL.md; do
+	[[ ! -e "${REPO}/${path}" ]] || fail "${path} must not be published"
+done
+
+[[ ! -e "${REPO}/BUILD_PERFORMANCE.md" ]] ||
+	fail "BUILD_PERFORMANCE.md is contributor-local profiling context"
+
+[[ ! -e "${REPO}/.github/FUNDING.yml" ]] ||
+	fail ".github/FUNDING.yml must not be published"
+
+if grep -Eq '\]\((docs/|CONTEXT\.md|AGENTS\.md|GOAL\.md|CODE_OF_CONDUCT\.md)([)#]|$)' \
+	"${REPO}/README.md" "${REPO}/rml/README.md"; then
+	fail "public entrypoints link to local-only documentation"
+fi
+
+if git -C "$REPO" ls-files -ci --exclude-standard | grep -q .; then
+	fail "tracked files are also ignored"
+fi
+
+machine_path_found=0
+while IFS= read -r -d '' path; do
+	[[ -f "${REPO}/${path}" ]] || continue
+	case "$path" in
+		*.md|*.yml|*.yaml|*.toml|*.sh)
+			if grep -nE '/home/[^/$<[:space:]]+/' "${REPO}/${path}"; then
+				machine_path_found=1
+			fi
+			;;
+	esac
+done < <(git -C "$REPO" ls-files -co --exclude-standard -z)
+if ((machine_path_found == 1)); then
+	fail "public documentation contains a machine-specific home path"
+fi
+
+grep -Eq '^publish = false$' "${REPO}/cli/Cargo.toml" ||
+	fail "cli/Cargo.toml must explicitly disable crates.io publication"
+
+for manifest in \
+	cli/Cargo.toml \
+	cli/crates/config-derive/Cargo.toml \
+	cli/crates/profiling/profiling/Cargo.toml \
+	cli/crates/profiling/profiling-procmacros/Cargo.toml \
+	studio-plugin/wally.toml; do
+	grep -Eq '^license = "MIT"$' "${REPO}/${manifest}" ||
+		fail "${manifest} must identify the first-party license as MIT"
+done
+
+for manifest in \
+	cli/crates/profiling/profiling/Cargo.toml \
+	cli/crates/profiling/profiling-procmacros/Cargo.toml; do
+	grep -Eq '^publish = false$' "${REPO}/${manifest}" ||
+		fail "${manifest} must explicitly disable crates.io publication"
+done
+
+for license in LICENSE.md cli/crates/config-derive/LICENSE studio-plugin/LICENSE.md; do
+	grep -Fq 'MIT License' "${REPO}/${license}" ||
+		fail "${license} must contain the MIT license"
+	diff -u "${REPO}/LICENSE.md" "${REPO}/${license}" >/dev/null ||
+		fail "${license} must match the repository MIT license"
+done
+
+third_party_notices="${REPO}/rml/THIRD_PARTY_NOTICES.md"
+for dependency in 'Bullet Physics' 'G3D Innovation Engine' 'Luau' 'Roblox ModLoader'; do
+	grep -Fq "$dependency" "$third_party_notices" ||
+		fail "rml/THIRD_PARTY_NOTICES.md is missing ${dependency}"
+done
+grep -Fq 'Redistribution and use in source and binary forms' "$third_party_notices" ||
+	fail "rml/THIRD_PARTY_NOTICES.md is missing the G3D BSD terms"
+grep -Fq 'Permission is hereby granted' "$third_party_notices" ||
+	fail "rml/THIRD_PARTY_NOTICES.md is missing the MIT terms"
+grep -Fq '$thirdPartyNotices = Join-Path $SourceDir "THIRD_PARTY_NOTICES.md"' \
+	"${REPO}/scripts/build-rml.ps1" ||
+	fail "RML packaging must source the third-party notices"
+grep -Fq 'Copy-Item -LiteralPath $thirdPartyNotices -Destination (Join-Path $stageRml "THIRD_PARTY_NOTICES.md") -Force' \
+	"${REPO}/scripts/build-rml.ps1" ||
+	fail "RML packaging must include the third-party notices"
+
+grep -Fq '## Platform support' "${REPO}/README.md" ||
+	fail "README.md must state platform support"
+grep -Fq '## Who Carbon is for' "${REPO}/README.md" ||
+	fail "README.md must identify its intended users"
+grep -Fq '## Carbon vs. Rojo' "${REPO}/README.md" ||
+	fail "README.md must explain when to choose Carbon over Rojo"
+grep -Fq 'instance-aware source control' "${REPO}/README.md" ||
+	fail "README.md must identify semantic instance merges as Carbon's advantage"
+grep -Fxq 'rokit add Chrrxs/carbon' "${REPO}/README.md" ||
+	fail "README.md must install Carbon through Rokit's latest-release resolution"
+if grep -Fq 'rokit add Chrrxs/carbon@' "${REPO}/README.md"; then
+	fail "README.md must not pin the Carbon release in its Rokit install command"
+fi
+grep -Fq '[Usage and project format](USAGE.md)' "${REPO}/README.md" ||
+	fail "README.md must move detailed usage into USAGE.md"
+[[ "$(wc -l < "${REPO}/README.md")" -le 100 ]] ||
+	fail "README.md must remain at most 100 lines"
+grep -Fq '[Contributing](CONTRIBUTING.md)' "${REPO}/README.md" ||
+	fail "README.md must link to CONTRIBUTING.md"
+grep -Fq '[Security policy](SECURITY.md)' "${REPO}/README.md" ||
+	fail "README.md must link to SECURITY.md"
+
+if grep -Fq 'Full featured tool for Roblox development' "${REPO}/studio-plugin/wally.toml"; then
+	fail "Studio plugin package description is stale"
+fi
+
+if grep -Fq '../../roblox-games' "${REPO}/scripts/lib/qualify-tree" ||
+	grep -Fq '../../robloxstudio-mcp' "${REPO}/scripts/lib/qualify-tree"; then
+	fail "qualification must not assume private sibling repositories"
+fi
+
+ci_workflow="${REPO}/.github/workflows/ci.yml"
+grep -Eq '^  pull_request:' "$ci_workflow" ||
+	fail "CI must run for pull requests"
+if grep -Eq '^  push:' "$ci_workflow"; then
+	fail "maintainer-qualified pushes must not rerun CI"
+fi
+[[ "$(grep -Ec '^    runs-on:' "$ci_workflow")" == 1 ]] ||
+	fail "CI must use exactly one runner"
+grep -Fq 'runs-on: ubuntu-latest' "$ci_workflow" ||
+	fail "CI must use the supported Linux environment"
+if grep -Eq 'matrix:|macos-|windows-' "$ci_workflow"; then
+	fail "CI must not claim unsupported CLI platforms"
+fi
+
+required_ci_checks=(
+	'cargo clippy --locked --all-targets -- -D warnings'
+	'cargo fmt --all -- --check'
+	'cargo install cargo-audit --locked --version 0.22.2'
+	'cargo audit --deny unsound --deny yanked'
+	'cargo test --locked --all-targets --verbose'
+	'carbon-qualify -- validate qualification/suites/carbon-release.json'
+	'./scripts/test-build-optimization'
+	'./scripts/test-rml-build-optimization'
+	'./scripts/test-release-installer'
+	'./scripts/test-release-workflow'
+	'./scripts/test-public-readiness'
+	'./scripts/test-production-readiness-isolation'
+	'./scripts/test-change-workflow'
+	'lune run scripts/generate-database.luau -- --check'
+	'selene src'
+	'stylua src scripts --check'
+	'./scripts/build-studio-plugin target/Carbon.rbxm'
+	'dotnet test rml/code/dotnet/Runtime/Runtime.slnx -c Release --nologo'
+	'dotnet test rml/code/dotnet/Roblox/Roblox.slnx -c Release --nologo'
+	'dotnet test rml/code/dotnet/CarbonBridge.Tests/CarbonBridge.Tests.csproj -c Release --nologo'
+)
+for check in "${required_ci_checks[@]}"; do
+	grep -Fq -- "$check" "$ci_workflow" ||
+		fail "CI is missing deterministic check: ${check}"
+done
+
+grep -Fq 'cargo audit --deny unsound --deny yanked' scripts/change ||
+	fail "scripts/change must reject unsound and yanked Rust dependencies"
+
+echo "public-readiness: all checks passed"

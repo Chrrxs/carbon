@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# shellcheck source=scripts/lib/release-receipt.sh
+. "${SCRIPT_DIR}/lib/release-receipt.sh"
+# shellcheck source=scripts/lib/component-state.sh
+. "${SCRIPT_DIR}/lib/component-state.sh"
+# shellcheck source=scripts/lib/change-workflow.sh
+. "${SCRIPT_DIR}/lib/change-workflow.sh"
+# shellcheck source=scripts/lib/release-version.sh
+. "${SCRIPT_DIR}/lib/release-version.sh"
+
+usage() {
+	cat <<'EOF'
+Update the local Carbon CLI, RML bundle, and Studio plugin from exact qualified
+artifacts without running Cargo or rebuilding anything.
+
+Usage:
+  scripts/update-release [options]
+
+Options:
+  --receipt PATH  Qualification receipt to verify. Defaults to the receipt for
+                  the checkout's complete tree.
+  --dry-run       Verify everything and describe the release update only.
+  -h, --help      Show this help.
+
+The product version is the qualified Eastern build timestamp. A separate
+content-derived identity keeps CLI/RML/plugin caches exact. Identical installed
+files are reused. Public releases are published separately with
+`./scripts/release`.
+EOF
+}
+
+die() {
+	echo "update-release: $*" >&2
+	exit 2
+}
+
+require_command() {
+	command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+receipt=""
+dry_run=0
+
+while (($# > 0)); do
+	case "$1" in
+		--receipt)
+			(($# >= 2)) || die "--receipt requires a path"
+			receipt="$2"
+			shift 2
+			;;
+		--dry-run)
+			dry_run=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-*)
+			die "unknown option: $1"
+			;;
+		*) die "unexpected positional argument: $1; versions are derived automatically" ;;
+	esac
+done
+
+require_command awk
+require_command cut
+require_command find
+require_command git
+require_command grep
+require_command jq
+require_command install
+require_command realpath
+require_command sed
+require_command sha256sum
+require_command tail
+require_command tr
+require_command wc
+
+if [[ -n "$(git -C "$REPO" status --porcelain=v1 --untracked-files=all)" ]]; then
+	die "the current working tree is dirty; release only an exactly reproducible commit"
+fi
+current_tree_fingerprint="$(repository_tree_fingerprint "$REPO")"
+if [[ -z "$receipt" ]]; then
+	receipt="$(change_receipt_path "$current_tree_fingerprint")"
+fi
+[[ -f "$receipt" ]] ||
+	die "qualification receipt not found for tree $current_tree_fingerprint; run ./scripts/change qualify first"
+receipt="$(realpath "$receipt")"
+verify_change_receipt "$receipt" "$current_tree_fingerprint" ||
+	die "invalid or incomplete workflow receipt: $receipt"
+jq -e '
+	.schema_version == 5 and
+	.outcome == "pass" and
+	(.git.commit | type == "string") and
+	.source_fingerprint.kind == "working-tree-content-v1" and
+	(.source_fingerprint.sha256 | type == "string") and
+	(.candidate.sha256 | type == "string") and
+	(.suite.sha256 | type == "string") and
+	(.report.sha256 | type == "string") and
+	(.components.carbon_cli.source_fingerprint | type == "string") and
+	(.components.carbon_cli.artifact_path | type == "string") and
+	(.components.carbon_cli.artifact_sha256 | type == "string") and
+	(.components.carbon_cli.install_path | type == "string") and
+	(.components.carbon_cli.qualification_runner_path | type == "string") and
+	(.components.carbon_cli.qualification_runner_sha256 | type == "string") and
+	.components.studio_plugin.source_path == "studio-plugin" and
+	(.components.studio_plugin.source_fingerprint | type == "string") and
+	(.components.studio_plugin.artifact_path | type == "string") and
+	(.components.studio_plugin.artifact_sha256 | type == "string") and
+	(.components.studio_plugin.install_path | type == "string") and
+	(.components.rml.source_fingerprint | type == "string") and
+	(.components.rml.artifact_path | type == "string") and
+	(.components.rml.artifact_sha256 | type == "string") and
+	(.components.rml.artifact_file_count | type == "number" and . > 0) and
+	(.components.rml.install_path | type == "string")
+' "$receipt" >/dev/null || die "invalid or non-passing qualification receipt: $receipt"
+
+qualified_commit="$(jq -er '.git.commit' "$receipt")"
+current_source_fingerprint="$(release_source_fingerprint "$REPO" Cargo.toml Cargo.lock cli rml studio-plugin qualification scripts)"
+qualified_source_fingerprint="$(jq -er '.source_fingerprint.sha256' "$receipt")"
+[[ "$current_source_fingerprint" == "$qualified_source_fingerprint" ]] ||
+	die "release source contents changed after qualification; run the gate again"
+
+qualified_version="$(jq -er '.candidate.version' "$receipt")"
+release_version_from_build "$qualified_version" >/dev/null ||
+	die "qualified candidate version is not an Eastern YY.M.DHHMM timestamp"
+build_identity="$(${SCRIPT_DIR}/build-identity)"
+current_carbon_fingerprint="$(
+	{
+		printf '%s\n' "$current_source_fingerprint"
+		printf '%s\n' "$qualified_version"
+		printf '%s\n' "$build_identity"
+	} | sha256sum | cut -d ' ' -f 1
+)"
+qualified_carbon_fingerprint="$(jq -er '.components.carbon_cli.source_fingerprint' "$receipt")"
+[[ "$qualified_carbon_fingerprint" == "$current_carbon_fingerprint" ]] ||
+	die "qualified CLI source fingerprint disagrees with the release source fingerprint"
+current_plugin_source_fingerprint="$(release_source_fingerprint "$REPO" studio-plugin scripts/build-studio-plugin scripts/build-version)"
+current_plugin_fingerprint="$(printf '%s\n%s\n' "$current_plugin_source_fingerprint" "$qualified_version" | sha256sum | cut -d ' ' -f 1)"
+qualified_plugin_fingerprint="$(jq -er '.components.studio_plugin.source_fingerprint' "$receipt")"
+[[ "$current_plugin_fingerprint" == "$qualified_plugin_fingerprint" ]] ||
+	die "Carbon Studio plugin sources changed after qualification; run the gate again"
+current_rml_source_fingerprint="$(release_source_fingerprint "$REPO" rml scripts/build-rml.ps1 scripts/build-identity)"
+current_rml_fingerprint="$(printf '%s\n%s\n' "$current_rml_source_fingerprint" "$build_identity" | sha256sum | cut -d ' ' -f 1)"
+qualified_rml_fingerprint="$(jq -er '.components.rml.source_fingerprint' "$receipt")"
+[[ "$current_rml_fingerprint" == "$qualified_rml_fingerprint" ]] ||
+	die "RML sources changed after qualification; run the gate again"
+
+expected_cli_install="$(realpath -m "${CARBON_QUALIFY_BIN_DIR:-${HOME}/.local/bin}/carbon")"
+if [[ -n "${MCP_PLUGINS_DIR:-}" ]]; then
+	expected_plugin_install="$(realpath -m "${MCP_PLUGINS_DIR}/Carbon.rbxm")"
+else
+	require_command powershell.exe
+	require_command wslpath
+	local_appdata_windows="$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("LocalApplicationData")' | tr -d '\r' | tail -n 1)"
+	[[ -n "$local_appdata_windows" ]] || die "could not resolve Windows LOCALAPPDATA"
+	expected_plugin_install="$(realpath -m "$(wslpath -u "$local_appdata_windows")/Roblox/Plugins/Carbon.rbxm")"
+fi
+cli_install="$(realpath -m "$(jq -er '.components.carbon_cli.install_path' "$receipt")")"
+plugin_install="$(realpath -m "$(jq -er '.components.studio_plugin.install_path' "$receipt")")"
+rml_install="$(realpath -m "$(jq -er '.components.rml.install_path' "$receipt")")"
+[[ "$cli_install" == "$expected_cli_install" ]] ||
+	die "qualified CLI install target is $cli_install, expected $expected_cli_install"
+[[ "$plugin_install" == "$expected_plugin_install" ]] ||
+	die "qualified Studio plugin install target is $plugin_install, expected $expected_plugin_install"
+
+suite="${REPO}/qualification/suites/carbon-release.json"
+suite_sha256="$(sha256sum "$suite" | cut -d ' ' -f 1)"
+qualified_suite_sha256="$(jq -er '.suite.sha256' "$receipt")"
+[[ "$suite_sha256" == "$qualified_suite_sha256" ]] ||
+	die "the production-readiness suite changed after qualification; run it again"
+
+candidate="$(jq -er '.candidate.path' "$receipt")"
+[[ -f "$candidate" ]] || die "qualified candidate no longer exists: $candidate"
+candidate="$(realpath "$candidate")"
+candidate_sha256="$(sha256sum "$candidate" | cut -d ' ' -f 1)"
+qualified_candidate_sha256="$(jq -er '.candidate.sha256' "$receipt")"
+[[ "$candidate_sha256" == "$qualified_candidate_sha256" ]] ||
+	die "qualified candidate bytes changed after qualification"
+cli_artifact="$(realpath "$(jq -er '.components.carbon_cli.artifact_path' "$receipt")")"
+cli_artifact_sha256="$(jq -er '.components.carbon_cli.artifact_sha256' "$receipt")"
+[[ "$cli_artifact" == "$candidate" && "$cli_artifact_sha256" == "$candidate_sha256" ]] ||
+	die "qualified CLI component does not match the tested candidate"
+qualifier="$(realpath "$(jq -er '.components.carbon_cli.qualification_runner_path' "$receipt")")"
+qualifier_sha256="$(sha256sum "$qualifier" | cut -d ' ' -f 1)"
+[[ "$qualifier_sha256" == "$(jq -er '.components.carbon_cli.qualification_runner_sha256' "$receipt")" ]] ||
+	die "qualified runner bytes changed after qualification"
+plugin_artifact="$(realpath "$(jq -er '.components.studio_plugin.artifact_path' "$receipt")")"
+plugin_artifact_sha256="$(sha256sum "$plugin_artifact" | cut -d ' ' -f 1)"
+[[ "$plugin_artifact_sha256" == "$(jq -er '.components.studio_plugin.artifact_sha256' "$receipt")" ]] ||
+	die "qualified Studio plugin bytes changed after qualification"
+rml_artifact="$(realpath "$(jq -er '.components.rml.artifact_path' "$receipt")")"
+[[ -d "$rml_artifact" ]] || die "qualified RML bundle no longer exists: $rml_artifact"
+rml_artifact_sha256="$(fingerprint_tree "$rml_artifact" .)"
+[[ "$rml_artifact_sha256" == "$(jq -er '.components.rml.artifact_sha256' "$receipt")" ]] ||
+	die "qualified RML bundle changed after qualification"
+rml_artifact_file_count="$(find "$rml_artifact" -type f -printf '.' | wc -c)"
+[[ "$rml_artifact_file_count" == "$(jq -er '.components.rml.artifact_file_count' "$receipt")" ]] ||
+	die "qualified RML bundle file count changed after qualification"
+candidate_version="$("$candidate" --color never --version | awk '{print $NF}')"
+version="$qualified_version"
+[[ "$candidate_version" == "$version" ]] ||
+	die "qualified candidate version is $candidate_version, expected receipt version $version"
+expected_rml_install="$(realpath -m "${HOME}/.carbon/rml/${build_identity}")"
+[[ "$rml_install" == "$expected_rml_install" ]] ||
+	die "qualified RML cache target is $rml_install, expected $expected_rml_install"
+
+report="$(jq -er '.report.path' "$receipt")"
+[[ -f "$report" ]] || die "qualification report no longer exists: $report"
+report_sha256="$(sha256sum "$report" | cut -d ' ' -f 1)"
+qualified_report_sha256="$(jq -er '.report.sha256' "$receipt")"
+[[ "$report_sha256" == "$qualified_report_sha256" ]] ||
+	die "qualification report changed after the receipt was issued"
+[[ "$(jq -er '.outcome' "$report")" == "pass" ]] || die "qualification report does not pass"
+
+candidate_target="$(jq -er '.candidate.target' "$receipt")"
+qualified_at="$(jq -er '.qualified_at' "$receipt")"
+needs_cli_update=0
+needs_plugin_update=0
+needs_rml_update=0
+qualified_component_needs_update "$cli_artifact" "$cli_install" && needs_cli_update=1
+qualified_component_needs_update "$plugin_artifact" "$plugin_install" && needs_plugin_update=1
+qualified_tree_needs_update "$rml_artifact" "$rml_install" "$rml_artifact_sha256" && needs_rml_update=1
+cat <<EOF
+PASS: qualified local installation is ready to update
+  Version:          $version
+  Qualified base:   $qualified_commit
+  Candidate target: $candidate_target
+  Candidate SHA-256:$candidate_sha256
+  Qualified at:     $qualified_at
+  Receipt:          $receipt
+  Local Carbon CLI: $(component_status "$needs_cli_update")
+  Local RML bundle: $(component_status "$needs_rml_update")
+  Local Studio plugin: $(component_status "$needs_plugin_update")
+EOF
+
+if ((dry_run == 1)); then
+	if ((needs_cli_update == 1)); then
+		echo "DRY RUN: would install the qualified Carbon CLI to $cli_install"
+	else
+		echo "DRY RUN: local Carbon CLI is already the qualified version"
+	fi
+	if ((needs_plugin_update == 1)); then
+		echo "DRY RUN: would install the qualified Carbon Studio plugin to $plugin_install"
+	else
+		echo "DRY RUN: local Carbon Studio plugin is already the qualified version"
+	fi
+	if ((needs_rml_update == 1)); then
+		echo "DRY RUN: would install the qualified RML bundle to $rml_install"
+	else
+		echo "DRY RUN: local RML bundle is already the qualified version"
+	fi
+	exit 0
+fi
+
+if ((needs_plugin_update == 1)); then
+	require_command powershell.exe
+	studio_count="$(powershell.exe -NoProfile -Command '@(Get-Process RobloxStudioBeta -ErrorAction SilentlyContinue).Count' | tr -d '\r' | tail -n 1)"
+	[[ "$studio_count" == "0" ]] || die "close Roblox Studio before updating the qualified Studio plugin"
+fi
+
+cli_install_result="$(install_qualified_component "$cli_artifact" "$cli_install" 0755)"
+plugin_install_result="$(install_qualified_component "$plugin_artifact" "$plugin_install" 0644)"
+rml_install_result="$(install_qualified_tree "$rml_artifact" "$rml_install" "$rml_artifact_sha256")"
+write_component_stamp carbon-plugin "$qualified_plugin_fingerprint" "$plugin_install"
+echo "Local Carbon CLI: $cli_install_result ($cli_install)"
+echo "Local RML bundle: $rml_install_result ($rml_install)"
+echo "Local Carbon Studio plugin: $plugin_install_result ($plugin_install)"
+
+echo "No local build was run. Publish separately with ./scripts/release."

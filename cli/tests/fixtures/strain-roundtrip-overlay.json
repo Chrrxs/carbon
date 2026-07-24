@@ -1,0 +1,9 @@
+{
+  "properties": [
+    {
+      "path": ["Lighting"],
+      "name": "Technology",
+      "value": {"Enum": 3}
+    }
+  ]
+}

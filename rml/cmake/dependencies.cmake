@@ -1,0 +1,75 @@
+include(cmake/cpm.cmake)
+
+function(setup_compiler_flags target_name)
+    if (MSVC)
+        target_compile_options(${target_name} PRIVATE
+                /bigobj
+                /utf-8
+                $<$<CONFIG:Debug>:/MDd>
+                $<$<CONFIG:Release>:/MD>
+                $<$<CONFIG:RelWithDebInfo>:/MD>
+                $<$<CONFIG:MinSizeRel>:/MD>
+                $<$<CONFIG:Debug>:/ZI>
+                $<$<CONFIG:RelWithDebInfo>:/O2 /Oi /Ot /Oy /Ob3 /sdl- /GL /GF /GS- /Gw>
+        )
+        target_link_options(${target_name} PRIVATE
+                $<$<CONFIG:Debug>:/INCREMENTAL>
+                $<$<CONFIG:RelWithDebInfo>:/LTCG /OPT:REF,ICF /GUARD:NO>
+                /NXCOMPAT:NO
+        )
+    else ()
+        if (WIN32)
+            target_compile_options(${target_name} PRIVATE -Wa,-mbig-obj)
+        endif ()
+    endif ()
+endfunction()
+
+function(setup_compile_definitions target_name access_level)
+    target_compile_definitions(${target_name} ${access_level}
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            IS_RML=1
+            $<$<CONFIG:Debug>:DEBUG>
+    )
+endfunction()
+
+function(setup_luau_dependencies target_name access_level)
+    target_link_libraries(${target_name} ${access_level}
+            Luau.Compiler
+            Luau.Ast
+            Luau.VM
+            Luau.VM.Internals
+            Luau.CodeGen
+    )
+
+    target_include_directories(${target_name} ${access_level}
+            "${LUAU_SOURCE_DIR}/Compiler/include"
+            "${LUAU_SOURCE_DIR}/Ast/include"
+            "${LUAU_SOURCE_DIR}/VM/include"
+            "${LUAU_SOURCE_DIR}/VM/src"
+            "${LUAU_SOURCE_DIR}/CodeGen/include"
+            "${LUAU_SOURCE_DIR}/Common/include"
+    )
+endfunction()
+
+function(setup_core_dependencies target_name access_level)
+    target_link_libraries(${target_name} ${access_level}
+            spdlog::spdlog
+            minhook
+            ZLIB::ZLIB
+            #Tracy::TracyClient
+            nlohmann_json::nlohmann_json
+            PolyHook_2
+    )
+
+    target_include_directories(${target_name} ${access_level}
+            "${spdlog_SOURCE_DIR}"
+            "${minhook_SOURCE_DIR}/include"
+            "${zlib_SOURCE_DIR}"
+            "${tomlplusplus_SOURCE_DIR}/include"
+            #"${tracy_SOURCE_DIR}/public"
+            "${nlohmann_json_SOURCE_DIR}/include"
+            "${polyhook2_SOURCE_DIR}"
+    )
+endfunction()

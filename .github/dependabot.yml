@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "quarterly"
+      time: "06:00"
+    open-pull-requests-limit: 40
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"

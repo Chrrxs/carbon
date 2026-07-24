@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# shellcheck source=scripts/lib/release-receipt.sh
+. "${SCRIPT_DIR}/lib/release-receipt.sh"
+# shellcheck source=scripts/lib/component-state.sh
+. "${SCRIPT_DIR}/lib/component-state.sh"
+# shellcheck source=scripts/lib/change-workflow.sh
+. "${SCRIPT_DIR}/lib/change-workflow.sh"
+
+usage() {
+	cat <<'EOF'
+One workflow for every Carbon feature:
+  RED RECORDED -> IMPLEMENT -> QUALIFIED TREE -> COMMIT SAME TREE -> FF-ONLY MERGE
+
+Usage:
+  scripts/change red -- COMMAND [ARG...]
+  scripts/change qualify
+  scripts/change status [REVISION]
+  scripts/change merge BRANCH
+
+Commands:
+  red       Run the focused regression and record its expected failure.
+  qualify   Require the regression to pass, then qualify the complete tree.
+  status    Show whether the current tree or revision has a valid receipt.
+  merge     Verify a committed receipt and fast-forward main to BRANCH.
+EOF
+}
+
+die() {
+	echo "change: $*" >&2
+	exit 2
+}
+
+show_status() {
+	(($# <= 1)) || die "status accepts at most one revision"
+	local revision="${1:-}"
+	local fingerprint
+	local receipt
+	local red_record
+
+	if [[ -n "$revision" ]]; then
+		git -C "$REPO" rev-parse --verify "${revision}^{commit}" >/dev/null 2>&1 ||
+			die "unknown revision: $revision"
+		fingerprint="$(revision_tree_fingerprint "$REPO" "$revision")"
+	else
+		fingerprint="$(repository_tree_fingerprint "$REPO")"
+		red_record="$(change_red_record "$REPO")"
+		if verify_red_record "$red_record"; then
+			echo "RED RECORDED: $(jq -r '.command | join(" ")' "$red_record")"
+		else
+			echo "RED MISSING"
+		fi
+	fi
+
+	receipt="$(change_receipt_path "$fingerprint")"
+	if verify_change_receipt "$receipt" "$fingerprint"; then
+		echo "QUALIFIED TREE: $fingerprint"
+		echo "Receipt: $receipt"
+	else
+		echo "UNQUALIFIED TREE: $fingerprint"
+	fi
+}
+
+run_workflow_tests() {
+	"${SCRIPT_DIR}/test-build-optimization"
+	"${SCRIPT_DIR}/test-rml-build-optimization"
+	"${SCRIPT_DIR}/test-release-installer"
+	"${SCRIPT_DIR}/test-release-workflow"
+	"${SCRIPT_DIR}/test-public-readiness"
+	"${SCRIPT_DIR}/test-production-readiness-isolation"
+	"${SCRIPT_DIR}/test-change-workflow"
+}
+
+run_studio_plugin_quality() {
+	(
+		for tool in lune selene stylua; do
+			command -v "$tool" >/dev/null 2>&1 || {
+				echo "change: required Studio-plugin tool not found: $tool" >&2
+				return 2
+			}
+		done
+		cd "${REPO}/studio-plugin"
+		lune run scripts/generate-database.luau -- --check
+		selene src
+		stylua src scripts --check
+	)
+}
+
+run_rust_advisories() {
+	local expected_version="0.22.2"
+	command -v cargo-audit >/dev/null 2>&1 ||
+		die "cargo-audit ${expected_version} is required; install it with: cargo install cargo-audit --locked --version ${expected_version}"
+	[[ "$(cargo audit --version)" == *" ${expected_version}" ]] ||
+		die "cargo-audit ${expected_version} is required for reproducible qualification"
+	cargo audit --deny unsound --deny yanked
+}
+
+phase_results='[]'
+phase_evidence=""
+run_phase() {
+	local id="$1"
+	shift
+	local log="${phase_evidence}/${id}.log"
+	local started
+	local finished
+	local duration_ms
+	local exit_code
+	started="$(date +%s%3N)"
+	echo
+	echo "==> $id"
+	set +e
+	(
+		set -e
+		cd "$REPO"
+		"$@"
+	) 2>&1 | tee "$log"
+	exit_code=${PIPESTATUS[0]}
+	set -e
+	finished="$(date +%s%3N)"
+	duration_ms=$((finished - started))
+	phase_results="$(jq \
+		--arg id "$id" \
+		--arg outcome "$([[ $exit_code == 0 ]] && printf pass || printf fail)" \
+		--arg path "$log" \
+		--arg sha256 "$(sha256sum "$log" | cut -d ' ' -f 1)" \
+		--argjson duration_ms "$duration_ms" \
+		'. + [{id: $id, outcome: $outcome, duration_ms: $duration_ms, log: {path: $path, sha256: $sha256}}]' \
+		<<< "$phase_results")"
+	((exit_code == 0)) || die "$id failed; evidence retained at $log"
+}
+
+qualify_tree() {
+	(($# == 0)) || die "qualify does not accept arguments"
+	local red_record
+	local red_tree
+	local tree_fingerprint
+	local final_fingerprint
+	local state_root
+	local run_dir
+	local evidence
+	local candidate_receipt
+	local final_receipt
+	local stored_receipt
+	local red_log
+	local red_copy
+	local red_attestation
+	local suite_copy
+	local -a focused_command
+
+	red_record="$(change_red_record "$REPO")"
+	verify_red_record "$red_record" ||
+		die "no valid red record; add the failing regression and run ./scripts/change red -- COMMAND"
+	red_tree="$(jq -er '.tree_fingerprint' "$red_record")"
+	tree_fingerprint="$(repository_tree_fingerprint "$REPO")"
+	[[ "$tree_fingerprint" != "$red_tree" ]] ||
+		die "the tree still matches the recorded failure; implement the change before qualifying"
+
+	mapfile -d '' -t focused_command < <(jq -j '.command[] | . + "\u0000"' "$red_record")
+	((${#focused_command[@]} > 0)) || die "red record contains no focused command"
+
+	state_root="$(change_state_root)"
+	mkdir -p "${state_root}/runs" "${state_root}/receipts"
+	run_dir="$(mktemp -d "${state_root}/runs/change-XXXXXXXX")"
+	evidence="${run_dir}/evidence"
+	phase_evidence="${evidence}/phases"
+	mkdir -p "$phase_evidence"
+
+	run_phase focused-regression "${focused_command[@]}"
+	run_phase rust-format cargo fmt --all -- --check
+	run_phase rust-clippy cargo clippy --locked --all-targets -- -D warnings
+	run_phase rust-advisories run_rust_advisories
+	run_phase rust-tests cargo test --locked --all-targets
+	run_phase workflow-tests run_workflow_tests
+	run_phase studio-plugin-quality run_studio_plugin_quality
+	run_phase production-readiness "${SCRIPT_DIR}/lib/qualify-tree" --artifacts "${evidence}/runtime"
+
+	final_fingerprint="$(repository_tree_fingerprint "$REPO")"
+	[[ "$final_fingerprint" == "$tree_fingerprint" ]] ||
+		die "repository bytes changed during qualification; rerun from the final tree"
+
+	candidate_receipt="${evidence}/runtime/candidate-receipt.json"
+	[[ -f "$candidate_receipt" ]] || die "production readiness did not issue a candidate receipt"
+	red_log="$(jq -er '.log.path' "$red_record")"
+	red_copy="${phase_evidence}/red.log"
+	install -m 0644 "$red_log" "$red_copy"
+	red_attestation="$(jq \
+		--arg path "$red_copy" \
+		--arg sha256 "$(sha256sum "$red_copy" | cut -d ' ' -f 1)" \
+		'.log = {path: $path, sha256: $sha256}' "$red_record")"
+	suite_copy="${evidence}/carbon-release-suite.json"
+	install -m 0644 "${REPO}/qualification/suites/carbon-release.json" "$suite_copy"
+	final_receipt="${evidence}/release-receipt.json"
+	jq \
+		--arg tree_fingerprint "$tree_fingerprint" \
+		--arg plan_sha256 "$(change_plan_fingerprint)" \
+		--arg suite_path "$suite_copy" \
+		--arg suite_sha256 "$(sha256sum "$suite_copy" | cut -d ' ' -f 1)" \
+		--argjson red "$red_attestation" \
+		--argjson phases "$phase_results" '
+		.schema_version = 5 |
+		.tree_fingerprint = {kind: "git-tree-content-v1", sha256: $tree_fingerprint} |
+		.suite = {path: $suite_path, sha256: $suite_sha256} |
+		.workflow = {plan_sha256: $plan_sha256, red: $red, phases: $phases}
+	' "$candidate_receipt" > "$final_receipt"
+	verify_change_receipt "$final_receipt" "$tree_fingerprint" ||
+		die "generated receipt failed its own integrity check"
+	stored_receipt="$(change_receipt_path "$tree_fingerprint")"
+	install -m 0644 "$final_receipt" "$stored_receipt"
+
+	echo
+	echo "QUALIFIED TREE: $tree_fingerprint"
+	echo "Receipt: $stored_receipt"
+	echo "Next: commit these exact bytes, then merge with ./scripts/change merge BRANCH"
+}
+
+branch_worktree() {
+	local branch="$1"
+	git -C "$REPO" worktree list --porcelain | awk -v wanted="refs/heads/${branch}" '
+		$1 == "worktree" { path = $2 }
+		$1 == "branch" && $2 == wanted { print path }
+	'
+}
+
+merge_qualified() {
+	(($# == 1)) || die "merge requires exactly one branch"
+	local branch="$1"
+	local current_branch
+	local feature_worktree
+	local feature_commit
+	local fingerprint
+	local receipt
+	local receipt_sha256
+	local note
+	[[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid branch name: $branch"
+	current_branch="$(git -C "$REPO" branch --show-current)"
+	[[ "$current_branch" == "main" ]] || die "qualified merges must run from the main worktree"
+	[[ -z "$(git -C "$REPO" status --porcelain=v1 --untracked-files=all)" ]] ||
+		die "main worktree is dirty"
+	git -C "$REPO" rev-parse --verify "refs/heads/${branch}^{commit}" >/dev/null 2>&1 ||
+		die "unknown local branch: $branch"
+	feature_worktree="$(branch_worktree "$branch")"
+	if [[ -n "$feature_worktree" && -n "$(git -C "$feature_worktree" status --porcelain=v1 --untracked-files=all)" ]]; then
+		die "$branch has uncommitted work in $feature_worktree"
+	fi
+	git -C "$REPO" merge-base --is-ancestor HEAD "$branch" ||
+		die "$branch is not a fast-forward of main; rebase it onto main and qualify the resulting tree"
+
+	feature_commit="$(git -C "$REPO" rev-parse "$branch")"
+	fingerprint="$(revision_tree_fingerprint "$REPO" "$branch")"
+	receipt="$(change_receipt_path "$fingerprint")"
+	verify_change_receipt "$receipt" "$fingerprint" ||
+		die "no passing receipt for the complete tree $fingerprint; qualify $branch before merging"
+	receipt_sha256="$(sha256sum "$receipt" | cut -d ' ' -f 1)"
+	note="$(jq -n \
+		--arg tree_fingerprint "$fingerprint" \
+		--arg receipt_sha256 "$receipt_sha256" \
+		--arg receipt "$receipt" \
+		'{tree_fingerprint: $tree_fingerprint, receipt_sha256: $receipt_sha256, receipt: $receipt}')"
+	git -C "$REPO" notes --ref=carbon-qualification add -f -m "$note" "$feature_commit"
+	git -C "$REPO" merge --ff-only "$branch"
+	[[ "$(revision_tree_fingerprint "$REPO" HEAD)" == "$fingerprint" ]] ||
+		die "post-merge tree does not match the qualified receipt"
+
+	echo "MERGED QUALIFIED TREE: $fingerprint"
+	echo "Receipt: $receipt"
+}
+
+record_red() {
+	if [[ "${1:-}" == "--" ]]; then
+		shift
+	fi
+	(($# > 0)) || die "red requires a focused test command after --"
+	[[ -n "$(git -C "$REPO" status --porcelain=v1 --untracked-files=all)" ]] ||
+		die "write the failing regression test before recording red"
+
+	local state
+	local log
+	local exit_code
+	local command_json
+	local tree_fingerprint
+	state="$(change_worktree_state "$REPO")"
+	mkdir -p "$state"
+	log="${state}/red.log"
+
+	set +e
+	(
+		cd "$REPO"
+		"$@"
+	) 2>&1 | tee "$log"
+	exit_code=${PIPESTATUS[0]}
+	set -e
+	((exit_code != 0)) || die "focused regression passed; red must be recorded before implementation"
+	((exit_code != 126 && exit_code != 127)) || die "focused regression command could not be executed"
+
+	command_json="$(printf '%s\0' "$@" | jq -Rs 'split("\u0000")[:-1]')"
+	tree_fingerprint="$(repository_tree_fingerprint "$REPO")"
+	jq -n \
+		--arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		--arg base_commit "$(git -C "$REPO" rev-parse HEAD)" \
+		--arg tree_fingerprint "$tree_fingerprint" \
+		--argjson command "$command_json" \
+		--argjson exit_code "$exit_code" \
+		--arg log "$log" \
+		--arg log_sha256 "$(sha256sum "$log" | cut -d ' ' -f 1)" \
+		'{
+			schema_version: 1,
+			outcome: "expected-failure",
+			recorded_at: $recorded_at,
+			base_commit: $base_commit,
+			tree_fingerprint: $tree_fingerprint,
+			command: $command,
+			exit_code: $exit_code,
+			log: {path: $log, sha256: $log_sha256}
+		}' > "$(change_red_record "$REPO")"
+
+	echo "RED RECORDED: focused regression failed with exit code $exit_code"
+	echo "Next: implement the change, then run ./scripts/change qualify"
+}
+
+command="${1:---help}"
+shift || true
+case "$command" in
+	red) record_red "$@" ;;
+	qualify) qualify_tree "$@" ;;
+	status) show_status "$@" ;;
+	merge) merge_qualified "$@" ;;
+	-h|--help|help) usage ;;
+	*) die "unknown command: $command" ;;
+esac
