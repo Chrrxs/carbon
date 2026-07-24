@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+studio_executable=""
+studio_argument_path=""
+studio_version=""
+build_id=""
+
+case "$(uname -s)" in
+	Linux)
+		[[ -n "${WSL_DISTRO_NAME:-}" ]] || {
+			echo "update-reflection: Linux reflection refresh requires WSL with Roblox Studio installed" >&2
+			exit 2
+		}
+		studio_info="$(powershell.exe -NoProfile -NonInteractive -Command '$studio = Get-ChildItem "$env:LOCALAPPDATA/Roblox/Versions/*/RobloxStudioBeta.exe" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if ($null -eq $studio) { exit 3 }; Write-Output ($studio.FullName + [char]9 + $studio.VersionInfo.FileVersion)' | tr -d '\r')"
+		IFS=$'\t' read -r studio_windows studio_version <<<"${studio_info}"
+		[[ -n "${studio_windows}" && -n "${studio_version}" ]] || {
+			echo "update-reflection: failed to identify the current Roblox Studio build" >&2
+			exit 2
+		}
+		studio_executable="$(wslpath -u "${studio_windows}")"
+		build_id="$(basename -- "$(dirname -- "${studio_executable}")")"
+		;;
+	Darwin)
+		studio_executable="/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio"
+		plist="/Applications/RobloxStudio.app/Contents/Info.plist"
+		[[ -x "${studio_executable}" && -f "${plist}" ]] || {
+			echo "update-reflection: Roblox Studio is not installed in /Applications" >&2
+			exit 2
+		}
+		studio_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${plist}")"
+		build_id="${studio_version}"
+		;;
+	*)
+		echo "update-reflection: supported hosts are WSL2 and macOS" >&2
+		exit 2
+		;;
+esac
+
+studio_version="${studio_version//, /.}"
+studio_version="${studio_version//,/.}"
+studio_version="${studio_version// /}"
+
+[[ "${studio_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+	echo "update-reflection: Studio reported invalid four-component version '${studio_version}'" >&2
+	exit 2
+}
+
+cache_root="${XDG_CACHE_HOME:-${HOME}/.cache}/carbon/reflection/${build_id}-${studio_version}"
+api_dump="${cache_root}/API-Dump.json"
+mkdir -p -- "${cache_root}"
+
+if [[ ! -s "${api_dump}" ]]; then
+	temporary="${api_dump}.tmp.$$"
+	trap 'rm -f -- "${temporary}"' EXIT
+	if [[ "$(uname -s)" == Linux ]]; then
+		studio_argument_path="$(wslpath -w "${temporary}")"
+	else
+		studio_argument_path="${temporary}"
+	fi
+	"${studio_executable}" -FullAPI "${studio_argument_path}"
+	[[ -s "${temporary}" ]] || {
+		echo "update-reflection: Studio did not emit an API dump for ${studio_version}" >&2
+		exit 2
+	}
+	mv -- "${temporary}" "${api_dump}"
+	trap - EXIT
+fi
+
+(
+	cd -- "${REPO}/studio-plugin"
+	lune run scripts/update-reflection-database.luau "${api_dump}" "${studio_version}"
+	lune run scripts/generate-database.luau
+)
+
+printf 'Reflection data now targets Roblox Studio %s (%s)\n' "${studio_version}" "${build_id}"

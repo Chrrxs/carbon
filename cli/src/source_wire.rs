@@ -9,7 +9,7 @@ use rbx_dom_weak::{
 	},
 	Ustr, UstrMap,
 };
-use rbx_reflection::{DataType, PropertyKind};
+use rbx_reflection::{DataType, PropertyKind, PropertySerialization};
 use serde::ser::SerializeMap;
 
 use crate::{resolution::UnresolvedValue, util};
@@ -482,6 +482,25 @@ pub(crate) fn canonical_variant_type(class: &str, property: &str) -> Option<Vari
 			return match property.data_type {
 				DataType::Value(ty) => Some(ty),
 				DataType::Enum(_) => Some(VariantType::Enum),
+				_ => None,
+			};
+		}
+		current = descriptor.superclass?;
+	}
+}
+
+pub(crate) fn canonical_property_serializes(class: &str, property: &str) -> Option<bool> {
+	let database = util::get_reflection_database();
+	let mut current = class;
+	loop {
+		let descriptor = database.classes.get(current)?;
+		if let Some(property) = descriptor.properties.get(property) {
+			return match property.kind {
+				PropertyKind::Canonical { ref serialization } => Some(matches!(
+					serialization,
+					PropertySerialization::Serializes | PropertySerialization::SerializesAs(_)
+				)),
+				PropertyKind::Alias { alias_for } => canonical_property_serializes(current, alias_for),
 				_ => None,
 			};
 		}

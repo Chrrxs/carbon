@@ -2,62 +2,122 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use env_logger::WriteStyle;
 use log::LevelFilter;
-use rbx_reflection::{ClassDescriptor, ClassTag, DataType, PropertyDescriptor, PropertyTag, ReflectionDatabase};
-use std::{env, fs, path::PathBuf, process::Command, sync::LazyLock};
+use rbx_dom_weak::types::VariantType;
+use rbx_reflection::{
+	ClassDescriptor, ClassTag, DataType, EnumDescriptor, PropertyDescriptor, PropertyKind, PropertySerialization,
+	PropertyTag, ReflectionDatabase, Scriptability,
+};
+use serde::Deserialize;
+use std::{collections::HashMap, env, fs, path::PathBuf, process::Command, sync::LazyLock};
 
-const ROBLOX_729_VERSION: [u32; 4] = [0, 729, 0, 7290838];
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReflectionOverlay {
+	version: [u32; 4],
+	classes: HashMap<String, OverlayClass>,
+	enums: HashMap<String, OverlayEnum>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayClass {
+	superclass: Option<String>,
+	tags: Vec<ClassTag>,
+	properties: HashMap<String, OverlayProperty>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayProperty {
+	data_type: OverlayDataType,
+	scriptability: Scriptability,
+	tags: Vec<PropertyTag>,
+	serializes: bool,
+}
+
+#[derive(Deserialize)]
+enum OverlayDataType {
+	Value(VariantType),
+	Enum(String),
+}
+
+#[derive(Deserialize)]
+struct OverlayEnum {
+	items: HashMap<String, u32>,
+}
+
+static REFLECTION_OVERLAY: LazyLock<ReflectionOverlay> = LazyLock::new(|| {
+	serde_json::from_slice(include_bytes!("../../studio-plugin/src/Lib/Dom/reflection.json"))
+		.expect("bundled Carbon reflection overlay should decode")
+});
 
 static REFLECTION_DATABASE: LazyLock<ReflectionDatabase<'static>> = LazyLock::new(|| {
-	let mut database = rbx_reflection_database::get_local()
-		.ok()
-		.flatten()
-		.unwrap_or_else(rbx_reflection_database::get_bundled)
-		.clone();
+	let overlay = &*REFLECTION_OVERLAY;
+	let mut database = rbx_reflection_database::get_bundled().clone();
+	database.version = overlay.version;
 
-	// rbx_reflection_database 3.0.0 is bundled from Roblox 0.728. Fill only
-	// missing 0.729 descriptors so a current/future local database remains
-	// authoritative.
-	for (name, is_service) in [
-		("DeviceDisplayService", true),
-		("DisplayWakeLock", false),
-		("PopLatencyService", true),
-	] {
-		database.classes.entry(name).or_insert_with(|| {
-			let mut descriptor = ClassDescriptor::new(name);
-			descriptor.superclass = Some("Instance");
-			descriptor
-				.tags
-				.extend([ClassTag::NotCreatable, ClassTag::NotReplicated]);
-			if is_service {
-				descriptor.tags.insert(ClassTag::Service);
-			}
-			descriptor
-		});
-	}
-
-	if let Some(voice_chat_service) = database.classes.get_mut("VoiceChatService") {
-		voice_chat_service
-			.properties
-			.entry("EnableVoiceVolumeControls")
-			.or_insert_with(|| {
-				let mut descriptor =
-					PropertyDescriptor::new("EnableVoiceVolumeControls", DataType::Enum("RolloutState"));
-				descriptor.tags.insert(PropertyTag::NotBrowsable);
-				descriptor
-			});
-	}
-
-	let overlay_is_complete = ["DeviceDisplayService", "DisplayWakeLock", "PopLatencyService"]
-		.iter()
-		.all(|name| database.classes.contains_key(name))
-		&& database
+	for (class_name, current) in &overlay.classes {
+		let class_name = class_name.as_str();
+		let descriptor = database
 			.classes
-			.get("VoiceChatService")
-			.is_some_and(|class| class.properties.contains_key("EnableVoiceVolumeControls"));
-	if database.version >= [0, 728, 0, 0] && database.version < ROBLOX_729_VERSION && overlay_is_complete {
-		database.version = ROBLOX_729_VERSION;
+			.entry(class_name)
+			.or_insert_with(|| ClassDescriptor::new(class_name));
+		descriptor.name = class_name;
+		descriptor.superclass = current.superclass.as_deref();
+		descriptor.tags = current.tags.iter().copied().collect();
+
+		for (property_name, current) in &current.properties {
+			let property_name = property_name.as_str();
+			let existing = descriptor.properties.get(property_name);
+			let data_type =
+				existing
+					.map(|property| property.data_type.clone())
+					.unwrap_or_else(|| match &current.data_type {
+						OverlayDataType::Value(data_type) => DataType::Value(*data_type),
+						OverlayDataType::Enum(enum_name) => DataType::Enum(enum_name.as_str()),
+					});
+			let preserve_kind = existing.is_some_and(|property| {
+				matches!(
+					&property.kind,
+					PropertyKind::Alias { .. }
+						| PropertyKind::Canonical {
+							serialization: PropertySerialization::SerializesAs(_) | PropertySerialization::Migrate(_)
+						}
+				)
+			});
+			let kind = if preserve_kind {
+				existing.expect("checked above").kind.clone()
+			} else {
+				PropertyKind::Canonical {
+					serialization: if current.serializes {
+						PropertySerialization::Serializes
+					} else {
+						PropertySerialization::DoesNotSerialize
+					},
+				}
+			};
+			let mut property = PropertyDescriptor::new(property_name, data_type);
+			property.scriptability = current.scriptability;
+			property.tags = current.tags.iter().copied().collect();
+			property.kind = kind;
+			descriptor.properties.insert(property_name, property);
+		}
 	}
 
+	database.enums = overlay
+		.enums
+		.iter()
+		.map(|(enum_name, current)| {
+			let enum_name = enum_name.as_str();
+			let mut descriptor = EnumDescriptor::new(enum_name);
+			descriptor.items = current
+				.items
+				.iter()
+				.map(|(name, value)| (name.as_str(), *value))
+				.collect();
+			(enum_name, descriptor)
+		})
+		.collect();
 	database
 });
 
@@ -141,7 +201,7 @@ pub fn get_reflection_database() -> &'static ReflectionDatabase<'static> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use rbx_reflection::{PropertyKind, PropertySerialization, Scriptability};
+	use rbx_reflection::{DataType, PropertyKind, PropertySerialization};
 	use std::time::{SystemTime, UNIX_EPOCH};
 
 	#[test]
@@ -161,44 +221,26 @@ mod tests {
 	}
 
 	#[test]
-	fn bundled_reflection_covers_roblox_729_class_delta() {
+	fn reflection_classifies_non_loadable_current_reference() {
 		let database = get_reflection_database();
-		assert!(database.version >= ROBLOX_729_VERSION);
-
-		for (name, is_service) in [
-			("DeviceDisplayService", true),
-			("DisplayWakeLock", false),
-			("PopLatencyService", true),
-		] {
-			let descriptor = database.classes.get(name).expect("0.729 class is missing");
-			assert_eq!(descriptor.superclass, Some("Instance"));
-			assert!(descriptor.properties.is_empty());
-			assert!(descriptor.default_properties.is_empty());
-			assert!(descriptor.tags.contains(&ClassTag::NotCreatable));
-			assert!(descriptor.tags.contains(&ClassTag::NotReplicated));
-			assert_eq!(descriptor.tags.contains(&ClassTag::Service), is_service);
-		}
-
-		let voice_chat_service = database
+		let input_action = database
 			.classes
-			.get("VoiceChatService")
-			.expect("VoiceChatService is missing");
-		let property = voice_chat_service
+			.get("InputAction")
+			.expect("InputAction reflection is missing");
+		let preferred_binding = input_action
 			.properties
-			.get("EnableVoiceVolumeControls")
-			.expect("0.729 VoiceChatService property is missing");
-		assert!(matches!(property.data_type, DataType::Enum("RolloutState")));
-		assert!(matches!(property.scriptability, Scriptability::None));
+			.get("PreferredBinding")
+			.expect("InputAction.PreferredBinding reflection is missing");
+
 		assert!(matches!(
-			property.kind,
+			preferred_binding.data_type,
+			DataType::Value(rbx_dom_weak::types::VariantType::Ref)
+		));
+		assert!(matches!(
+			preferred_binding.kind,
 			PropertyKind::Canonical {
-				serialization: PropertySerialization::Serializes
+				serialization: PropertySerialization::DoesNotSerialize
 			}
 		));
-		assert_eq!(property.tags.len(), 1);
-		assert!(property.tags.contains(&PropertyTag::NotBrowsable));
-		assert!(!voice_chat_service
-			.default_properties
-			.contains_key("EnableVoiceVolumeControls"));
 	}
 }

@@ -5,6 +5,7 @@
 //! module keeps the decoded place in one flat arena and assigns final source
 //! identities in place. The artifact writer can then consume the arena directly.
 
+use crate::carbon_warn;
 use anyhow::{bail, ensure, Context, Result};
 use rbx_binary::InstanceSource;
 use rbx_dom_weak::{
@@ -1907,16 +1908,9 @@ pub(crate) fn compile_validated(
 		.collect::<HashSet<_>>();
 	let mut sideband_reference_targets = HashMap::with_capacity(envelope.external_references.len());
 	let mut referenced_mapped_refs = HashSet::new();
+	let mut omitted_non_persistent_references = Vec::new();
 	for reference in &envelope.external_references {
 		let owner = topology.ordinal_refs[reference.owner_ordinal as usize];
-		let target = match reference.target {
-			CaptureReferenceTarget::Null => Ref::none(),
-			CaptureReferenceTarget::Ordinal(ordinal) => topology.ordinal_refs[ordinal as usize],
-			CaptureReferenceTarget::Mapped(target) => {
-				referenced_mapped_refs.insert(target);
-				target
-			}
-		};
 		let class = &envelope.nodes[reference.owner_ordinal as usize].class_name;
 		let name = if shell_ordinals.contains(&reference.owner_ordinal) {
 			let (name, data_type) = privileged::capture_shell_property_identity(class, &reference.property)?;
@@ -1933,7 +1927,21 @@ pub(crate) fn compile_validated(
 				"capture sideband {class}.{} is not a Ref property",
 				reference.property
 			);
+			let serializes = artifact_store::canonical_property_serializes(class, canonical)
+				.with_context(|| format!("capture canonical reference descriptor {class}.{canonical} is unknown"))?;
+			if !serializes {
+				omitted_non_persistent_references.push(format!("{class}.{}", reference.property));
+				continue;
+			}
 			Ustr::from(canonical)
+		};
+		let target = match reference.target {
+			CaptureReferenceTarget::Null => Ref::none(),
+			CaptureReferenceTarget::Ordinal(ordinal) => topology.ordinal_refs[ordinal as usize],
+			CaptureReferenceTarget::Mapped(target) => {
+				referenced_mapped_refs.insert(target);
+				target
+			}
 		};
 		if let Some(existing) = sideband_reference_targets.get(&(owner, name)) {
 			ensure!(
@@ -1945,6 +1953,22 @@ pub(crate) fn compile_validated(
 		}
 		sideband_reference_targets.insert((owner, name), target);
 		arena.get_mut(owner)?.properties.insert(name, Variant::Ref(target));
+	}
+	if !omitted_non_persistent_references.is_empty() {
+		omitted_non_persistent_references.sort_unstable();
+		omitted_non_persistent_references.dedup();
+		let omitted = omitted_non_persistent_references.len();
+		let details = omitted_non_persistent_references
+			.iter()
+			.take(8)
+			.cloned()
+			.collect::<Vec<_>>()
+			.join(", ");
+		carbon_warn!(
+			"Capture omitted {omitted} non-persistent reference descriptor{} that Studio cannot round-trip: {details}{}",
+			if omitted == 1 { "" } else { "s" },
+			if omitted > 8 { ", ..." } else { "" }
+		);
 	}
 	let sideband_references = sideband_reference_targets.keys().copied().collect::<HashSet<_>>();
 	let topology_elapsed = topology_started.elapsed();
@@ -3048,9 +3072,15 @@ mod tests {
 				.with_property(binary_property, Variant::Ref(target)),
 		);
 		let mut owner_model = Vec::new();
-		rbx_binary::to_writer(&mut owner_model, &dom, &[owner]).unwrap();
+		rbx_binary::Serializer::new()
+			.reflection_database(util::get_reflection_database())
+			.serialize(&mut owner_model, &dom, &[owner])
+			.unwrap();
 		let mut target_model = Vec::new();
-		rbx_binary::to_writer(&mut target_model, &dom, &[target]).unwrap();
+		rbx_binary::Serializer::new()
+			.reflection_database(util::get_reflection_database())
+			.serialize(&mut target_model, &dom, &[target])
+			.unwrap();
 		let artifact = framed_capture(&[(vec![2], owner_model), (vec![3], target_model)]);
 
 		let directory = std::env::temp_dir().join(format!("carbon-cross-chunk-reference-{}", uuid::Uuid::new_v4()));
@@ -3141,6 +3171,34 @@ mod tests {
 		assert_eq!(
 			owner.properties.get(&Ustr::from("Value")),
 			Some(&Variant::Ref(target.referent))
+		);
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn native_capture_omits_non_round_trippable_current_reference() {
+		let (compiled, directory) = compile_cross_chunk_reference(
+			"InputAction",
+			"PreferredBinding",
+			&[("PreferredBinding", CaptureReferenceTarget::Ordinal(3))],
+		);
+		let compiled = compiled.unwrap();
+		let owner = compiled.arena.nodes.iter().find(|node| node.name == "Owner").unwrap();
+		assert!(!owner.properties.contains_key(&Ustr::from("PreferredBinding")));
+		assert!(compiled.referenced_mapped_refs.is_empty());
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn native_capture_rejects_unknown_reference_descriptor() {
+		let (compiled, directory) = compile_cross_chunk_reference(
+			"InputAction",
+			"PreferredBinding",
+			&[("FutureBinding", CaptureReferenceTarget::Ordinal(3))],
+		);
+		assert_eq!(
+			compiled.unwrap_err().to_string(),
+			"capture reference descriptor InputAction.FutureBinding is unknown"
 		);
 		std::fs::remove_dir_all(directory).unwrap();
 	}

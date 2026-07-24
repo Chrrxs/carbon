@@ -63,6 +63,9 @@ jobs:
       - name: Install plugin toolchain
         working-directory: studio-plugin
         run: rokit install --no-trust-check
+      - name: Test reflection database updates
+        working-directory: studio-plugin
+        run: lune run scripts/test-reflection-database-update.luau
       - name: Verify generated reflection database
         working-directory: studio-plugin
         run: lune run scripts/generate-database.luau -- --check

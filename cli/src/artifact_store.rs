@@ -38,8 +38,9 @@ use crate::{
 
 use crate::source_wire::{adapt_lighting_output_properties, normalize_wire_attributes};
 pub(crate) use crate::source_wire::{
-	canonical_property_name, canonical_variant_type, capture_synthesized_defaults, cframe_semantically_equal,
-	decode_exact_raw, exact_raw_bytes, is_omittable_default, validate_capture_property, WireProperties,
+	canonical_property_name, canonical_property_serializes, canonical_variant_type, capture_synthesized_defaults,
+	cframe_semantically_equal, decode_exact_raw, exact_raw_bytes, is_omittable_default, validate_capture_property,
+	WireProperties,
 };
 
 pub const MANIFEST_IDENTITY_ATTRIBUTE: &str = "__StudioWorktree_CarbonManifestId";
