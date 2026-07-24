@@ -579,7 +579,16 @@ fn launch_through_mcp(
 ) -> std::result::Result<ManagedStudioLifecycle, ManagedLaunchFailure> {
 	let (studio_executable, loader_path) =
 		mcp_launch_paths(rml_launch).map_err(|error| ManagedLaunchFailure::pre_dispatch(&mcp.endpoint, error))?;
-	let payload = mcp_launch_request(&path, &studio_executable, &loader_path, rml_launch.build_version());
+	let dotnet_root = std::env::var("DOTNET_ROOT")
+		.ok()
+		.filter(|value| !value.trim().is_empty());
+	let payload = mcp_launch_request(
+		&path,
+		&studio_executable,
+		&loader_path,
+		rml_launch.build_version(),
+		dotnet_root.as_deref(),
+	);
 	let result = mcp_tool(
 		&mcp.endpoint,
 		mcp.auth_token.as_deref(),
@@ -619,8 +628,14 @@ fn launch_through_mcp(
 	.map_err(|error| ManagedLaunchFailure::invalid_response(&mcp.endpoint, error))
 }
 
-fn mcp_launch_request(path: &std::path::Path, studio: &str, loader: &str, build_version: &str) -> Value {
-	json!({
+fn mcp_launch_request(
+	path: &std::path::Path,
+	studio: &str,
+	loader: &str,
+	build_version: &str,
+	dotnet_root: Option<&str>,
+) -> Value {
+	let mut payload = json!({
 		"action": "launch",
 		"source": "local_file",
 		"local_place_file": path,
@@ -633,7 +648,11 @@ fn mcp_launch_request(path: &std::path::Path, studio: &str, loader: &str, build_
 			"remove": [rml::LOADED_BUILD_ENV]
 		},
 		"wait_for_connection": false
-	})
+	});
+	if let Some(dotnet_root) = dotnet_root {
+		payload["process_environment"]["set"]["DOTNET_ROOT"] = Value::String(dotnet_root.to_owned());
+	}
+	payload
 }
 
 fn mcp_launch_paths(rml_launch: &rml::Launch) -> Result<(String, String)> {
@@ -1531,6 +1550,7 @@ mod tests {
 			r"C:\Roblox\RobloxStudioBeta.exe",
 			r"C:\Carbon\RobloxModLoader\roblox_modloader.dll",
 			"0.0.0+build.test",
+			Some(r"C:\Users\builder\.dotnet"),
 		);
 
 		assert_eq!(payload["action"], "launch");
@@ -1544,6 +1564,10 @@ mod tests {
 		assert_eq!(
 			payload["process_environment"]["set"][rml::EXPECTED_BUILD_ENV],
 			"0.0.0+build.test"
+		);
+		assert_eq!(
+			payload["process_environment"]["set"]["DOTNET_ROOT"],
+			r"C:\Users\builder\.dotnet"
 		);
 		assert_eq!(payload["process_environment"]["remove"], json!([rml::LOADED_BUILD_ENV]));
 		assert_eq!(payload["wait_for_connection"], false);
