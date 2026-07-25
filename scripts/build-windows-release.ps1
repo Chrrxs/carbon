@@ -63,21 +63,25 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 $rmlPackage = Join-Path $repo "target\windows-rml-package"
 $studioPlugin = Join-Path $repo "target\Carbon-windows.rbxm"
 $bash = Resolve-GitBash
+$environmentVariableNames = @(
+    "CARBON_BUILD_IDENTITY",
+    "CARBON_BUILD_VERSION",
+    "CARBON_STUDIO_PLUGIN_BUNDLE",
+    "CARBON_RML_BUNDLE",
+    "Path",
+    "INCLUDE",
+    "LIB"
+)
+$previousEnvironment = @{}
+foreach ($name in $environmentVariableNames) {
+    if (Test-Path -LiteralPath "Env:$name") {
+        $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+    }
+}
 
 Push-Location $repo
 try {
-    & (Join-Path $repo "scripts\build-rml.ps1") `
-        -SourceDir (Join-Path $repo "rml") `
-        -BuildDir $RmlBuildDir `
-        -PackageDir $rmlPackage `
-        -BuildVersion $Version
-
-    $env:CARBON_BUILD_VERSION = $Version
-    Invoke-Checked -Program $bash -CommandArguments @(
-        "./scripts/build-studio-plugin",
-        "target/Carbon-windows.rbxm"
-    )
-
+    [Environment]::SetEnvironmentVariable("CARBON_BUILD_IDENTITY", $null, "Process")
     $identityOutput = & $bash "./scripts/build-identity"
     if ($LASTEXITCODE -ne 0) {
         throw "scripts/build-identity exited with code $LASTEXITCODE"
@@ -88,6 +92,17 @@ try {
     }
 
     $env:CARBON_BUILD_IDENTITY = $buildIdentity
+    & (Join-Path $repo "scripts\build-rml.ps1") `
+        -SourceDir (Join-Path $repo "rml") `
+        -BuildDir $RmlBuildDir `
+        -PackageDir $rmlPackage `
+        -BuildVersion $buildIdentity
+
+    $env:CARBON_BUILD_VERSION = $Version
+    Invoke-Checked -Program $bash -CommandArguments @(
+        "./scripts/build-studio-plugin",
+        "target/Carbon-windows.rbxm"
+    )
     $env:CARBON_STUDIO_PLUGIN_BUNDLE = $studioPlugin
     $env:CARBON_RML_BUNDLE = $rmlPackage
     Invoke-Checked -Program "cargo.exe" -CommandArguments @(
@@ -98,7 +113,17 @@ try {
         "carbon"
     )
 } finally {
-    Pop-Location
+    try {
+        foreach ($name in $environmentVariableNames) {
+            if ($previousEnvironment.ContainsKey($name)) {
+                [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], "Process")
+            } else {
+                [Environment]::SetEnvironmentVariable($name, $null, "Process")
+            }
+        }
+    } finally {
+        Pop-Location
+    }
 }
 
 $executable = Join-Path $repo "target\release\carbon.exe"

@@ -338,7 +338,7 @@ impl Bridge {
 		anyhow::bail!("RML bridge for Studio session {studio_session_id} ({instance_id}) is unavailable")
 	}
 
-	fn active_bridge_ids_for_process(process_id: Option<u32>) -> Result<HashSet<String>> {
+	fn active_bridge_ids_for_process(process_id: Option<u32>, require_engine_ready: bool) -> Result<HashSet<String>> {
 		let mut active = HashSet::new();
 		let (sender, receiver) = mpsc::channel();
 		for path in discovery_paths()? {
@@ -365,7 +365,12 @@ impl Bridge {
 					)
 					.ok()?;
 					let capabilities = bridge.get::<Capabilities>("v1/capabilities").ok()?;
-					is_ready_bridge(&bridge.discovery, &capabilities, process_id)
+					let attested = if require_engine_ready {
+						is_ready_bridge(&bridge.discovery, &capabilities, process_id)
+					} else {
+						is_loaded_bridge(&bridge.discovery, &capabilities, process_id)
+					};
+					attested
 						.then_some(capabilities)
 						.map(|capabilities| capabilities.bridge_id)
 				})();
@@ -380,7 +385,7 @@ impl Bridge {
 	}
 
 	pub fn active_bridge_ids() -> Result<HashSet<String>> {
-		Self::active_bridge_ids_for_process(None)
+		Self::active_bridge_ids_for_process(None, true)
 	}
 
 	pub fn wait_for_active(excluded: &HashSet<String>, timeout: Duration) -> Result<Self> {
@@ -402,9 +407,17 @@ impl Bridge {
 	}
 
 	pub fn wait_for_process(process_id: u32, timeout: Duration) -> Result<Self> {
+		Self::wait_for_process_attestation(process_id, timeout, true)
+	}
+
+	pub fn wait_for_loaded_process(process_id: u32, timeout: Duration) -> Result<Self> {
+		Self::wait_for_process_attestation(process_id, timeout, false)
+	}
+
+	fn wait_for_process_attestation(process_id: u32, timeout: Duration, require_engine_ready: bool) -> Result<Self> {
 		let deadline = std::time::Instant::now() + timeout;
 		loop {
-			let candidates = Self::active_bridge_ids_for_process(Some(process_id))?
+			let candidates = Self::active_bridge_ids_for_process(Some(process_id), require_engine_ready)?
 				.into_iter()
 				.collect::<Vec<_>>();
 			match candidates.as_slice() {
@@ -619,12 +632,16 @@ impl Bridge {
 	}
 }
 
-fn is_ready_bridge(discovery: &Discovery, capabilities: &Capabilities, process_id: Option<u32>) -> bool {
+fn is_loaded_bridge(discovery: &Discovery, capabilities: &Capabilities, process_id: Option<u32>) -> bool {
 	capabilities.bridge_id == discovery.bridge_id
 		&& capabilities.process_id == discovery.process_id
+		&& process_id.is_none_or(|expected| capabilities.process_id == expected)
+}
+
+fn is_ready_bridge(discovery: &Discovery, capabilities: &Capabilities, process_id: Option<u32>) -> bool {
+	is_loaded_bridge(discovery, capabilities, process_id)
 		&& capabilities.engine_ready
 		&& capabilities.engine_generation != 0
-		&& process_id.is_none_or(|expected| capabilities.process_id == expected)
 }
 
 fn validate_wsl_endpoint(endpoint: &str) -> Result<String> {
@@ -736,13 +753,12 @@ fn discovery_paths() -> Result<Vec<PathBuf>> {
 	Ok(paths)
 }
 
-/// Remove only discovery records owned by one Studio process after capture has
-/// observed that process exit. RML normally removes these records on unload,
-/// but Studio can terminate without running managed unload hooks. The process
-/// identity is part of the authenticated discovery contract, so cleanup never
-/// guesses from timestamps or removes another open Studio's bridge.
-pub fn cleanup_process_discovery(process_id: u32) -> Result<usize> {
-	cleanup_discovery_records(discovery_record_paths()?, process_id)
+/// Remove only discovery records carrying the bridge identity attested for
+/// this Studio launch. A later Studio may reuse the PID but never this bridge
+/// ID, so cleanup cannot erase another live launch.
+pub fn cleanup_bridge_discovery(process_id: u32, bridge_id: &str) -> Result<usize> {
+	validate_bridge_id(bridge_id)?;
+	cleanup_discovery_records(discovery_record_paths()?, process_id, bridge_id)
 }
 
 fn discovery_record_paths() -> Result<Vec<PathBuf>> {
@@ -782,25 +798,15 @@ fn route_registry_paths(routes: &Path) -> Vec<PathBuf> {
 		.collect()
 }
 
-fn cleanup_discovery_records(paths: Vec<PathBuf>, process_id: u32) -> Result<usize> {
+fn cleanup_discovery_records(paths: Vec<PathBuf>, process_id: u32, bridge_id: &str) -> Result<usize> {
 	let mut removed = 0;
 	for path in paths {
-		let Some(discovery) = fs::read(&path)
-			.ok()
-			.and_then(|bytes| serde_json::from_slice::<Discovery>(&bytes).ok())
-		else {
-			continue;
-		};
-		if discovery.process_id != process_id {
-			continue;
-		}
-
-		// Re-read immediately before deletion so a malformed/replaced file can
-		// never be removed based on a stale observation.
+		// Re-read immediately before deletion so a malformed/replaced file or a
+		// later Studio launch that reused the PID can never lose its record.
 		let still_owned = fs::read(&path)
 			.ok()
 			.and_then(|bytes| serde_json::from_slice::<Discovery>(&bytes).ok())
-			.is_some_and(|current| current.process_id == process_id && current.bridge_id == discovery.bridge_id);
+			.is_some_and(|current| current.process_id == process_id && current.bridge_id == bridge_id);
 		if !still_owned {
 			continue;
 		}
@@ -1080,6 +1086,8 @@ mod tests {
 	fn discovery_waits_until_the_exact_process_has_an_attached_engine_generation() {
 		let (discovery, mut capabilities) = discovery_and_capabilities(false, 0);
 		assert!(!is_ready_bridge(&discovery, &capabilities, Some(42)));
+		assert!(is_loaded_bridge(&discovery, &capabilities, Some(42)));
+		assert!(!is_loaded_bridge(&discovery, &capabilities, Some(7)));
 		capabilities.engine_ready = true;
 		assert!(!is_ready_bridge(&discovery, &capabilities, Some(42)));
 		capabilities.engine_generation = 1;
@@ -1108,12 +1116,16 @@ mod tests {
 		fs::write(&route, &exited_json).unwrap();
 		fs::write(&other, serde_json::to_vec(&open).unwrap()).unwrap();
 
+		let mut reused = open.clone();
+		reused.process_id = 42;
+		fs::write(&route, serde_json::to_vec(&reused).unwrap()).unwrap();
 		assert_eq!(
-			cleanup_discovery_records(vec![main.clone(), route.clone(), other.clone()], 42).unwrap(),
-			2
+			cleanup_discovery_records(vec![main.clone(), route.clone(), other.clone()], 42, &exited.bridge_id,)
+				.unwrap(),
+			1
 		);
 		assert!(!main.exists());
-		assert!(!route.exists());
+		assert!(route.exists());
 		assert!(other.exists());
 		fs::remove_dir_all(root).unwrap();
 	}

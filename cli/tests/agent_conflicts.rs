@@ -99,11 +99,15 @@ fn write_nested_artifact(path: &Path, root: Ref, parent: Ref, child: Ref, child_
 	artifact_store::extract_snapshot(snapshot, "Game".to_owned(), path).unwrap();
 }
 
+fn shell_quote(path: &Path) -> String {
+	format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 fn initialize_repository(repository: &Path, carbon: &Path) {
 	git(repository, ["init", "-b", "main"]);
 	git(repository, ["config", "user.name", "Carbon Test"]);
 	git(repository, ["config", "user.email", "carbon@example.invalid"]);
-	let driver = format!("{} merge-artifact %O %A %B %P", carbon.display());
+	let driver = format!("{} merge-artifact %O %A %B %P", shell_quote(carbon));
 	git(
 		repository,
 		["config", "merge.carbon.name", "Carbon semantic artifact merge"],

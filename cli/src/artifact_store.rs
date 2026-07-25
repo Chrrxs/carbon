@@ -327,22 +327,61 @@ fn replace_file_atomic(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn replace_file_atomic(source: &Path, destination: &Path) -> Result<()> {
-	use std::{iter, os::windows::ffi::OsStrExt};
 	use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
 
-	let source: Vec<u16> = source.as_os_str().encode_wide().chain(iter::once(0)).collect();
-	let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(iter::once(0)).collect();
+	let source_wide = windows_api_path(source)?;
+	let destination_wide = windows_api_path(destination)?;
 	let result = unsafe {
 		MoveFileExW(
-			source.as_ptr(),
-			destination.as_ptr(),
+			source_wide.as_ptr(),
+			destination_wide.as_ptr(),
 			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
 		)
 	};
 	if result == 0 {
-		return Err(std::io::Error::last_os_error()).context("failed to atomically replace Carbon artifact");
+		return Err(std::io::Error::last_os_error()).with_context(|| {
+			format!(
+				"failed to atomically replace Carbon artifact {} with {}",
+				destination.display(),
+				source.display()
+			)
+		});
 	}
 	Ok(())
+}
+
+#[cfg(windows)]
+fn windows_api_path(path: &Path) -> Result<Vec<u16>> {
+	use std::os::windows::ffi::OsStrExt;
+
+	const SEPARATOR: u16 = b'\\' as u16;
+	const VERBATIM_PREFIX: [u16; 4] = [SEPARATOR, SEPARATOR, b'?' as u16, SEPARATOR];
+	const DEVICE_PREFIX: [u16; 4] = [SEPARATOR, SEPARATOR, b'.' as u16, SEPARATOR];
+	const UNC_PREFIX: [u16; 8] = [
+		SEPARATOR,
+		SEPARATOR,
+		b'?' as u16,
+		SEPARATOR,
+		b'U' as u16,
+		b'N' as u16,
+		b'C' as u16,
+		SEPARATOR,
+	];
+
+	let absolute = std::path::absolute(path)?;
+	let wide = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+	let mut encoded = Vec::with_capacity(wide.len() + UNC_PREFIX.len() + 1);
+	if wide.starts_with(&VERBATIM_PREFIX) || wide.starts_with(&DEVICE_PREFIX) {
+		encoded.extend_from_slice(&wide);
+	} else if wide.starts_with(&[SEPARATOR, SEPARATOR]) {
+		encoded.extend_from_slice(&UNC_PREFIX);
+		encoded.extend_from_slice(&wide[2..]);
+	} else {
+		encoded.extend_from_slice(&VERBATIM_PREFIX);
+		encoded.extend_from_slice(&wide);
+	}
+	encoded.push(0);
+	Ok(encoded)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -358,9 +397,9 @@ pub(crate) fn install_artifact_file(source: &Path, destination: &Path) -> Result
 	replace_file_atomic(source, destination)
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+fn sync_directory(_path: &Path) -> Result<()> {
 	#[cfg(unix)]
-	File::open(path)?.sync_all()?;
+	File::open(_path)?.sync_all()?;
 	Ok(())
 }
 
@@ -2552,7 +2591,7 @@ fn install_git_merge_candidate(candidate: &Path, current: &Path) -> Result<()> {
 	let replacement = current_parent.join(format!(".carbon-merge-result-{}.tmp", Uuid::new_v4().simple()));
 	let result = (|| {
 		fs::copy(candidate, &replacement)?;
-		File::open(&replacement)?.sync_all()?;
+		OpenOptions::new().write(true).open(&replacement)?.sync_all()?;
 		replace_file_atomic(&replacement, current)?;
 		sync_directory(current_parent)?;
 		Ok(())

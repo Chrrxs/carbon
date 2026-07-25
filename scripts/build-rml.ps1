@@ -267,25 +267,6 @@ $env:LIB = @(
     (Join-Path $windowsSdkRoot "Lib\$windowsSdkVersion\ucrt\x64"),
     (Join-Path $windowsSdkRoot "Lib\$windowsSdkVersion\um\x64")
 ) -join ';'
-Write-Host "[fresh-rml] Configuring native loader with MSVC and Ninja"
-Invoke-Checked -Program $cmake -Arguments @(
-    "-S", $SourceDir,
-    "-B", $BuildDir,
-    "-G", "Ninja",
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-DCMAKE_MAKE_PROGRAM=$ninja",
-    "-DCMAKE_RC_COMPILER=$resourceCompiler",
-    "-DCMAKE_MT=$manifestTool",
-    "-DROBLOX_MODLOADER_BUILD_DUMPER=OFF",
-    "-DROBLOX_MODLOADER_BUILD_EXAMPLES=OFF",
-    "-DROBLOX_MODLOADER_BUILD_MANAGED_PROJECTS=OFF",
-    "-DROBLOX_MODLOADER_USE_CMAKE_CSHARP=OFF",
-    "-DRML_FORCE_INCLUDE_COMMON_WITHOUT_PCH=OFF",
-    "-DCARBON_BUILD_VERSION=$BuildVersion",
-    "-DBUILD_TESTING=OFF"
-)
-Invoke-Checked -Program $cmake -Arguments @("--build", $BuildDir, "--parallel", "--target", "roblox_modloader")
-
 Write-Host "[fresh-rml] Ensuring an isolated .NET 10 SDK"
 $dotnetSdkVersion = "10.0.302"
 $dotnetSdkArchiveName = "dotnet-sdk-10.0.302-win-x64.zip"
@@ -313,6 +294,26 @@ $installedDotnetSdk = Join-Path $dotnetRoot "sdk\$dotnetSdkVersion"
 if (-not (Test-Path -LiteralPath $installedDotnetSdk -PathType Container)) {
     throw "isolated .NET SDK version directory is missing: $installedDotnetSdk"
 }
+$env:Path = "$dotnetRoot;$env:Path"
+
+Write-Host "[fresh-rml] Configuring native loader with MSVC and Ninja"
+Invoke-Checked -Program $cmake -Arguments @(
+    "-S", $SourceDir,
+    "-B", $BuildDir,
+    "-G", "Ninja",
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_MAKE_PROGRAM=$ninja",
+    "-DCMAKE_RC_COMPILER=$resourceCompiler",
+    "-DCMAKE_MT=$manifestTool",
+    "-DROBLOX_MODLOADER_BUILD_DUMPER=OFF",
+    "-DROBLOX_MODLOADER_BUILD_EXAMPLES=OFF",
+    "-DROBLOX_MODLOADER_BUILD_MANAGED_PROJECTS=OFF",
+    "-DROBLOX_MODLOADER_USE_CMAKE_CSHARP=OFF",
+    "-DRML_FORCE_INCLUDE_COMMON_WITHOUT_PCH=OFF",
+    "-DCARBON_BUILD_VERSION=$BuildVersion",
+    "-DBUILD_TESTING=OFF"
+)
+Invoke-Checked -Program $cmake -Arguments @("--build", $BuildDir, "--parallel", "--target", "roblox_modloader")
 
 Write-Host "[fresh-rml] Testing the complete managed runtime"
 $bridgeTests = Join-Path $SourceDir "code\dotnet\CarbonBridge.Tests\CarbonBridge.Tests.csproj"

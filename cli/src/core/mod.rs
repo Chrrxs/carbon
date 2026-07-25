@@ -3211,6 +3211,7 @@ mod source_watcher_tests {
 	#[test]
 	fn truncate_and_partial_notifications_coalesce_to_the_final_script_source() {
 		let (sender, receiver) = crossbeam_channel::unbounded();
+		let _keepalive = sender.clone();
 		let state = Arc::new(Mutex::new(Ok("partial".to_owned())));
 		let writer_state = state.clone();
 		thread::spawn(move || {
@@ -3239,6 +3240,7 @@ mod source_watcher_tests {
 	#[test]
 	fn transient_invalid_utf8_state_waits_for_the_final_valid_source() {
 		let (sender, receiver) = crossbeam_channel::unbounded();
+		let _keepalive = sender.clone();
 		let state = Arc::new(Mutex::new(Err("Script source is not valid UTF-8".to_owned())));
 		let writer_state = state.clone();
 		thread::spawn(move || {

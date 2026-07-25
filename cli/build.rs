@@ -8,6 +8,26 @@ const STUDIO_PLUGIN_BUNDLE_ENV: &str = "CARBON_STUDIO_PLUGIN_BUNDLE";
 const RML_BUNDLE_ENV: &str = "CARBON_RML_BUNDLE";
 const RML_GENERATED_SOURCE: &str = "carbon_rml_bundle.rs";
 
+fn resolve_bash() -> PathBuf {
+	#[cfg(windows)]
+	if let Ok(output) = Command::new("where.exe").arg("git.exe").output() {
+		if output.status.success() {
+			for line in String::from_utf8_lossy(&output.stdout).lines() {
+				let git = Path::new(line.trim());
+				let Some(root) = git.parent().and_then(Path::parent) else {
+					continue;
+				};
+				let candidate = root.join("bin").join("bash.exe");
+				if candidate.is_file() {
+					return candidate;
+				}
+			}
+		}
+	}
+
+	PathBuf::from("bash")
+}
+
 fn main() {
 	let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
 	let repository = manifest_dir.parent().expect("the CLI lives beneath the monorepo root");
@@ -38,7 +58,7 @@ fn main() {
 	let version = match env::var("CARBON_BUILD_VERSION") {
 		Ok(version) => version,
 		Err(_) => {
-			let output = Command::new("bash")
+			let output = Command::new(resolve_bash())
 				.arg(&version_script)
 				.current_dir(repository)
 				.output()
@@ -60,7 +80,7 @@ fn main() {
 	let identity = match env::var("CARBON_BUILD_IDENTITY") {
 		Ok(identity) => identity,
 		Err(_) => {
-			let output = Command::new("bash")
+			let output = Command::new(resolve_bash())
 				.arg(&identity_script)
 				.current_dir(repository)
 				.output()

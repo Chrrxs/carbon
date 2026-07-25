@@ -178,11 +178,14 @@
           "kind": "mcp",
           "tool": "manage_instance",
           "arguments": {"action": "status", "instance_id": "${studio_instance}"},
-          "timeout_seconds": 30,
+          "timeout_seconds": 120,
+          "poll_interval_ms": 100,
           "checks": [
             {"pointer": "/managed", "op": "equals", "value": true},
             {"pointer": "/source", "op": "equals", "value": "local_file"},
             {"pointer": "/process_running", "op": "equals", "value": true},
+            {"pointer": "/process_authorized", "op": "equals", "value": true},
+            {"pointer": "/process_ownership_released", "op": "equals", "value": true},
             {"pointer": "/state", "op": "equals", "value": "connected"}
           ],
           "capture": {

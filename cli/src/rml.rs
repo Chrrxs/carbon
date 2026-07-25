@@ -3,11 +3,13 @@ use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::info;
 use serde::{Deserialize, Serialize};
-#[cfg(any(carbon_bundled_rml, test))]
+#[cfg(any(carbon_bundled_rml, test, target_os = "linux", target_os = "windows"))]
 use std::io::Write;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::io::{BufRead, BufReader};
 use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::{
 	env, fs,
 	fs::{File, OpenOptions},
@@ -111,6 +113,366 @@ impl Launch {
 	pub fn bootstrap_updated(&self) -> bool {
 		self.bootstrap_updated
 	}
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn powershell_injection_script(
+	process_id: u32,
+	loader: &str,
+	studio_executable: &str,
+	started_at_file_time: u64,
+) -> String {
+	let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
+	let encoded_studio = BASE64_STANDARD.encode(studio_executable.as_bytes());
+	r#"
+$processId = __CARBON_PROCESS_ID__
+$startedAtFileTime = [uint64]__CARBON_STARTED_AT_FILE_TIME__
+$loader = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_LOADER_BASE64__'))
+$studio = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_STUDIO_BASE64__'))
+if ($loader -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)') { throw 'Carbon supplied a non-absolute RML loader path' }
+if ($studio -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)') { throw 'Carbon supplied a non-absolute Studio executable path' }
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class CarbonRmlInjector
+{
+    private const uint ProcessAccess = 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0400 | 0x1000;
+    private const uint MemCommit = 0x1000;
+    private const uint MemReserve = 0x2000;
+    private const uint MemRelease = 0x8000;
+    private const uint PageReadWrite = 0x04;
+    private const uint WaitObject0 = 0x00000000;
+    private const uint WaitTimeout = 0x00000102;
+    private const uint CreateSuspended = 0x00000004;
+    private const uint ResumeFailed = 0xFFFFFFFF;
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileTime
+    {
+        public uint Low;
+        public uint High;
+    }
+
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(
+        IntPtr process,
+        uint flags,
+        StringBuilder executable,
+        ref uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessTimes(
+        IntPtr process,
+        out FileTime creation,
+        out FileTime exit,
+        out FileTime kernel,
+        out FileTime user);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr VirtualAllocEx(
+        IntPtr process,
+        IntPtr address,
+        UIntPtr size,
+        uint allocationType,
+        uint protect);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool VirtualFreeEx(IntPtr process, IntPtr address, UIntPtr size, uint freeType);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteProcessMemory(
+        IntPtr process,
+        IntPtr address,
+        byte[] buffer,
+        UIntPtr size,
+        out UIntPtr written);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string moduleName);
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateRemoteThread(
+        IntPtr process,
+        IntPtr attributes,
+        UIntPtr stackSize,
+        IntPtr startAddress,
+        IntPtr parameter,
+        uint flags,
+        out uint threadId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static string NormalizePath(string path)
+    {
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+        {
+            path = @"\\" + path.Substring(8);
+        }
+        else if (path.StartsWith(@"\\?\", StringComparison.Ordinal))
+        {
+            path = path.Substring(4);
+        }
+        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
+    }
+
+    private static void Check(bool condition, string operation)
+    {
+        if (!condition)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
+        }
+    }
+
+    public static void Inject(uint processId, string loader, string expectedExecutable, ulong expectedStartedAt)
+    {
+        byte[] path = Encoding.Unicode.GetBytes(loader + "\0");
+        IntPtr process = OpenProcess(ProcessAccess, false, processId);
+        Check(process != IntPtr.Zero, "OpenProcess");
+        IntPtr remote = IntPtr.Zero;
+        IntPtr thread = IntPtr.Zero;
+        bool remoteThreadFinished = false;
+        try
+        {
+            FileTime creation;
+            FileTime exit;
+            FileTime kernel;
+            FileTime user;
+            Check(GetProcessTimes(process, out creation, out exit, out kernel, out user), "GetProcessTimes");
+            ulong startedAt = ((ulong)creation.High << 32) | creation.Low;
+            if (startedAt != expectedStartedAt)
+            {
+                throw new InvalidOperationException(
+                    "Carbon injector process creation time does not match the launched Studio process");
+            }
+
+            var executable = new StringBuilder(32768);
+            uint executableLength = (uint)executable.Capacity;
+            Check(
+                QueryFullProcessImageName(process, 0, executable, ref executableLength),
+                "QueryFullProcessImageName");
+            if (!string.Equals(
+                NormalizePath(executable.ToString()),
+                NormalizePath(expectedExecutable),
+                StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "Carbon injector process identity does not match the launched Studio executable");
+            }
+
+            remote = VirtualAllocEx(
+                process,
+                IntPtr.Zero,
+                (UIntPtr)path.Length,
+                MemCommit | MemReserve,
+                PageReadWrite);
+            Check(remote != IntPtr.Zero, "VirtualAllocEx");
+
+            UIntPtr written;
+            Check(
+                WriteProcessMemory(process, remote, path, (UIntPtr)path.Length, out written)
+                    && written.ToUInt64() == (ulong)path.Length,
+                "WriteProcessMemory");
+
+            IntPtr kernel32 = GetModuleHandle("kernel32.dll");
+            Check(kernel32 != IntPtr.Zero, "GetModuleHandle");
+            IntPtr loadLibrary = GetProcAddress(kernel32, "LoadLibraryW");
+            Check(loadLibrary != IntPtr.Zero, "GetProcAddress");
+
+            uint threadId;
+            thread = CreateRemoteThread(
+                process,
+                IntPtr.Zero,
+                UIntPtr.Zero,
+                loadLibrary,
+                remote,
+                CreateSuspended,
+                out threadId);
+            Check(thread != IntPtr.Zero, "CreateRemoteThread");
+
+            Console.Out.WriteLine("CARBON_RML_INJECTOR_READY");
+            Console.Out.Flush();
+            if (!string.Equals(Console.In.ReadLine(), "CARBON_RML_INJECTOR_PROCEED", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("Carbon injector authorization was not confirmed");
+            }
+            if (ResumeThread(thread) == ResumeFailed)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed");
+            }
+            Console.Out.WriteLine("CARBON_RML_INJECTOR_STARTED");
+            Console.Out.Flush();
+            uint wait = WaitForSingleObject(thread, 30000);
+            if (wait == WaitTimeout)
+            {
+                throw new TimeoutException("RML loader injection timed out");
+            }
+            Check(wait == WaitObject0, "WaitForSingleObject");
+            remoteThreadFinished = true;
+            // The remote thread exit API truncates the 64-bit HMODULE returned by LoadLibraryW.
+            // Carbon verifies the loaded module through exact-build bridge attestation.
+
+        }
+        finally
+        {
+            if (thread != IntPtr.Zero)
+            {
+                CloseHandle(thread);
+            }
+            if (remote != IntPtr.Zero && (thread == IntPtr.Zero || remoteThreadFinished))
+            {
+                VirtualFreeEx(process, remote, UIntPtr.Zero, MemRelease);
+            }
+            CloseHandle(process);
+        }
+    }
+}
+'@
+[CarbonRmlInjector]::Inject([uint32]$processId, $loader, $studio, $startedAtFileTime)
+"#
+	.replace("__CARBON_PROCESS_ID__", &process_id.to_string())
+	.replace("__CARBON_STARTED_AT_FILE_TIME__", &started_at_file_time.to_string())
+	.replace("__CARBON_LOADER_BASE64__", &encoded_loader)
+	.replace("__CARBON_STUDIO_BASE64__", &encoded_studio)
+}
+
+#[cfg(target_os = "linux")]
+fn windows_loader_path(loader: &Path) -> Result<String> {
+	let output = Command::new("wslpath")
+		.args(["-w"])
+		.arg(loader)
+		.output()
+		.context("failed to translate the RML loader path for Windows")?;
+	ensure!(
+		output.status.success(),
+		"failed to translate the RML loader path for Windows: {}",
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	let loader = String::from_utf8(output.stdout)?.trim().to_owned();
+	ensure!(!loader.is_empty(), "Windows RML loader path is empty");
+	Ok(loader)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_loader_path(loader: &Path) -> Result<String> {
+	Ok(loader
+		.to_str()
+		.context("RML loader path is not valid UTF-8")?
+		.to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn reap_failed_injector(mut child: Child, error: anyhow::Error) -> anyhow::Error {
+	child.stdin.take();
+	match child.wait_with_output() {
+		Ok(output) => {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+			let stderr = stderr.trim();
+			if stderr.is_empty() {
+				error
+			} else {
+				error.context(format!("Carbon RML injector failed: {stderr}"))
+			}
+		}
+		Err(wait_error) => error.context(format!("failed to reap the Carbon RML injector: {wait_error}")),
+	}
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn inject_loader(
+	process_id: u32,
+	loader: &Path,
+	studio_executable: &str,
+	started_at_file_time: u64,
+	authorize: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+	ensure!(loader.is_file(), "RML loader is missing: {}", loader.display());
+	let loader = windows_loader_path(loader)?;
+	let script = powershell_injection_script(process_id, &loader, studio_executable, started_at_file_time);
+	let mut child = Command::new("powershell.exe")
+		.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.context("failed to start the Carbon RML injector")?;
+	let mut stdout = BufReader::new(
+		child
+			.stdout
+			.take()
+			.context("Carbon RML injector stdout is unavailable")?,
+	);
+	let mut ready = String::new();
+	if let Err(error) = stdout.read_line(&mut ready) {
+		child.stdout = Some(stdout.into_inner());
+		let error = anyhow::Error::new(error).context("failed to read Carbon RML injector readiness");
+		return Err(reap_failed_injector(child, error));
+	}
+	if ready.trim() != "CARBON_RML_INJECTOR_READY" {
+		child.stdout = Some(stdout.into_inner());
+		let error = anyhow::anyhow!("Carbon RML injector did not stage the exact launched Studio process");
+		return Err(reap_failed_injector(child, error));
+	}
+	let write_result = match child.stdin.as_mut() {
+		Some(stdin) => writeln!(stdin, "CARBON_RML_INJECTOR_PROCEED"),
+		None => {
+			child.stdout = Some(stdout.into_inner());
+			return Err(reap_failed_injector(
+				child,
+				anyhow::anyhow!("Carbon RML injector stdin is unavailable"),
+			));
+		}
+	};
+	if let Err(error) = write_result {
+		child.stdout = Some(stdout.into_inner());
+		return Err(reap_failed_injector(
+			child,
+			anyhow::Error::new(error).context("failed to start the staged Carbon RML injector"),
+		));
+	}
+	let mut started = String::new();
+	let started_result = stdout.read_line(&mut started);
+	child.stdout = Some(stdout.into_inner());
+	if let Err(error) = started_result {
+		let error = anyhow::Error::new(error).context("failed to read Carbon RML injector start confirmation");
+		return Err(reap_failed_injector(child, error));
+	}
+	if started.trim() != "CARBON_RML_INJECTOR_STARTED" {
+		let error = anyhow::anyhow!("Carbon RML injector did not start its staged remote thread");
+		return Err(reap_failed_injector(child, error));
+	}
+	if let Err(error) = authorize() {
+		return Err(reap_failed_injector(
+			child,
+			error.context("Carbon RML injection authorization failed"),
+		));
+	}
+	child.stdin.take();
+	let output = child
+		.wait_with_output()
+		.context("failed to wait for the Carbon RML injector")?;
+	ensure!(
+		output.status.success(),
+		"failed to load Carbon RML into Roblox Studio process {process_id}: {}",
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn inject_loader(
+	_process_id: u32,
+	_loader: &Path,
+	_studio_executable: &str,
+	_started_at_file_time: u64,
+	_authorize: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+	Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -726,7 +1088,7 @@ mod tests {
 	fn temp(name: &str) -> PathBuf {
 		let path = env::temp_dir().join(format!("carbon-rml-{name}-{}", Uuid::new_v4()));
 		fs::create_dir_all(&path).unwrap();
-		path
+		fs::canonicalize(path).unwrap()
 	}
 
 	fn fake_package(root: &Path) {
@@ -873,5 +1235,40 @@ mod tests {
 		let mut changed_code = second;
 		changed_code[500] = 43;
 		assert!(!bootstrap_bytes_compatible(&first, &changed_code));
+	}
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn explicit_loader_injection_is_process_scoped_and_path_safe() {
+		let loader = r"C:\Carbon\rml\loader'; throw 'unsafe\roblox_modloader.dll";
+		let studio = r"C:\Roblox\version'; throw 'unsafe\RobloxStudioBeta.exe";
+		let script = powershell_injection_script(47_312, loader, studio, 133_700_123_456);
+
+		assert!(!script.contains(loader));
+		assert!(!script.contains(studio));
+		assert!(script.contains(&BASE64_STANDARD.encode(loader.as_bytes())));
+		assert!(script.contains(&BASE64_STANDARD.encode(studio.as_bytes())));
+		assert!(!script.contains("__CARBON_LOADER_BASE64__"));
+		assert!(!script.contains("__CARBON_STUDIO_BASE64__"));
+		assert!(!script.contains("GetExitCodeThread"));
+		assert!(script.contains("$processId = 47312"));
+		assert!(script.contains("$startedAtFileTime = [uint64]133700123456"));
+		for operation in [
+			"OpenProcess",
+			"QueryFullProcessImageName",
+			"GetProcessTimes",
+			"VirtualAllocEx",
+			"WriteProcessMemory",
+			"CreateRemoteThread",
+			"LoadLibraryW",
+			"WaitForSingleObject",
+			"VirtualFreeEx",
+			"CARBON_RML_INJECTOR_READY",
+			"CARBON_RML_INJECTOR_PROCEED",
+			"CARBON_RML_INJECTOR_STARTED",
+			"CreateSuspended",
+			"ResumeThread",
+		] {
+			assert!(script.contains(operation), "missing {operation}");
+		}
 	}
 }

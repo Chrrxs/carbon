@@ -791,7 +791,7 @@ fn copy_new_file(source: &Path, destination: &Path) -> Result<bool> {
 	let temporary = parent.join(format!(".carbon-resolve-{}.tmp", Uuid::new_v4().simple()));
 	let result = (|| {
 		fs::copy(source, &temporary)?;
-		File::open(&temporary)?.sync_all()?;
+		OpenOptions::new().write(true).open(&temporary)?.sync_all()?;
 		fs::rename(&temporary, destination)?;
 		Ok(true)
 	})();
@@ -803,7 +803,7 @@ fn copy_new_file(source: &Path, destination: &Path) -> Result<bool> {
 
 fn copy_synced(source: &Path, destination: &Path) -> Result<()> {
 	fs::copy(source, destination)?;
-	File::open(destination)?.sync_all()?;
+	OpenOptions::new().write(true).open(destination)?.sync_all()?;
 	Ok(())
 }
 
