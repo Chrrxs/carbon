@@ -313,7 +313,7 @@ fn read_api_dump(path: &std::path::Path) -> Result<(String, ApiDump)> {
 	Ok((content, dump))
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 const FULL_API_POWERSHELL: &str = r#"
 $startInfo = New-Object System.Diagnostics.ProcessStartInfo
 $startInfo.FileName = $env:CARBON_REFLECTION_STUDIO
@@ -390,32 +390,22 @@ fn windows_path(path: &std::path::Path) -> Result<std::ffi::OsString> {
 	Ok(String::from_utf8(output.stdout)?.trim().into())
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Path) -> Result<()> {
-	#[cfg(target_os = "linux")]
 	let (studio, output) = (windows_path(&studio_info.executable)?, windows_path(output_path)?);
-	#[cfg(target_os = "windows")]
-	let (studio, output) = (
-		studio_info.executable.as_os_str().to_owned(),
-		output_path.as_os_str().to_owned(),
-	);
-
 	let mut command = Command::new("powershell.exe");
 	command
 		.args(["-NoProfile", "-NonInteractive", "-Command", FULL_API_POWERSHELL])
 		.env("CARBON_REFLECTION_STUDIO", studio)
 		.env("CARBON_REFLECTION_OUTPUT", output);
-	#[cfg(target_os = "linux")]
-	{
-		let mut wslenv = env::var("WSLENV").unwrap_or_default();
-		for variable in ["CARBON_REFLECTION_STUDIO", "CARBON_REFLECTION_OUTPUT"] {
-			if !wslenv.is_empty() {
-				wslenv.push(':');
-			}
-			wslenv.push_str(variable);
+	let mut wslenv = env::var("WSLENV").unwrap_or_default();
+	for variable in ["CARBON_REFLECTION_STUDIO", "CARBON_REFLECTION_OUTPUT"] {
+		if !wslenv.is_empty() {
+			wslenv.push(':');
 		}
-		command.env("WSLENV", wslenv);
+		wslenv.push_str(variable);
 	}
+	command.env("WSLENV", wslenv);
 
 	let output = command.output().context("failed to launch Studio FullAPI extraction")?;
 	ensure!(
@@ -427,15 +417,20 @@ fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Pat
 	Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Path) -> Result<()> {
 	use std::time::{Duration, Instant};
 
 	let mut child = Command::new(&studio_info.executable)
 		.arg("--fullApi")
 		.arg(output_path)
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
 		.spawn()
 		.with_context(|| format!("failed to launch Studio at {}", studio_info.executable.display()))?;
+	#[cfg(target_os = "windows")]
+	let process_id = child.id();
 	let deadline = Instant::now() + Duration::from_secs(45);
 	let mut last_length = 0;
 	let mut stable_polls = 0;
@@ -456,9 +451,16 @@ fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Pat
 		}
 		std::thread::sleep(Duration::from_millis(100));
 	}
+	#[cfg(target_os = "windows")]
+	let _ = Command::new("taskkill.exe")
+		.args(["/F", "/T", "/PID", &process_id.to_string()])
+		.output();
 	let _ = child.kill();
 	let _ = child.wait();
-	ensure!(output_path.is_file(), "Studio produced no FullAPI dump");
+	ensure!(
+		output_path.is_file() && read_api_dump(output_path).is_ok(),
+		"Studio produced no complete FullAPI dump"
+	);
 	Ok(())
 }
 

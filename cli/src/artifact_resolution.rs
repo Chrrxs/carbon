@@ -227,6 +227,66 @@ fn repository_for(path: &Path) -> Result<Option<PathBuf>> {
 	))
 }
 
+fn git_common_dir(root: &Path) -> Result<PathBuf> {
+	let output = git_checked(root, &[OsString::from("rev-parse"), OsString::from("--git-common-dir")])?;
+	let path = String::from_utf8(output).context("Git common directory is not UTF-8")?;
+	let path = PathBuf::from(path.trim());
+	Ok(if path.is_absolute() { path } else { root.join(path) })
+}
+
+#[cfg(target_os = "linux")]
+fn is_windows_drive_path(path: &str) -> bool {
+	let bytes = path.as_bytes();
+	bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
+}
+
+#[cfg(target_os = "linux")]
+fn windows_git_common_dir(root: &Path) -> Result<OsString> {
+	ensure!(
+		env::var_os("WSL_DISTRO_NAME").is_some(),
+		"Windows Git fallback is available only from WSL"
+	);
+	let common_dir = git_common_dir(root)?;
+	let output = Command::new("wslpath")
+		.arg("-w")
+		.arg(&common_dir)
+		.output()
+		.with_context(|| format!("failed to translate Git common directory {}", common_dir.display()))?;
+	ensure!(
+		output.status.success(),
+		"wslpath -w failed for Git common directory {}: {}",
+		common_dir.display(),
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	let windows_path = String::from_utf8(output.stdout)
+		.context("Windows Git common directory is not UTF-8")?
+		.trim()
+		.to_owned();
+	ensure!(
+		is_windows_drive_path(&windows_path),
+		"Git common directory {} is not on a Windows drive",
+		common_dir.display()
+	);
+	Ok(windows_path.into())
+}
+
+#[cfg(target_os = "linux")]
+fn set_local_config_with_windows_git(root: &Path, arguments: &[OsString]) -> Result<()> {
+	let git_dir = windows_git_common_dir(root)?;
+	let output = Command::new("git.exe")
+		.arg("--git-dir")
+		.arg(git_dir)
+		.args(arguments)
+		.output()
+		.context("failed to execute Windows Git from WSL")?;
+	ensure!(
+		output.status.success(),
+		"Windows Git configuration fallback failed: {}",
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	Ok(())
+}
+
 fn local_config_matches(root: &Path, key: &str, expected: &str) -> Result<bool> {
 	let output = git_output(
 		root,
@@ -251,17 +311,25 @@ fn local_config_matches(root: &Path, key: &str, expected: &str) -> Result<bool> 
 }
 
 fn set_local_config(root: &Path, key: &str, value: &str) -> Result<()> {
-	git_checked(
-		root,
-		&[
-			OsString::from("config"),
-			OsString::from("--local"),
-			OsString::from("--replace-all"),
-			OsString::from(key),
-			OsString::from(value),
-		],
-	)?;
-	Ok(())
+	let arguments = [
+		OsString::from("config"),
+		OsString::from("--local"),
+		OsString::from("--replace-all"),
+		OsString::from(key),
+		OsString::from(value),
+	];
+	match git_checked(root, &arguments) {
+		Ok(_) => Ok(()),
+		Err(error) => {
+			#[cfg(target_os = "linux")]
+			if env::var_os("WSL_DISTRO_NAME").is_some() {
+				return set_local_config_with_windows_git(root, &arguments).with_context(|| {
+					format!("native Git could not update local configuration: {error:#}; Windows Git fallback failed")
+				});
+			}
+			Err(error)
+		}
+	}
 }
 
 fn merge_attributes_match(root: &Path, artifact: &str) -> Result<bool> {
@@ -318,10 +386,7 @@ fn append_local_attributes(root: &Path) -> Result<()> {
 }
 
 fn repository_setup_lock(root: &Path) -> Result<File> {
-	let output = git_checked(root, &[OsString::from("rev-parse"), OsString::from("--git-common-dir")])?;
-	let path = String::from_utf8(output).context("Git common directory is not UTF-8")?;
-	let path = PathBuf::from(path.trim());
-	let path = if path.is_absolute() { path } else { root.join(path) };
+	let path = git_common_dir(root)?;
 	let lock_path = path.join("carbon-serve.lock");
 	let lock = OpenOptions::new()
 		.create(true)
@@ -894,6 +959,55 @@ mod tests {
 			.unwrap();
 		assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 		output.stdout
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn windows_git_fallback_requires_a_drive_mapped_common_directory() {
+		assert!(is_windows_drive_path(r"C:\Users\carbon\repository\.git"));
+		assert!(is_windows_drive_path("D:/repository/.git"));
+		assert!(!is_windows_drive_path(r"\\wsl.localhost\Ubuntu\home\carbon\.git"));
+		assert!(!is_windows_drive_path("/home/carbon/repository/.git"));
+	}
+
+	#[test]
+	fn linked_worktree_resolves_the_shared_git_common_directory() {
+		let directory = env::temp_dir().join(format!("carbon-linked-git-{}", Uuid::new_v4().simple()));
+		let repository = directory.join("repository");
+		let worktree = directory.join("worktree");
+		fs::create_dir_all(&repository).unwrap();
+		git(&repository, ["init", "-b", "main"]);
+		git(&repository, ["config", "user.name", "Carbon Test"]);
+		git(&repository, ["config", "user.email", "carbon@example.invalid"]);
+		fs::write(repository.join("tracked.txt"), "tracked\n").unwrap();
+		git(&repository, ["add", "tracked.txt"]);
+		git(&repository, ["commit", "-m", "tracked"]);
+		git(
+			&repository,
+			[
+				OsString::from("worktree"),
+				OsString::from("add"),
+				OsString::from("-b"),
+				OsString::from("linked"),
+				worktree.as_os_str().to_owned(),
+			],
+		);
+
+		assert_eq!(
+			fs::canonicalize(git_common_dir(&worktree).unwrap()).unwrap(),
+			fs::canonicalize(repository.join(".git")).unwrap()
+		);
+
+		git(
+			&repository,
+			[
+				OsString::from("worktree"),
+				OsString::from("remove"),
+				OsString::from("--force"),
+				worktree.as_os_str().to_owned(),
+			],
+		);
+		fs::remove_dir_all(directory).unwrap();
 	}
 
 	#[test]

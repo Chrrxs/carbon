@@ -981,7 +981,10 @@ fn windows_dotnet_root_script(loader: &str) -> String {
 	let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
 	r#"
 $loader = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_LOADER_BASE64__'))
-$runtimeConfigPath = Join-Path (Split-Path -Parent $loader) 'runtime\RML.runtimeconfig.json'
+$runtimeConfigPath = [System.IO.Path]::Combine(
+    [System.IO.Path]::GetDirectoryName($loader),
+    'runtime\RML.runtimeconfig.json'
+)
 if (-not (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf)) {
     Write-Error "Carbon RML runtime configuration is missing: $runtimeConfigPath"
     exit 4
@@ -1799,11 +1802,13 @@ mod tests {
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
 	fn powershell_dotnet_discovery_matches_the_rml_runtime_contract() {
-		let loader = r#"C:\Carbon\rml\worktree'; throw 'loader\RobloxModLoader\roblox_modloader.dll"#;
+		let loader = r#"\\?\C:\Carbon\rml\worktree'; throw 'loader\RobloxModLoader\roblox_modloader.dll"#;
 		let script = windows_dotnet_root_script(loader);
 
 		assert!(!script.contains(loader));
 		assert!(script.contains("runtime\\RML.runtimeconfig.json"));
+		assert!(script.contains("[System.IO.Path]::GetDirectoryName($loader)"));
+		assert!(!script.contains("Split-Path -Parent $loader"));
 		assert!(script.contains("Microsoft.NETCore.App"));
 		assert!(script.contains("$candidateVersion.Major -eq $requiredVersion.Major"));
 		assert!(script.contains("$candidateVersion -ge $requiredVersion"));
