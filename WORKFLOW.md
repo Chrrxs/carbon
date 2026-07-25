@@ -122,7 +122,10 @@ changing the local installation:
 
 The qualified executable already carries its Eastern `YY.M.DHHMM` build
 timestamp, such as `26.7.231935`. The command verifies the complete receipt and
-remote `main`, pushes the matching `v26.7.231935` tag, and publishes only that
-exact installed-stack-qualified executable as the single Rokit-compatible
-`carbon-26.7.231935-linux-x86_64.gz` asset. The publication-triggered workflow
-decompresses and verifies it without rebuilding.
+remote `main`, pushes the matching `v26.7.231935` tag, and publishes that exact
+installed-stack-qualified executable as the Rokit-compatible
+`carbon-26.7.231935-linux-x86_64.gz` asset. The publication workflow also
+builds `carbon-26.7.231935-windows-x86_64.zip` from the immutable tag on a
+native Windows runner, verifies its embedded version, and then verifies both
+published assets. Pull requests compile and test every Rust target on both
+Linux and Windows.

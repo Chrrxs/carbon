@@ -82,6 +82,9 @@ jq -n \
 asset_name="$(qualified_release_asset_name "26.7.231935")"
 [[ "$asset_name" == "carbon-26.7.231935-linux-x86_64.gz" ]] ||
 	die "release asset name is not Rokit-compatible: $asset_name"
+windows_asset_name="$(windows_release_asset_name "26.7.231935")"
+[[ "$windows_asset_name" == "carbon-26.7.231935-windows-x86_64.zip" ]] ||
+	die "Windows release asset name is not platform-compatible: $windows_asset_name"
 prepare_qualified_release_asset "$candidate" "$receipt" "$first"
 prepare_qualified_release_asset "$candidate" "$receipt" "$second"
 
@@ -97,15 +100,69 @@ grep -Fq 'types: [published]' "$workflow" || die "release verification is not dr
 grep -Fq 'gh release download' "$workflow" || die "release verification does not inspect published assets"
 grep -Fq 'linux-x86_64.gz' "$workflow" || die "release verification does not select the Rokit-compatible asset"
 grep -Fq 'gzip -dc' "$workflow" || die "release verification does not inspect the compressed executable"
-if grep -Eq 'release\\.json|SHA256SUMS|\\.zip|cargo build|build-rml|CARBON_RML_BUNDLE|windows-latest|curl .*\| *bash' "$workflow"; then
-	die "release workflow still rebuilds or bootstraps mutable release inputs"
+if grep -Eq 'release\\.json|SHA256SUMS|curl .*\| *bash' "$workflow"; then
+	die "release workflow still publishes sidecars or bootstraps mutable release inputs"
 fi
+windows_release_job="$(
+	awk '
+		$0 == "  windows:" { found = 1 }
+		found && $0 ~ /^  [A-Za-z0-9_-]+:/ && $0 != "  windows:" { exit }
+		found { print }
+		END { if (!found) exit 1 }
+	' "$workflow"
+)" || die "release workflow is missing the native Windows job"
+for requirement in \
+	'runs-on: windows-latest' \
+	'contents: write' \
+	'./scripts/build-windows-release.ps1' \
+	'rokit-1.1.1-windows-x86_64.zip' \
+	'3a7ebfe87f8cfc9668a9c294a8ad2562d304f5d9812149a05cf15b2131596af8' \
+	'windows-x86_64.zip' \
+	'gh release upload' \
+	'gh release download'; do
+	grep -Fq -- "$requirement" <<< "$windows_release_job" ||
+		die "Windows release job is missing: ${requirement}"
+done
+grep -Fq 'needs: windows' "$workflow" ||
+	die "published-asset verification can race the Windows release build"
+grep -Fq 'windows_asset="carbon-${version}-windows-x86_64.zip"' "$workflow" ||
+	die "published-asset verification does not require the Windows archive"
+
+windows_builder="${SCRIPT_DIR}/build-windows-release.ps1"
+[[ -f "$windows_builder" ]] || die "native Windows release builder is missing"
+for requirement in \
+	'scripts\build-rml.ps1' \
+	'./scripts/build-studio-plugin' \
+	'CARBON_STUDIO_PLUGIN_BUNDLE' \
+	'CARBON_RML_BUNDLE' \
+	'cargo.exe' \
+	'Compress-Archive'; do
+	grep -Fq -- "$requirement" "$windows_builder" ||
+		die "native Windows release builder is missing: ${requirement}"
+done
+
+ci_workflow="${REPO}/.github/workflows/ci.yml"
+windows_ci_job="$(
+	awk '
+		$0 == "  windows:" { found = 1 }
+		found && $0 ~ /^  [A-Za-z0-9_-]+:/ && $0 != "  windows:" { exit }
+		found { print }
+		END { if (!found) exit 1 }
+	' "$ci_workflow"
+)" || die "CI is missing the native Windows job"
+grep -Fq 'runs-on: windows-latest' <<< "$windows_ci_job" ||
+	die "native Windows CI does not run on a Windows host"
+grep -Fq 'cargo test --locked --all-targets --verbose' <<< "$windows_ci_job" ||
+	die "native Windows CI does not compile and test every Rust target"
+
 grep -Fq 'prepare_qualified_release_asset' "${SCRIPT_DIR}/release" ||
 	die "release command does not stage the qualified executable as a Rokit-compatible asset"
 grep -Fq 'gh release create' "${SCRIPT_DIR}/release" ||
 	die "release command does not publish the qualified executable"
-if grep -Eq 'release\\.json|SHA256SUMS|\\.zip' "${SCRIPT_DIR}/release" "${SCRIPT_DIR}/lib/release-artifact.sh"; then
-	die "release command still produces sidecar or zip assets"
+grep -Fq 'windows_release_asset_name' "${SCRIPT_DIR}/release" ||
+	die "release command does not recognize the asynchronously built Windows asset"
+if grep -Eq 'release\\.json|SHA256SUMS' "${SCRIPT_DIR}/release" "${SCRIPT_DIR}/lib/release-artifact.sh"; then
+	die "release command still produces sidecar assets"
 fi
 
 if grep -R -Eq 'GIT_TAG +(master|main)|/archive/(master|main)|/rokit/main/' \
@@ -156,4 +213,4 @@ grep -Fq 'cargo install cargo-audit --locked --version 0.22.2' "${REPO}/.github/
 grep -Fq 'cargo audit' "${REPO}/.github/workflows/ci.yml" ||
 	die "CI does not run the advisory scanner"
 
-echo "PASS: one-command Eastern timestamp releases publish one Rokit-compatible gzip asset"
+echo "PASS: qualified releases publish native Windows and Rokit-compatible WSL/Linux builds"

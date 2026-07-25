@@ -9,8 +9,8 @@ only when you explicitly capture it, so ownership never depends on which copy
 changed last.
 
 > [!IMPORTANT]
-> Carbon is pre-1.0. The first public releases support Roblox Studio on Windows
-> through x86_64 WSL2, and project formats may still change before 1.0.
+> Carbon is pre-1.0. Releases support Roblox Studio on x86_64 Windows both
+> natively and through WSL2, and project formats may still change before 1.0.
 
 ## Who Carbon is for
 
@@ -42,9 +42,10 @@ conflict with instance context and resolves it through an explicit plan.
 ## Platform support
 
 - Windows 10 or 11 on an x86_64 machine
-- WSL2
 - Roblox Studio installed on Windows
-- [Rokit](https://github.com/rojo-rbx/rokit) installed in WSL2
+- Native Windows or WSL2 for the Carbon CLI
+- [Rokit](https://github.com/rojo-rbx/rokit) installed in the same environment
+  as the Carbon CLI
 
 ## Install
 
@@ -54,6 +55,8 @@ rokit add Chrrxs/carbon
 
 The executable contains its matching RML runtime and Studio plugin. Carbon
 installs or updates both automatically when `serve` or `studio` starts.
+Rokit selects the native Windows x86_64 build in Windows and the Linux x86_64
+build in WSL2.
 
 ## Start a project
 

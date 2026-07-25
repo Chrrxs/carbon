@@ -16,7 +16,7 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 
 usage() {
 	cat <<'EOF'
-Publish an exact qualified Carbon tree and its exact qualified executable.
+Publish an exact qualified Carbon tree for WSL/Linux and native Windows.
 
 Usage:
   scripts/release [options]
@@ -35,8 +35,9 @@ Options:
 The version is the qualified executable's Eastern build timestamp in
 YY.M.DHHMM form. The script never rebuilds or installs anything. It verifies
 the exact qualified tree, creates and pushes the matching tag, and publishes
-only one Rokit-compatible gzip asset containing the immutable
-receipt-qualified executable.
+the immutable receipt-qualified executable as a Rokit-compatible gzip asset
+for WSL/Linux. The publication workflow builds the native Windows x86_64
+archive from that exact tag and verifies both assets.
 EOF
 }
 
@@ -136,6 +137,8 @@ qualified_at="$(jq -er '.qualified_at' "$receipt")"
 artifact_dir="$(mktemp -d -t carbon-release-assets-XXXXXXXX)"
 asset_name="$(qualified_release_asset_name "$version")" ||
 	die "failed to derive the Rokit-compatible release asset name"
+windows_asset_name="$(windows_release_asset_name "$version")" ||
+	die "failed to derive the native Windows release asset name"
 prepare_qualified_release_asset \
 	"$candidate" "$receipt" "$artifact_dir" ||
 	die "failed to stage the qualified release asset"
@@ -167,7 +170,7 @@ PASS: exact qualified release is ready.
 EOF
 
 if ((dry_run == 1)); then
-	echo "DRY RUN: would create and push $tag, then publish only $asset_name"
+	echo "DRY RUN: would publish $asset_name, then trigger the $windows_asset_name build"
 	exit 0
 fi
 
@@ -182,12 +185,19 @@ if gh release view "$tag" --repo "$repository" --json assets >/dev/null 2>&1; th
 	mapfile -t published_assets < <(
 		gh release view "$tag" --repo "$repository" --json assets --jq '.assets[].name' | sort
 	)
-	[[ "${published_assets[*]}" == "$asset_name" ]] ||
-		die "existing $tag release does not contain exactly one asset named $asset_name"
+	if [[ "${#published_assets[@]}" == 1 && "${published_assets[0]}" == "$asset_name" ]]; then
+		windows_status="is still pending"
+	elif [[ "${#published_assets[@]}" == 2 &&
+		"${published_assets[0]}" == "$asset_name" &&
+		"${published_assets[1]}" == "$windows_asset_name" ]]; then
+		windows_status="is published"
+	else
+		die "existing $tag release assets do not match $asset_name and optional $windows_asset_name"
+	fi
 	gh release download "$tag" --repo "$repository" --pattern "$asset_name" --dir "$published_dir"
 	cmp -s "${artifact_dir}/${asset_name}" "${published_dir}/${asset_name}" ||
 		die "existing $tag asset differs from the exact qualified release asset"
-	echo "PASS: $tag already publishes this exact Rokit-compatible asset."
+	echo "PASS: $tag publishes the exact Rokit-compatible asset; $windows_asset_name $windows_status."
 	exit 0
 fi
 
@@ -203,4 +213,4 @@ gh release create "$tag" \
 	--title "Carbon $version" \
 	--generate-notes \
 	--verify-tag
-echo "Published Carbon $version as $tag with only $asset_name."
+echo "Published Carbon $version as $tag with $asset_name; the native Windows build is now running."

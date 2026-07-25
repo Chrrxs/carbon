@@ -123,12 +123,14 @@ After qualified bytes are merged and pushed, release them with one command:
 local installation. The final checkout must be clean, match remote `main`, and
 have the exact content-addressed receipt. It takes the version from the retained
 WSL/Linux x86_64 candidate, pushes the matching tag, and publishes the exact
-executable as one deterministic Rokit-compatible
-`carbon-<version>-linux-x86_64.gz` asset. The publication-triggered workflow
-decompresses and verifies the uploaded binary without rebuilding.
-That executable embeds the exact RML package and Studio plugin exercised by
-qualification. `update-release` is an optional, separate local installer for
-the retained qualified artifacts.
+executable as the deterministic Rokit-compatible
+`carbon-<version>-linux-x86_64.gz` asset. That executable embeds the exact RML
+package and Studio plugin exercised by qualification. The
+publication-triggered workflow builds a native
+`carbon-<version>-windows-x86_64.zip` from the same immutable tag, reruns the
+RML build's native and managed checks, verifies the Windows executable version,
+and then verifies both published assets. `update-release` is an optional,
+separate local installer for the retained qualified artifacts.
 
 The MCP token is loaded from `ROBLOX_STUDIO_AUTH_TOKEN`, the compatibility override `ROBLOX_STUDIO_MCP_AUTH_TOKEN`, `ROBLOX_STUDIO_MCP_AUTH_TOKEN_FILE`, or the standard `~/.robloxstudio-mcp/auth-token` path. Tokens are never written to reports.
 

@@ -19,6 +19,8 @@ body:
     attributes:
       label: Environment
       options:
+        - Windows 11 native
+        - Windows 10 native
         - Windows 11 with WSL2
         - Windows 10 with WSL2
         - Unsupported or development-only environment

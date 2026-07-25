@@ -1,4 +1,4 @@
-name: Verify Qualified Release
+name: Build and Verify Carbon Release
 
 on:
   release:
@@ -8,11 +8,96 @@ permissions:
   contents: read
 
 jobs:
+  windows:
+    name: Build Native Windows Release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install pinned Rokit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "rokit-1.1.1-windows-x86_64.zip"
+          $install = Join-Path $env:RUNNER_TEMP "rokit"
+          Invoke-WebRequest `
+            -Uri "https://github.com/rojo-rbx/rokit/releases/download/v1.1.1/rokit-1.1.1-windows-x86_64.zip" `
+            -OutFile $archive
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = "3a7ebfe87f8cfc9668a9c294a8ad2562d304f5d9812149a05cf15b2131596af8"
+          if ($actual -ne $expected) {
+            throw "Rokit archive hash mismatch: expected $expected, got $actual"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $install
+          & (Join-Path $install "rokit.exe") self-install
+          if ($LASTEXITCODE -ne 0) {
+            throw "rokit self-install exited with code $LASTEXITCODE"
+          }
+          (Join-Path $env:USERPROFILE ".rokit\bin") |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install plugin toolchain
+        working-directory: studio-plugin
+        run: rokit install --no-trust-check
+      - name: Build native Windows release
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        shell: pwsh
+        run: |
+          $version = $env:TAG.Substring(1)
+          ./scripts/build-windows-release.ps1 `
+            -Version $version `
+            -OutputDir (Join-Path $PWD "target\release-assets")
+      - name: Publish and verify native Windows release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:TAG.Substring(1)
+          $assetName = "carbon-$version-windows-x86_64.zip"
+          $asset = Join-Path $PWD "target\release-assets\$assetName"
+          gh release upload $env:TAG $asset --repo $env:REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to upload $assetName"
+          }
+
+          $download = Join-Path $env:RUNNER_TEMP "published-carbon-windows"
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          gh release download $env:TAG `
+            --repo $env:REPOSITORY `
+            --pattern $assetName `
+            --dir $download
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to download published $assetName"
+          }
+          $published = Join-Path $download $assetName
+          if ((Get-FileHash -LiteralPath $published -Algorithm SHA256).Hash -ne
+              (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash) {
+            throw "published Windows archive differs from the built archive"
+          }
+
+          $expanded = Join-Path $download "expanded"
+          Expand-Archive -LiteralPath $published -DestinationPath $expanded
+          $actualVersion = (& (Join-Path $expanded "carbon.exe") --color never --version |
+            Out-String).Trim().Split()[-1]
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -ne $version) {
+            throw "published Windows executable reports $actualVersion, expected $version"
+          }
+
   verify:
-    name: Verify Published Qualified Bytes
+    name: Verify Published Release Assets
+    needs: windows
     runs-on: ubuntu-latest
     steps:
-      - name: Verify the published executable identity
+      - name: Verify the published executable identities
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -39,13 +124,21 @@ jobs:
             "$short_year" "$month" "$day" "$hour" "$minute")"
           [[ "$(TZ=America/New_York date -d "$instant" '+%Y-%m-%dT%H:%M')" == "$instant" ]]
 
+          linux_asset="carbon-${version}-linux-x86_64.gz"
+          windows_asset="carbon-${version}-windows-x86_64.zip"
           mapfile -t assets < <(
-            gh release view "$TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name'
+            gh release view "$TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name' |
+              sort
           )
-          asset_name="carbon-${version}-linux-x86_64.gz"
-          [[ "${#assets[@]}" == 1 && "${assets[0]}" == "$asset_name" ]]
-          gh release download "$TAG" --repo "$REPOSITORY" --pattern "$asset_name"
-          gzip --test "$asset_name"
-          gzip -dc "$asset_name" > carbon
+          [[ "${#assets[@]}" == 2 ]]
+          [[ "${assets[0]}" == "$linux_asset" && "${assets[1]}" == "$windows_asset" ]]
+
+          gh release download "$TAG" --repo "$REPOSITORY" --pattern "$linux_asset"
+          gzip --test "$linux_asset"
+          gzip -dc "$linux_asset" > carbon
           chmod 0755 carbon
           [[ "$(./carbon --color never --version | awk '{print $NF}')" == "$version" ]]
+
+          gh release download "$TAG" --repo "$REPOSITORY" --pattern "$windows_asset"
+          mapfile -t windows_entries < <(unzip -Z1 "$windows_asset")
+          [[ "${#windows_entries[@]}" == 1 && "${windows_entries[0]}" == "carbon.exe" ]]

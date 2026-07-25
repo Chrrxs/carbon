@@ -13,6 +13,19 @@ qualified_release_asset_name() {
 	printf 'carbon-%s-linux-x86_64.gz\n' "$version"
 }
 
+windows_release_asset_name() {
+	(($# == 1)) || {
+		echo "windows_release_asset_name: expected VERSION" >&2
+		return 2
+	}
+	local version="$1"
+	[[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.([1-9][0-9]*)$ ]] || {
+		echo "windows_release_asset_name: invalid version: ${version}" >&2
+		return 2
+	}
+	printf 'carbon-%s-windows-x86_64.zip\n' "$version"
+}
+
 prepare_qualified_release_asset() {
 	(($# == 3)) || {
 		echo "prepare_qualified_release_asset: expected CANDIDATE RECEIPT OUTPUT" >&2

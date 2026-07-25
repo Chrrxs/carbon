@@ -27,7 +27,8 @@ cd studio-plugin
 rokit install
 ```
 
-The ordinary Rust checks are available on every supported Rust host:
+The ordinary Rust checks are available on every supported Rust host and run in
+CI on both Linux and native Windows:
 
 ```sh
 cargo fmt --all -- --check

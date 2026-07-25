@@ -158,11 +158,13 @@ grep -Eq '^  pull_request:' "$ci_workflow" ||
 if grep -Eq '^  push:' "$ci_workflow"; then
 	fail "maintainer-qualified pushes must not rerun CI"
 fi
-[[ "$(grep -Ec '^    runs-on:' "$ci_workflow")" == 1 ]] ||
-	fail "CI must use exactly one runner"
+[[ "$(grep -Ec '^    runs-on:' "$ci_workflow")" == 2 ]] ||
+	fail "CI must use exactly one Linux and one Windows runner"
 grep -Fq 'runs-on: ubuntu-latest' "$ci_workflow" ||
 	fail "CI must use the supported Linux environment"
-if grep -Eq 'matrix:|macos-|windows-' "$ci_workflow"; then
+grep -Fq 'runs-on: windows-latest' "$ci_workflow" ||
+	fail "CI must compile and test the native Windows CLI"
+if grep -Eq 'matrix:|macos-' "$ci_workflow"; then
 	fail "CI must not claim unsupported CLI platforms"
 fi
 
