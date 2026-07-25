@@ -16,6 +16,102 @@ qualification_rml_build_dir() {
 		"${windows_cache_root%/}" "$(qualification_worktree_key "$repository")"
 }
 
+qualification_http_is_healthy() {
+	local url="$1"
+	curl --silent --fail --connect-timeout 0.2 --max-time 0.5 "$url" >/dev/null 2>&1
+}
+
+qualification_mcp_server_can_be_reused() {
+	local studio_plugin_updated="$1"
+	local mcp_server_rebuilt="$2"
+	local mcp_server_healthy="$3"
+	((studio_plugin_updated == 0 && mcp_server_rebuilt == 0 && mcp_server_healthy == 1))
+}
+
+qualification_process_belongs_to_repository() {
+	local process_id="$1"
+	local repository="$2"
+	local repository_path
+	local process_cwd
+	local process_command
+
+	[[ "$process_id" =~ ^[0-9]+$ && -r "/proc/${process_id}/cmdline" ]] || return 1
+	repository_path="$(realpath "$repository" 2>/dev/null)" || return 1
+	process_cwd="$(realpath "/proc/${process_id}/cwd" 2>/dev/null || true)"
+	if [[ "$process_cwd" == "$repository_path" || "$process_cwd" == "${repository_path}/"* ]]; then
+		return 0
+	fi
+	process_command="$(tr '\0' ' ' < "/proc/${process_id}/cmdline")"
+	[[ "$process_command" == *"$repository_path"* ]]
+}
+
+qualification_process_descends_from() {
+	local process_id="$1"
+	local ancestor_id="$2"
+	local parent_id
+	local depth
+
+	[[ "$process_id" =~ ^[0-9]+$ && "$ancestor_id" =~ ^[0-9]+$ ]] || return 1
+	for ((depth = 0; depth < 64; depth += 1)); do
+		[[ "$process_id" == "$ancestor_id" ]] && return 0
+		[[ -r "/proc/${process_id}/status" ]] || return 1
+		parent_id="$(ps -o ppid= -p "$process_id" 2>/dev/null | tr -d ' ')"
+		[[ "$parent_id" =~ ^[0-9]+$ && "$parent_id" != "$process_id" && "$parent_id" != 0 ]] || return 1
+		process_id="$parent_id"
+	done
+	return 1
+}
+
+qualification_stop_process_tree() {
+	local root_id="$1"
+	local listener_id="$2"
+	local process_group
+	local attempt
+
+	[[ "$root_id" =~ ^[0-9]+$ && "$listener_id" =~ ^[0-9]+$ ]] || return 1
+	process_group="$(ps -o pgid= -p "$root_id" 2>/dev/null | tr -d ' ')"
+	if [[ "$process_group" == "$root_id" ]]; then
+		kill -TERM -- "-${process_group}" 2>/dev/null || true
+	else
+		kill -TERM "$listener_id" 2>/dev/null || true
+		if [[ "$root_id" != "$listener_id" ]]; then
+			kill -TERM "$root_id" 2>/dev/null || true
+		fi
+	fi
+
+	for ((attempt = 0; attempt < 100; attempt += 1)); do
+		if ! kill -0 "$root_id" 2>/dev/null && ! kill -0 "$listener_id" 2>/dev/null; then
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 1
+}
+
+qualification_wait_for_http_stability() {
+	local url="$1"
+	local required_successes="${2:-30}"
+	local max_attempts="${3:-300}"
+	local delay_seconds="${4:-0.1}"
+	local attempt
+	local consecutive_successes=0
+
+	for ((attempt = 1; attempt <= max_attempts; attempt += 1)); do
+		if qualification_http_is_healthy "$url"; then
+			consecutive_successes=$((consecutive_successes + 1))
+			if ((consecutive_successes >= required_successes)); then
+				return 0
+			fi
+		else
+			consecutive_successes=0
+		fi
+		if ((attempt < max_attempts)); then
+			sleep "$delay_seconds"
+		fi
+	done
+	return 1
+}
+
 qualification_context_init() {
 	local state_root="$1"
 	local repository="$2"

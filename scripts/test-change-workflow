@@ -72,6 +72,80 @@ status="$(CARBON_CHANGE_STATE_DIR="$state" "${red_repo}/scripts/change" status)"
 grep -q 'RED RECORDED' <<< "$status" || die "status did not report the red state"
 grep -q 'UNQUALIFIED TREE' <<< "$status" || die "status did not reject an unqualified tree"
 
+quality_repo="${root}/quality-repo"
+quality_state="${root}/quality-state"
+quality_tools="${root}/quality-tools"
+quality_log="${root}/quality-tools.log"
+init_repo "$quality_repo"
+rm -- "${quality_repo}/scripts/lib"
+mkdir -p "${quality_repo}/scripts/lib" "${quality_repo}/studio-plugin/scripts" "$quality_tools"
+for library in release-receipt.sh component-state.sh change-workflow.sh; do
+	ln -s "${SCRIPT_DIR}/lib/${library}" "${quality_repo}/scripts/lib/${library}"
+done
+printf '%s\n' '#!/usr/bin/env bash' 'exit 23' > "${quality_repo}/scripts/lib/qualify-tree"
+chmod +x "${quality_repo}/scripts/lib/qualify-tree"
+for workflow_test in \
+	test-build-optimization \
+	test-rml-build-optimization \
+	test-release-installer \
+	test-release-workflow \
+	test-public-readiness \
+	test-production-readiness-isolation \
+	test-change-workflow; do
+	printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${quality_repo}/scripts/${workflow_test}"
+	chmod +x "${quality_repo}/scripts/${workflow_test}"
+done
+printf '%s\n' \
+	'#!/usr/bin/env bash' \
+	'printf "update-reflection %s\n" "$*" >> "${CARBON_TOOL_LOG}"' \
+	> "${quality_repo}/scripts/update-reflection"
+chmod +x "${quality_repo}/scripts/update-reflection"
+printf '%s\n' \
+	'#!/usr/bin/env bash' \
+	'if [[ "$*" == "audit --version" ]]; then echo "cargo-audit 0.22.2"; fi' \
+	'exit 0' \
+	> "${quality_tools}/cargo"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${quality_tools}/cargo-audit"
+chmod +x "${quality_tools}/cargo" "${quality_tools}/cargo-audit"
+for tool in lune selene stylua; do
+	printf '%s\n' \
+		'#!/usr/bin/env bash' \
+		'printf "'"${tool}"' %s\n" "$*" >> "${CARBON_TOOL_LOG}"' \
+		> "${quality_tools}/${tool}"
+	chmod +x "${quality_tools}/${tool}"
+done
+for studio_test in \
+	test-bounded-retry.luau \
+	test-current-reflection-database.luau \
+	test-live-reflection-database.luau \
+	test-mapping-reconciliation-architecture.luau \
+	test-protected-properties.luau; do
+	: > "${quality_repo}/studio-plugin/scripts/${studio_test}"
+done
+printf '%s\n' '#!/usr/bin/env bash' 'exit 9' > "${quality_repo}/focused-regression"
+chmod +x "${quality_repo}/focused-regression"
+CARBON_CHANGE_STATE_DIR="$quality_state" "${quality_repo}/scripts/change" red -- ./focused-regression >/dev/null
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${quality_repo}/focused-regression"
+expect_failure \
+	"${root}/quality.out" \
+	env \
+	PATH="${quality_tools}:${PATH}" \
+	CARBON_CHANGE_STATE_DIR="$quality_state" \
+	CARBON_TOOL_LOG="$quality_log" \
+	"${quality_repo}/scripts/change" qualify
+grep -q 'production-readiness failed' "${root}/quality.out" ||
+	die "stubbed qualification did not reach production readiness"
+for expected in \
+	'update-reflection --check' \
+	'lune run scripts/test-bounded-retry.luau' \
+	'lune run scripts/test-current-reflection-database.luau' \
+	'lune run scripts/test-live-reflection-database.luau' \
+	'lune run scripts/test-mapping-reconciliation-architecture.luau' \
+	'lune run scripts/test-protected-properties.luau'; do
+	grep -Fqx "$expected" "$quality_log" ||
+		die "change qualify did not run Studio-plugin check: $expected"
+done
+
 write_receipt() {
 	local repo="$1"
 	local revision="$2"

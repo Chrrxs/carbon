@@ -15,7 +15,12 @@ die() {
 }
 
 root="$(mktemp -d -t carbon-qualification-isolation-test-XXXXXXXX)"
+owned_process_pid=""
 cleanup() {
+	if [[ -n "$owned_process_pid" ]]; then
+		kill "$owned_process_pid" 2>/dev/null || true
+		wait "$owned_process_pid" 2>/dev/null || true
+	fi
 	if [[ -n "$root" && -d "$root" && "$root" == /tmp/carbon-qualification-isolation-test-* ]]; then
 		rm -rf -- "$root"
 	fi
@@ -109,5 +114,73 @@ changed_fingerprint="$(release_source_fingerprint "$fingerprint_repo" cli script
 git -C "$fingerprint_repo" add cli/input.rs
 [[ "$(release_source_fingerprint "$fingerprint_repo" cli scripts)" == "$changed_fingerprint" ]] ||
 	die "staging unchanged bytes altered the receipt fingerprint"
+
+declare -F qualification_wait_for_http_stability >/dev/null ||
+	die "qualification has no post-install MCP stability gate"
+health_tools="${root}/health-tools"
+health_attempts="${root}/health-attempts"
+mkdir -p "$health_tools"
+printf '0\n' > "$health_attempts"
+printf '%s\n' \
+	'#!/usr/bin/env bash' \
+	'[[ " $* " == *" --connect-timeout "* ]] || exit 64' \
+	'[[ " $* " == *" --max-time "* ]] || exit 64' \
+	'attempt="$(cat "${QUALIFICATION_HEALTH_ATTEMPTS}")"' \
+	'attempt=$((attempt + 1))' \
+	'printf "%s\n" "$attempt" > "${QUALIFICATION_HEALTH_ATTEMPTS}"' \
+	'((attempt != 3))' \
+	> "${health_tools}/curl"
+chmod +x "${health_tools}/curl"
+PATH="${health_tools}:${PATH}" \
+	QUALIFICATION_HEALTH_ATTEMPTS="$health_attempts" \
+	qualification_wait_for_http_stability "http://127.0.0.1:58741/health" 3 6 0 ||
+	die "qualification did not tolerate a restarting MCP listener"
+[[ "$(< "$health_attempts")" == 6 ]] ||
+	die "qualification accepted MCP health before it was stable"
+if grep -Eq 'curl .*mcp_port.*/health' "${SCRIPT_DIR}/lib/qualify-tree"; then
+	die "qualification bypasses bounded health probes before the stability gate"
+fi
+declare -F qualification_mcp_server_can_be_reused >/dev/null ||
+	die "qualification has no explicit MCP reuse policy"
+qualification_mcp_server_can_be_reused 0 0 1 ||
+	die "qualification rejected a current healthy MCP server"
+if qualification_mcp_server_can_be_reused 1 0 1; then
+	die "qualification reused an MCP server after replacing the Studio plugin"
+fi
+if qualification_mcp_server_can_be_reused 0 1 1; then
+	die "qualification reused an MCP server after rebuilding it"
+fi
+if qualification_mcp_server_can_be_reused 0 0 0; then
+	die "qualification reused an unhealthy MCP server"
+fi
+
+owned_process_repo="${root}/owned-process-repo"
+mkdir -p "$owned_process_repo"
+(
+	cd "$owned_process_repo"
+	exec -a "node packages/robloxstudio-mcp/dist/index.js" sleep 30
+) &
+owned_process_pid=$!
+for _ in {1..100}; do
+	[[ "$(realpath "/proc/${owned_process_pid}/cwd" 2>/dev/null || true)" == "$owned_process_repo" ]] && break
+	sleep 0.01
+done
+qualification_process_belongs_to_repository "$owned_process_pid" "$owned_process_repo" ||
+	die "qualification rejected a repository-owned process with a relative command"
+if qualification_process_belongs_to_repository "$owned_process_pid" "${root}/worktree-a"; then
+	die "qualification accepted a process owned by a different repository"
+fi
+qualification_process_descends_from "$owned_process_pid" "$BASHPID" ||
+	die "qualification could not prove a child belongs to its daemon process tree"
+if qualification_process_descends_from "$BASHPID" "$owned_process_pid"; then
+	die "qualification reversed the daemon process-tree relationship"
+fi
+qualification_stop_process_tree "$owned_process_pid" "$owned_process_pid" ||
+	die "qualification could not stop an owned listener process"
+wait "$owned_process_pid" 2>/dev/null || true
+if kill -0 "$owned_process_pid" 2>/dev/null; then
+	die "qualification left an owned listener process running"
+fi
+owned_process_pid=""
 
 echo "PASS: production-readiness run contexts isolate ports, leases, and worktree state"

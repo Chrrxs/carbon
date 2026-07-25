@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+
+(
+	cd -- "${REPO}/studio-plugin"
+	lune run scripts/test-bounded-retry.luau
+)
+
+temporary="$(mktemp -d -t carbon-reflection-workflow-test-XXXXXXXX)"
+cleanup() {
+	if [[ -n "${temporary}" && -d "${temporary}" && "${temporary}" == /tmp/carbon-reflection-workflow-test-* ]]; then
+		rm -rf -- "${temporary}"
+	fi
+}
+trap cleanup EXIT INT TERM
+
+base="$(git -C "${REPO}" merge-base origin/main HEAD)"
+index="${temporary}/index"
+GIT_INDEX_FILE="${index}" git -C "${REPO}" read-tree "${base}"
+GIT_INDEX_FILE="${index}" "${REPO}/scripts/update-reflection" --check
+
+echo "PASS: reflection generation is current independent of Git staging state"
+
+"${REPO}/scripts/test-change-workflow"

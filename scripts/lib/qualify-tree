@@ -54,6 +54,33 @@ require_command() {
 	command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+stop_repository_mcp_listener() {
+	local listener_pid="$1"
+	local repository="$2"
+	local listener_command
+	local listener_root
+	local listener_parent
+	local parent_command
+
+	[[ -r "/proc/${listener_pid}/cmdline" ]] ||
+		die "cannot inspect process $listener_pid on MCP port $mcp_port"
+	listener_command="$(tr '\0' ' ' < "/proc/${listener_pid}/cmdline")"
+	qualification_process_belongs_to_repository "$listener_pid" "$repository" ||
+		die "MCP port $mcp_port is owned by an unrelated process: $listener_command"
+
+	listener_root="$listener_pid"
+	while :; do
+		listener_parent="$(ps -o ppid= -p "$listener_root" | tr -d ' ')"
+		[[ -n "$listener_parent" && -r "/proc/${listener_parent}/cmdline" ]] || break
+		parent_command="$(tr '\0' ' ' < "/proc/${listener_parent}/cmdline")"
+		[[ "$parent_command" == *"$repository"* ]] || break
+		listener_root="$listener_parent"
+	done
+
+	qualification_stop_process_tree "$listener_root" "$listener_pid" ||
+		die "existing MCP process tree $listener_root did not stop"
+}
+
 project="${CARBON_QUALIFY_PROJECT:-}"
 data_dir="${CARBON_QUALIFY_DATA_DIR:-}"
 artifacts="${CARBON_QUALIFY_ARTIFACTS:-}"
@@ -371,7 +398,7 @@ refresh_shared_component_status() {
 }
 
 mcp_is_healthy=0
-curl --silent --fail "http://127.0.0.1:${mcp_port}/health" >/dev/null 2>&1 && mcp_is_healthy=1
+qualification_http_is_healthy "http://127.0.0.1:${mcp_port}/health" && mcp_is_healthy=1
 shared_update_needed=0
 ((needs_carbon_plugin == 0 && needs_mcp_dependencies == 0 && needs_mcp_server == 0)) || shared_update_needed=1
 ((mcp_is_healthy == 1)) || shared_update_needed=1
@@ -398,12 +425,14 @@ if [[ "$stack_lock_mode" == shared ]] &&
 	refresh_shared_component_status
 fi
 
+carbon_plugin_updated=0
 if ((needs_carbon_plugin == 1)); then
 	step "Updating the Carbon Studio plugin"
 	install -m 0644 "$built_plugin" "$carbon_plugin"
 	carbon_plugin_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" studio-plugin scripts/build-studio-plugin scripts/build-version)"
 	carbon_plugin_fingerprint="$(printf '%s\n%s\n' "$carbon_plugin_source_fingerprint" "$build_version" | sha256sum | cut -d ' ' -f 1)"
 	write_component_stamp carbon-plugin "$carbon_plugin_fingerprint" "$carbon_plugin"
+	carbon_plugin_updated=1
 else
 	step "Carbon Studio plugin is up to date"
 fi
@@ -442,11 +471,11 @@ rml_log_dir="${CARBON_QUALIFY_RML_LOG_DIR:-${embedded_rml_package}/RobloxModLoad
 mkdir -p "$rml_crash_dir" "$rml_log_dir"
 
 mcp_is_healthy=0
-if curl --silent --fail "http://127.0.0.1:${mcp_port}/health" >/dev/null 2>&1; then
+if qualification_http_is_healthy "http://127.0.0.1:${mcp_port}/health"; then
 	mcp_is_healthy=1
 fi
 
-if ((mcp_rebuilt == 0 && mcp_is_healthy == 1)); then
+if qualification_mcp_server_can_be_reused "$carbon_plugin_updated" "$mcp_rebuilt" "$mcp_is_healthy"; then
 	step "Reusing the healthy, up-to-date robloxstudio-mcp server"
 else
 	if [[ "$stack_lock_mode" == shared ]]; then
@@ -457,6 +486,8 @@ else
 	fi
 	if ((mcp_rebuilt == 1)); then
 		step "Starting the updated robloxstudio-mcp server"
+	elif ((carbon_plugin_updated == 1)); then
+		step "Restarting robloxstudio-mcp after the Carbon Studio plugin update"
 	else
 		step "Starting the up-to-date robloxstudio-mcp server"
 	fi
@@ -466,26 +497,7 @@ else
 	for _ in {1..32}; do
 		listener_pid="$(lsof -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | sort -u | head -n 1 || true)"
 		[[ -n "$listener_pid" ]] || break
-		[[ -r "/proc/${listener_pid}/cmdline" ]] || die "cannot inspect process $listener_pid on MCP port $mcp_port"
-		listener_command="$(tr '\0' ' ' < "/proc/${listener_pid}/cmdline")"
-		[[ "$listener_command" == *"$mcp_repo"* ]] ||
-			die "MCP port $mcp_port is owned by an unrelated process: $listener_command"
-
-		listener_root="$listener_pid"
-		while :; do
-			listener_parent="$(ps -o ppid= -p "$listener_root" | tr -d ' ')"
-			[[ -n "$listener_parent" && -r "/proc/${listener_parent}/cmdline" ]] || break
-			parent_command="$(tr '\0' ' ' < "/proc/${listener_parent}/cmdline")"
-			[[ "$parent_command" == *"$mcp_repo"* ]] || break
-			listener_root="$listener_parent"
-		done
-
-		kill -TERM "$listener_root"
-		for _ in {1..100}; do
-			kill -0 "$listener_root" 2>/dev/null || break
-			sleep 0.05
-		done
-		kill -0 "$listener_root" 2>/dev/null && die "existing MCP process $listener_root did not stop"
+		stop_repository_mcp_listener "$listener_pid" "$mcp_repo"
 	done
 	lsof -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | grep -q . &&
 		die "could not free MCP port $mcp_port after stopping repository-owned primaries"
@@ -506,14 +518,31 @@ else
 			tail -n 80 "$mcp_daemon_log" >&2 || true
 			die "MCP server exited before becoming ready"
 		}
-		if curl --silent --fail "http://127.0.0.1:${mcp_port}/health" >/dev/null; then
-			mcp_ready=1
-			break
+		listener_pid="$(lsof -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | sort -u | head -n 1 || true)"
+		if [[ -n "$listener_pid" ]]; then
+			if qualification_process_descends_from "$listener_pid" "$mcp_daemon_pid"; then
+				if qualification_http_is_healthy "http://127.0.0.1:${mcp_port}/health"; then
+					mcp_ready=1
+					break
+				fi
+			else
+				# A repository proxy may promote between the port-free check and
+				# this daemon's bind. Stop it so this long-lived daemon can promote.
+				stop_repository_mcp_listener "$listener_pid" "$mcp_repo"
+			fi
 		fi
 		sleep 0.1
 	done
-	((mcp_ready == 1)) || die "MCP server did not become ready; see $mcp_daemon_log"
+	((mcp_ready == 1)) ||
+		die "qualification-owned MCP server did not become the healthy listener; see $mcp_daemon_log"
 fi
+
+# Installing a timestamped Studio plugin can make a shared MCP host restart its
+# listener just after its first healthy response. Require a quiet health window
+# before the suite dispatches a managed Studio launch through that listener.
+step "Waiting for the robloxstudio-mcp listener to remain stable"
+qualification_wait_for_http_stability "http://127.0.0.1:${mcp_port}/health" ||
+	die "robloxstudio-mcp did not remain healthy after the installed Studio stack update"
 
 # From here through receipt creation, every run holds a shared lease on the
 # shared plugin/MCP stack. RML packages remain per-worktree and immutable.

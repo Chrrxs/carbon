@@ -595,6 +595,12 @@ fn managed_launch_identity(result: &Value) -> Result<(String, u32)> {
 	Ok((launch_id, process_id))
 }
 
+fn mcp_broker_place_path(path: &Path) -> &Path {
+	// The broker resolves this path in its own host namespace and converts it
+	// to a Windows Studio argument only when spawning the native process.
+	path
+}
+
 fn launch_through_mcp(
 	path: PathBuf,
 	rml_launch: &rml::Launch,
@@ -602,10 +608,6 @@ fn launch_through_mcp(
 ) -> std::result::Result<ManagedStudioLifecycle, ManagedLaunchFailure> {
 	let (studio_executable, loader_path) =
 		mcp_launch_paths(rml_launch).map_err(|error| ManagedLaunchFailure::pre_dispatch(&mcp.endpoint, error))?;
-	#[cfg(target_os = "linux")]
-	let path = windows_path(&path, "Studio place")
-		.map(PathBuf::from)
-		.map_err(|error| ManagedLaunchFailure::pre_dispatch(&mcp.endpoint, error))?;
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	let dotnet_root = Some(
 		windows_dotnet_root(&loader_path).map_err(|error| ManagedLaunchFailure::pre_dispatch(&mcp.endpoint, error))?,
@@ -615,7 +617,7 @@ fn launch_through_mcp(
 		.ok()
 		.filter(|value| !value.trim().is_empty());
 	let payload = mcp_launch_request(
-		&path,
+		mcp_broker_place_path(&path),
 		&studio_executable,
 		&loader_path,
 		rml_launch.build_version(),
@@ -1657,7 +1659,7 @@ mod tests {
 	#[test]
 	fn managed_launch_transfers_exact_rml_environment() {
 		let payload = mcp_launch_request(
-			std::path::Path::new(r"\\wsl.localhost\Ubuntu\tmp\carbon-managed.rbxl"),
+			std::path::Path::new("/tmp/carbon-managed.rbxl"),
 			r"C:\Roblox\RobloxStudioBeta.exe",
 			r"C:\Carbon\RobloxModLoader\roblox_modloader.dll",
 			"0.0.0+build.test",
@@ -1666,10 +1668,7 @@ mod tests {
 
 		assert_eq!(payload["action"], "launch");
 		assert_eq!(payload["source"], "local_file");
-		assert_eq!(
-			payload["local_place_file"],
-			r"\\wsl.localhost\Ubuntu\tmp\carbon-managed.rbxl"
-		);
+		assert_eq!(payload["local_place_file"], "/tmp/carbon-managed.rbxl");
 		assert_eq!(
 			payload["process_environment"]["set"][rml::LOADER_ENV],
 			r"C:\Carbon\RobloxModLoader\roblox_modloader.dll"
@@ -1684,6 +1683,12 @@ mod tests {
 		);
 		assert_eq!(payload["process_environment"]["remove"], json!([rml::LOADED_BUILD_ENV]));
 		assert_eq!(payload["wait_for_connection"], false);
+	}
+
+	#[test]
+	fn managed_launch_keeps_place_path_in_broker_namespace() {
+		let place = PathBuf::from("/tmp/CarbonQualification-managed.rbxl");
+		assert_eq!(mcp_broker_place_path(&place), place.as_path());
 	}
 
 	#[test]

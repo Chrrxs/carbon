@@ -58,4 +58,18 @@ assert(
 	not cancelled and tostring(cancellationReason):find("bridge absent", 1, true),
 	"managed startup cancellation must return the last bridge error"
 )
+
+local boundedAttempts = 0
+local bounded, boundedReason = BoundedRetry.runUntil(function()
+	boundedAttempts += 1
+	error("bridge never attached")
+end, function() end, function()
+	return boundedAttempts < 61
+end)
+assert(
+	not bounded and tostring(boundedReason):find("bridge never attached", 1, true),
+	"managed startup exhaustion must return the last bridge error"
+)
+assert(boundedAttempts == 60, "managed startup must fail after its generous bounded retry window")
+
 print("PASS: retry policy tolerates slow managed launches and bounds manual attach")

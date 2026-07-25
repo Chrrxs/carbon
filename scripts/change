@@ -76,13 +76,18 @@ run_workflow_tests() {
 
 run_studio_plugin_quality() {
 	(
+		local test_script
 		for tool in lune selene stylua; do
 			command -v "$tool" >/dev/null 2>&1 || {
 				echo "change: required Studio-plugin tool not found: $tool" >&2
 				return 2
 			}
 		done
+		"${SCRIPT_DIR}/update-reflection" --check
 		cd "${REPO}/studio-plugin"
+		for test_script in scripts/test-*.luau; do
+			lune run "$test_script"
+		done
 		lune run scripts/generate-database.luau -- --check
 		selene src
 		stylua src scripts --check

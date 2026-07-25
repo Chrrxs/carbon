@@ -221,6 +221,7 @@ pub(crate) fn is_transient_manifest_capture_error(error: &anyhow::Error) -> bool
 	[
 		"native snapshot failed: capture page-table plan is no longer active",
 		"native snapshot failed: capture page-table epochs changed before staging",
+		"DataModel changed between the native hierarchy read and serializer launch",
 		"Studio changed during Capture Manifest staging; retry the capture",
 	]
 	.iter()
@@ -243,7 +244,9 @@ mod manifest_capture_retry_tests {
 			|| {
 				attempts += 1;
 				match attempts {
-					1 => anyhow::bail!("native snapshot failed: capture page-table plan is no longer active"),
+					1 => anyhow::bail!(
+						"native snapshot failed: edit DataModel changed between the native hierarchy read and serializer launch"
+					),
 					2 => anyhow::bail!("Studio changed during Capture Manifest staging; retry the capture"),
 					_ => Ok("complete"),
 				}
@@ -1004,7 +1007,7 @@ impl Core {
 				ready.serializer_settled,
 				"RML reported a ready capture before its serializer settled"
 			);
-			self.update_manifest_capture_message(request_id, "Sealing the streamed native capture")?;
+			self.update_manifest_capture_message(request_id, "Transferring native capture artifacts")?;
 			let capture_result =
 				(|| -> Result<(
 					String,
