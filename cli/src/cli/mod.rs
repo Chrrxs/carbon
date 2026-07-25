@@ -132,15 +132,15 @@ impl Cli {
 				command.main()
 			}
 			Commands::MergeArtifact(command) => {
-				util::init_reflection()?;
+				util::init_artifact_reflection()?;
 				command.main()
 			}
 			Commands::Conflicts(command) => {
-				util::init_reflection()?;
+				util::init_artifact_reflection()?;
 				command.main()
 			}
 			Commands::Resolve(command) => {
-				util::init_reflection()?;
+				util::init_artifact_reflection()?;
 				command.main()
 			}
 			Commands::Build(command) => {
@@ -155,7 +155,7 @@ impl Cli {
 			Commands::Stop(command) => command.main(),
 			Commands::Studio(command) => command.main(),
 			Commands::Diff(command) => {
-				util::init_reflection()?;
+				util::init_artifact_reflection()?;
 				command.main()
 			}
 			Commands::Focus(command) => command.main(),

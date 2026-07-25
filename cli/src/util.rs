@@ -8,7 +8,6 @@ use rbx_reflection::{
 	PropertyTag, ReflectionDatabase, Scriptability,
 };
 use serde::Deserialize;
-#[cfg(test)]
 use std::sync::LazyLock;
 use std::{
 	env, fs,
@@ -529,7 +528,6 @@ pub struct ReflectionSnapshot {
 
 static LIVE_SNAPSHOT: OnceLock<ReflectionSnapshot> = OnceLock::new();
 static REFLECTION_INIT_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(test)]
 static BUNDLED_FALLBACK_DATABASE: LazyLock<ReflectionDatabase<'static>> =
 	LazyLock::new(|| rbx_reflection_database::get_bundled().clone());
 
@@ -565,6 +563,13 @@ pub fn init_reflection() -> Result<&'static ReflectionSnapshot> {
 	Ok(LIVE_SNAPSHOT
 		.get()
 		.expect("live reflection snapshot was just initialized"))
+}
+
+pub fn init_artifact_reflection() -> Result<()> {
+	if cfg!(debug_assertions) && env::var_os("CARBON_TEST_BUNDLED_REFLECTION").is_some() {
+		return Ok(());
+	}
+	init_reflection().map(|_| ())
 }
 
 pub fn get_reflection_snapshot() -> &'static ReflectionSnapshot {
@@ -652,15 +657,7 @@ pub fn get_reflection_database() -> &'static ReflectionDatabase<'static> {
 	if let Some(snapshot) = LIVE_SNAPSHOT.get() {
 		&snapshot.database
 	} else {
-		#[cfg(test)]
-		{
-			&BUNDLED_FALLBACK_DATABASE
-		}
-		#[cfg(not(test))]
-		{
-			let snapshot = init_reflection().expect("failed to initialize live reflection database");
-			&snapshot.database
-		}
+		&BUNDLED_FALLBACK_DATABASE
 	}
 }
 

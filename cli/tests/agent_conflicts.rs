@@ -23,7 +23,12 @@ where
 	I: IntoIterator<Item = S>,
 	S: AsRef<OsStr>,
 {
-	Command::new(program).args(arguments).current_dir(cwd).output().unwrap()
+	Command::new(program)
+		.args(arguments)
+		.current_dir(cwd)
+		.env("CARBON_TEST_BUNDLED_REFLECTION", "1")
+		.output()
+		.unwrap()
 }
 
 fn git<I, S>(repository: &Path, arguments: I)
