@@ -1,10 +1,13 @@
 use anyhow::{bail, ensure, Context, Result};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::info;
 use serde::{Deserialize, Serialize};
 #[cfg(any(carbon_bundled_rml, test))]
 use std::io::Write;
+use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{
 	env, fs,
 	fs::{File, OpenOptions},
@@ -110,57 +113,233 @@ impl Launch {
 	}
 }
 
-pub fn latest_studio_dir() -> Result<PathBuf> {
-	if let Some(executable) = env::var_os("ROBLOX_STUDIO_EXE") {
-		let executable = PathBuf::from(executable);
+#[derive(Debug, Clone)]
+pub struct StudioInfo {
+	pub executable: PathBuf,
+	pub version_text: String,
+	pub version_components: [u32; 4],
+	pub build_id: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn windows_file_version(path: &str) -> Result<String> {
+	let encoded_path = BASE64_STANDARD.encode(path.as_bytes());
+	let script = format!(
+		r#"$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_path}')); (Get-Item -LiteralPath $path).VersionInfo.FileVersion"#
+	);
+	let output = Command::new("powershell.exe")
+		.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+		.output()
+		.context("failed to read Studio file version")?;
+	ensure!(output.status.success(), "failed to read Studio file version");
+	Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_studio_bundle(executable: &Path) -> Result<&Path> {
+	executable
+		.ancestors()
+		.find(|path| path.extension().is_some_and(|extension| extension == "app"))
+		.with_context(|| {
+			format!(
+				"Studio executable is not inside an app bundle: {}",
+				executable.display()
+			)
+		})
+}
+
+#[cfg(target_os = "macos")]
+fn macos_studio_version(executable: &Path) -> Result<String> {
+	let plist = macos_studio_bundle(executable)?.join("Contents/Info.plist");
+	ensure!(
+		plist.is_file(),
+		"Info.plist not found for Studio app at {}",
+		plist.display()
+	);
+	let output = Command::new("/usr/libexec/PlistBuddy")
+		.args(["-c", "Print :CFBundleShortVersionString"])
+		.arg(&plist)
+		.output()
+		.with_context(|| format!("failed to read Studio version from {}", plist.display()))?;
+	ensure!(
+		output.status.success(),
+		"failed to read Studio version from {}",
+		plist.display()
+	);
+	Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+pub fn get_studio_info() -> Result<StudioInfo> {
+	if let Some(executable_env) = env::var_os("ROBLOX_STUDIO_EXE") {
+		let executable = PathBuf::from(executable_env);
 		ensure!(
 			executable.is_file(),
 			"ROBLOX_STUDIO_EXE does not exist: {}",
 			executable.display()
 		);
-		return executable
+		#[cfg(target_os = "macos")]
+		let build_id = macos_studio_bundle(&executable)?
+			.file_name()
+			.and_then(|name| name.to_str())
+			.unwrap_or("custom")
+			.to_owned();
+		#[cfg(not(target_os = "macos"))]
+		let build_id = executable
 			.parent()
-			.map(Path::to_owned)
-			.context("ROBLOX_STUDIO_EXE has no parent directory");
+			.and_then(|p| p.file_name())
+			.and_then(|n| n.to_str())
+			.unwrap_or("custom")
+			.to_owned();
+
+		#[cfg(target_os = "linux")]
+		let raw_version = {
+			let win_path = Command::new("wslpath")
+				.args(["-w", executable.to_str().unwrap()])
+				.output()
+				.context("failed to translate executable path with wslpath -w")?;
+			ensure!(win_path.status.success(), "wslpath -w failed");
+			let win_str = String::from_utf8(win_path.stdout)?.trim().to_owned();
+			windows_file_version(&win_str)?
+		};
+
+		#[cfg(target_os = "macos")]
+		let raw_version = macos_studio_version(&executable)?;
+
+		#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+		let raw_version = windows_file_version(
+			executable
+				.to_str()
+				.context("Roblox Studio executable path is not valid UTF-8")?,
+		)?;
+
+		let (version_text, version_components) = parse_version(&raw_version)?;
+		return Ok(StudioInfo {
+			executable,
+			version_text,
+			version_components,
+			build_id,
+		});
 	}
 
 	#[cfg(target_os = "linux")]
 	{
 		ensure!(
 			env::var_os("WSL_DISTRO_NAME").is_some(),
-			"automatic RML installation on Linux requires WSL"
+			"automatic Studio reflection on Linux requires WSL"
 		);
 		let output = Command::new("powershell.exe")
 			.args([
 				"-NoProfile",
 				"-NonInteractive",
 				"-Command",
-				r#"$studio = Get-ChildItem "$env:LOCALAPPDATA/Roblox/Versions/*/RobloxStudioBeta.exe" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if ($null -eq $studio) { exit 3 }; $studio.Directory.FullName"#,
+				r#"$studio = Get-ChildItem "$env:LOCALAPPDATA/Roblox/Versions/*/RobloxStudioBeta.exe" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if ($null -eq $studio) { exit 3 }; Write-Output ($studio.FullName + [char]9 + $studio.VersionInfo.FileVersion)"#,
 			])
 			.output()
 			.context("failed to locate Roblox Studio through PowerShell")?;
 		ensure!(output.status.success(), "Roblox Studio is not installed");
-		let windows_path = String::from_utf8(output.stdout)?.trim().to_owned();
+		let stdout = String::from_utf8(output.stdout)?;
+		let line = stdout.trim();
+		let mut parts = line.split('\t');
+		let windows_path = parts.next().context("missing Studio executable path")?.trim();
+		let raw_version = parts.next().context("missing Studio file version")?.trim();
+
 		let translated = Command::new("wslpath")
-			.args(["-u", windows_path.as_str()])
+			.args(["-u", windows_path])
 			.output()
-			.context("failed to translate the Roblox Studio path")?;
-		ensure!(
-			translated.status.success(),
-			"failed to translate the Roblox Studio path"
-		);
-		Ok(PathBuf::from(String::from_utf8(translated.stdout)?.trim()))
+			.context("failed to translate Roblox Studio path")?;
+		ensure!(translated.status.success(), "failed to translate Roblox Studio path");
+		let executable = PathBuf::from(String::from_utf8(translated.stdout)?.trim());
+
+		let build_id = executable
+			.parent()
+			.and_then(|p| p.file_name())
+			.and_then(|n| n.to_str())
+			.unwrap_or("latest")
+			.to_owned();
+
+		let (version_text, version_components) = parse_version(raw_version)?;
+
+		Ok(StudioInfo {
+			executable,
+			version_text,
+			version_components,
+			build_id,
+		})
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(target_os = "macos")]
 	{
 		use roblox_install::RobloxStudio;
 		let executable = RobloxStudio::locate()?.application_path().to_owned();
-		executable
-			.parent()
-			.map(Path::to_owned)
-			.context("Roblox Studio executable has no parent directory")
+		ensure!(executable.is_file(), "Roblox Studio executable not found");
+
+		let raw_version = macos_studio_version(&executable)?;
+		let build_id = macos_studio_bundle(&executable)?
+			.file_name()
+			.and_then(|name| name.to_str())
+			.unwrap_or("RobloxStudio.app")
+			.to_owned();
+		let (version_text, version_components) = parse_version(&raw_version)?;
+
+		Ok(StudioInfo {
+			executable,
+			version_text,
+			version_components,
+			build_id,
+		})
 	}
+
+	#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+	{
+		use roblox_install::RobloxStudio;
+		let executable = RobloxStudio::locate()?.application_path().to_owned();
+		ensure!(executable.is_file(), "Roblox Studio executable not found");
+
+		let build_id = executable
+			.parent()
+			.and_then(|p| p.file_name())
+			.and_then(|n| n.to_str())
+			.unwrap_or("latest")
+			.to_owned();
+
+		let raw_version = windows_file_version(
+			executable
+				.to_str()
+				.context("Roblox Studio executable path is not valid UTF-8")?,
+		)?;
+		let (version_text, version_components) = parse_version(&raw_version)?;
+
+		Ok(StudioInfo {
+			executable,
+			version_text,
+			version_components,
+			build_id,
+		})
+	}
+}
+
+fn parse_version(raw: &str) -> Result<(String, [u32; 4])> {
+	let sanitized = raw.replace(", ", ".").replace(',', ".").replace(' ', "");
+	let parts: Vec<&str> = sanitized.split('.').collect();
+	ensure!(
+		parts.len() == 4,
+		"Studio version string '{raw}' does not have 4 components"
+	);
+	let c0: u32 = parts[0].parse().context("invalid version component 0")?;
+	let c1: u32 = parts[1].parse().context("invalid version component 1")?;
+	let c2: u32 = parts[2].parse().context("invalid version component 2")?;
+	let c3: u32 = parts[3].parse().context("invalid version component 3")?;
+
+	let text = format!("{c0}.{c1}.{c2}.{c3}");
+	Ok((text, [c0, c1, c2, c3]))
+}
+
+pub fn latest_studio_dir() -> Result<PathBuf> {
+	let info = get_studio_info()?;
+	info.executable
+		.parent()
+		.map(Path::to_owned)
+		.context("Roblox Studio executable has no parent directory")
 }
 
 pub fn package_dir(explicit: Option<&Path>) -> Result<PathBuf> {

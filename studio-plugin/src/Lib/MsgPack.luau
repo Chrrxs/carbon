@@ -431,7 +431,31 @@ local extensionTypeLUT = {
 	[16] = 0xD8,
 }
 
-local function encode(result: buffer, offset: number, data: any): number
+local function canonicalMapKeyLess(left: any, right: any): boolean
+	local leftType = type(left)
+	local rightType = type(right)
+	if leftType ~= rightType then
+		return leftType < rightType
+	elseif leftType == "string" or leftType == "number" then
+		return left < right
+	elseif leftType == "boolean" then
+		return left == false and right == true
+	end
+	error(`Could not canonically encode map key type {leftType}`)
+end
+
+local function canonicalMapKeys(data, forceMap: boolean): { any }
+	local keys = {}
+	for key in pairs(data) do
+		if not forceMap or key ~= "_msgpackType" then
+			table.insert(keys, key)
+		end
+	end
+	table.sort(keys, canonicalMapKeyLess)
+	return keys
+end
+
+local function encode(result: buffer, offset: number, data: any, canonicalMaps: boolean): number
 	local dtype = type(data)
 
 	if data == nil then
@@ -643,7 +667,7 @@ local function encode(result: buffer, offset: number, data: any): number
 			end
 
 			for _, v in ipairs(data) do
-				newOffset = encode(result, newOffset, v)
+				newOffset = encode(result, newOffset, v, canonicalMaps)
 			end
 
 			return newOffset
@@ -665,10 +689,17 @@ local function encode(result: buffer, offset: number, data: any): number
 				error("Could not encode - too long map")
 			end
 
-			for k, v in pairs(data) do
-				if not forceMap or k ~= "_msgpackType" then
-					newOffset = encode(result, newOffset, k)
-					newOffset = encode(result, newOffset, v)
+			if canonicalMaps then
+				for _, k in canonicalMapKeys(data, forceMap) do
+					newOffset = encode(result, newOffset, k, true)
+					newOffset = encode(result, newOffset, data[k], true)
+				end
+			else
+				for k, v in pairs(data) do
+					if not forceMap or k ~= "_msgpackType" then
+						newOffset = encode(result, newOffset, k, false)
+						newOffset = encode(result, newOffset, v, false)
+					end
 				end
 			end
 
@@ -844,7 +875,16 @@ function MsgPack.encode(data: any): string
 	local length = computeLength(data, {})
 	local result = bufferCreate(length)
 
-	encode(result, 0, data)
+	encode(result, 0, data, false)
+
+	return bufferToString(result)
+end
+
+function MsgPack.encodeCanonical(data: any): string
+	local length = computeLength(data, {})
+	local result = bufferCreate(length)
+
+	encode(result, 0, data, true)
 
 	return bufferToString(result)
 end

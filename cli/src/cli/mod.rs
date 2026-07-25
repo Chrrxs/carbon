@@ -123,19 +123,46 @@ impl Cli {
 
 	pub fn main(self) -> Result<()> {
 		match self.command {
-			Commands::Init(command) => command.main(),
-			Commands::Migrate(command) => command.main(),
-			Commands::MergeArtifact(command) => command.main(),
-			Commands::Conflicts(command) => command.main(),
-			Commands::Resolve(command) => command.main(),
-			Commands::Build(command) => command.main(),
+			Commands::Init(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
+			Commands::Migrate(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
+			Commands::MergeArtifact(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
+			Commands::Conflicts(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
+			Commands::Resolve(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
+			Commands::Build(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
 			Commands::Capture(command) => command.main(),
-			Commands::Serve(command) => command.main(),
+			Commands::Serve(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
 			Commands::Stop(command) => command.main(),
 			Commands::Studio(command) => command.main(),
-			Commands::Diff(command) => command.main(),
+			Commands::Diff(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
 			Commands::Focus(command) => command.main(),
-			Commands::Sourcemap(command) => command.main(),
+			Commands::Sourcemap(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
 			Commands::Config(command) => command.main(),
 			Commands::Rml(command) => command.main(),
 		}

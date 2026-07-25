@@ -205,6 +205,7 @@ fn find_canonical_property<'de>(
 	type_name: &str,
 	prop_name: &str,
 	strict: bool,
+	skip_known_non_serializing_properties: bool,
 ) -> Result<Option<CanonicalProperty<'de>>, InnerError> {
 	match find_property_descriptors(database, class_descriptor, prop_name) {
 		Some((_, descriptors)) => {
@@ -225,7 +226,7 @@ fn find_canonical_property<'de>(
 			// found is the one that's supposed to serialize.
 			if let PropertyKind::Canonical { serialization } = &descriptors.canonical.kind {
 				if matches!(serialization, PropertySerialization::DoesNotSerialize) {
-					if strict {
+					if strict && !skip_known_non_serializing_properties {
 						return Err(InnerError::StrictProperty {
 							type_name: type_name.to_owned(),
 							prop_name: prop_name.to_owned(),
@@ -561,6 +562,7 @@ impl<'db, 'sink, R: Read> DeserializerState<'db, 'sink, R> {
 			type_info.type_name.as_str(),
 			&prop_name,
 			self.deserializer.strict,
+			self.deserializer.skip_known_non_serializing_properties,
 		)? {
 			property
 		} else {

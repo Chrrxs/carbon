@@ -4,6 +4,10 @@ All notable Carbon Studio plugin changes are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Studio-owned reflection descriptors now come automatically from the exact installed Studio build; the bundled database only supplies Carbon-specific adapters and historical aliases.
+
 ## [0.1.0] - 2026-07-17
 
 ### Added

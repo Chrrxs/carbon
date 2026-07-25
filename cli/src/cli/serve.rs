@@ -21,7 +21,7 @@ use crate::{
 	project,
 	server::{self, Server},
 	sessions::{self, Session},
-	source, studio,
+	source, studio, util,
 };
 
 const SERVE_HOST: &str = "127.0.0.1";
@@ -219,8 +219,9 @@ impl Serve {
 			report.properties.to_string().bold()
 		);
 		crate::carbon_info!("Launching Roblox Studio");
+		let studio_dir = &util::get_reflection_snapshot().studio_dir;
 		let managed_studio =
-			launch_disposable_managed_place(&build_path, || studio::launch_managed(build_path.clone()))?;
+			launch_disposable_managed_place(&build_path, || studio::launch_managed(build_path.clone(), studio_dir))?;
 		let studio_process_id = managed_studio.process_id();
 		crate::carbon_info!(
 			"Waiting for Roblox Studio to connect on {} (Studio PID {}, lifecycle: {})",

@@ -3,10 +3,11 @@ use std::{collections::BTreeMap, io::Write};
 use rbx_dom_weak::{
 	types::{
 		BinaryString, BrickColor, CFrame, Color3, Color3uint8, Content, Enum, Font, Matrix3, Ref, Region3,
-		SharedString, Variant, Vector3,
+		SharedString, Variant, VariantType, Vector3,
 	},
 	InstanceBuilder, Ustr, WeakDom,
 };
+use rbx_reflection::{DataType, PropertyDescriptor, PropertyKind, PropertySerialization, ReflectionDatabase};
 
 use crate::{
 	chunk::{Chunk, ChunkBuilder},
@@ -335,6 +336,51 @@ fn unknown_property() {
 		.strict(true)
 		.deserialize(buffer.as_slice())
 		.expect("strict decoding should retain representable unknown properties");
+}
+
+fn reflection_with_non_serializing_probe(serializes: bool) -> ReflectionDatabase<'static> {
+	let mut database = rbx_reflection_database::get_bundled().clone();
+	let class = database
+		.classes
+		.get_mut("Folder")
+		.expect("Folder reflection is missing");
+	let mut property = PropertyDescriptor::new("SaveOnlyProbe", DataType::Value(VariantType::Ref));
+	property.kind = PropertyKind::Canonical {
+		serialization: if serializes {
+			PropertySerialization::Serializes
+		} else {
+			PropertySerialization::DoesNotSerialize
+		},
+	};
+	class.properties.insert("SaveOnlyProbe", property);
+	database
+}
+
+#[test]
+fn strict_capture_can_skip_a_known_save_only_property() {
+	let serializing = reflection_with_non_serializing_probe(true);
+	let non_serializing = reflection_with_non_serializing_probe(false);
+	let tree = WeakDom::new(InstanceBuilder::new("Folder").with_property("SaveOnlyProbe", Ref::none()));
+	let mut buffer = Vec::new();
+	Serializer::new()
+		.reflection_database(&serializing)
+		.serialize(&mut buffer, &tree, &[tree.root_ref()])
+		.unwrap();
+
+	let error = Deserializer::new()
+		.strict(true)
+		.reflection_database(&non_serializing)
+		.deserialize(buffer.as_slice())
+		.unwrap_err();
+	assert!(error.to_string().contains("marks this property as non-serializing"));
+
+	let decoded = Deserializer::new()
+		.strict(true)
+		.skip_known_non_serializing_properties(true)
+		.reflection_database(&non_serializing)
+		.deserialize(buffer.as_slice())
+		.unwrap();
+	assert!(!decoded.root().properties.contains_key(&Ustr::from("SaveOnlyProbe")));
 }
 
 #[test]

@@ -13,6 +13,12 @@ local BINARY_TYPES = {
 	UniqueId = true,
 }
 
+local ALWAYS_MATERIALIZED_TYPES = {
+	-- CapabilityControl can reject writes even when API security reports None.
+	-- Native serialized access preserves the persisted value consistently.
+	SecurityCapabilities = true,
+}
+
 local RUNTIME_CACHE_PROPERTIES = {
 	-- Recomputed from CSG geometry on load; Studio does not retain the serialized
 	-- authoring-time count and exposes zero while the union remains unchanged.
@@ -65,6 +71,10 @@ function ProtectedProperties.isPersistentReadOnly(className: string, propertyNam
 	return PERSISTENT_READ_ONLY_PROPERTIES[`{className}.{propertyName}`] == true
 end
 
+function ProtectedProperties.requiresMaterialization(dataType: string): boolean
+	return ALWAYS_MATERIALIZED_TYPES[dataType] == true
+end
+
 function ProtectedProperties.exclusionReason(className: string, propertyName: string, propertyData): string?
 	local dataTypeKey, dataTypeValue = next(propertyData.DataType)
 	local dataType = if dataTypeKey == "Enum" then "Enum" else dataTypeValue
@@ -98,7 +108,8 @@ local function candidatesForClass(database, className: string): { any }
 			seen[propertyName] = true
 			local dataTypeKey, dataTypeValue = next(propertyData.DataType)
 			local dataType = if dataTypeKey == "Enum" then "Enum" else dataTypeValue
-			local protectedScriptability = propertyData.Scriptability == "None"
+			local protectedScriptability = ProtectedProperties.requiresMaterialization(dataType)
+				or propertyData.Scriptability == "None"
 				or propertyData.Scriptability == "Write"
 				or (propertyData.Scriptability == "Custom" and dataType == "OptionalCFrame")
 				or (

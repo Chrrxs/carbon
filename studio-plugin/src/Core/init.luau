@@ -11,10 +11,10 @@ local TransientMetadata = require(Carbon.TransientMetadata)
 local Types = require(Carbon.Types)
 local manifest = require(Carbon.manifest)
 
+local BoundedRetry = require(script.BoundedRetry)
 local Error = require(script.Error)
 local InitialReconciliation = require(script.InitialReconciliation)
 local MappingReconciler = require(script.MappingReconciler)
-local PrivilegedNegotiation = require(script.PrivilegedNegotiation)
 
 local PROTOCOL_VERSION = 4
 
@@ -59,9 +59,52 @@ end
 function Core:run(): Promise.Promise
 	return Promise.new(function(_, reject)
 		self.status = Core.Status.Connecting
-		-- selene: allow(undefined_variable)
-		Dom.assertReflectionVersion(version())
 
+		Log.trace("Fetching live reflection..")
+		local reflection
+		if self.expectedWorktree then
+			local success, result = BoundedRetry.run(function()
+				return self.client:fetchReflection():expect()
+			end, function(delay)
+				task.wait(delay)
+			end)
+			if not success then
+				return reject(result)
+			end
+			reflection = result
+		else
+			reflection = self.client:fetchReflection():expect()
+		end
+		if
+			type(reflection) ~= "table"
+			or type(reflection.version) ~= "table"
+			or type(reflection.apiDump) ~= "string"
+		then
+			return reject(Error.new(Error.Unknown, "Invalid reflection data received from server"))
+		end
+		-- selene: allow(undefined_variable)
+		local studioVersion = version()
+		local applySuccess, applyError = pcall(function()
+			local result = Dom.applyReflection(reflection.version, reflection.apiDump, studioVersion)
+			local skippedProperties = {}
+			for propertyName, dataType in result.skippedProperties do
+				table.insert(skippedProperties, `{propertyName} ({dataType})`)
+			end
+			table.sort(skippedProperties)
+			if #skippedProperties > 0 then
+				Log.debug(
+					`Live reflection omitted {#skippedProperties} unsupported round-trippable properties: {table.concat(
+						skippedProperties,
+						", "
+					)}`
+				)
+			end
+		end)
+		if not applySuccess then
+			return reject(Error.new(Error.Unknown, `Failed to apply live reflection database: {tostring(applyError)}`))
+		end
+
+		Dom.assertReflectionVersion(studioVersion)
 		Log.trace("Fetching server details..")
 		local project = self.client:fetchDetails():expect()
 		self:__verifyProject(project):expect()
@@ -70,7 +113,7 @@ function Core:run(): Promise.Promise
 		local trustedBuiltPlace = InitialReconciliation.isTrustedBuiltPlace(project, self.expectedWorktree)
 		if not self.expectedWorktree then
 			local confirmed = self.__prompt(
-				`Attach this open Studio place to Carbon project "{project.name}"? Filesystem mappings will be applied authoritatively.`,
+				`Attach this open Studio place to Carbon project "{project.name}"? Its current state will be captured before filesystem mappings are applied authoritatively.`,
 				nil
 			)
 			if not confirmed then
@@ -84,22 +127,35 @@ function Core:run(): Promise.Promise
 		TransientMetadata.claimMcpPlaceIdTransport(serverStorage, self.client.instanceId)
 
 		-- Negotiation binds this Studio session to its RML bridge for explicit
-		-- native capture. It does not attach, verify, or watch the hierarchy.
-		local privilegedSuccess, privilegedResult = PrivilegedNegotiation.run(function()
-			local capabilities = self.client:getPrivilegedCapabilities():expect()
-			if
-				capabilities.studioSessionId ~= self.client.studioSessionId
-				or capabilities.instanceId ~= self.client.instanceId
-			then
-				error("RML bridge routing identity mismatch", 0)
-			end
-			return capabilities
-		end, function(delay)
+		-- native capture. Managed launches wait until the matching bridge arrives;
+		-- removing the managed session marker cancels the wait through Core:stop.
+		local fetchCapabilities = function()
+			return self.client:getPrivilegedCapabilities():expect()
+		end
+		local waitForRetry = function(delay)
 			task.wait(delay)
-		end)
+		end
+		local privilegedSuccess, privilegedResult
+		if self.expectedWorktree then
+			privilegedSuccess, privilegedResult = BoundedRetry.runUntil(fetchCapabilities, waitForRetry, function()
+				return self.status == Core.Status.Connecting
+			end)
+		else
+			privilegedSuccess, privilegedResult = BoundedRetry.run(fetchCapabilities, waitForRetry)
+		end
 		if not privilegedSuccess then
 			Dom.configurePrivileged(nil, nil)
+			if self.status ~= Core.Status.Connecting then
+				return reject(Error.new(Error.Terminated))
+			end
 			return reject(Error.new(Error.PrivilegedUnavailable, privilegedResult))
+		end
+		if
+			privilegedResult.studioSessionId ~= self.client.studioSessionId
+			or privilegedResult.instanceId ~= self.client.instanceId
+		then
+			Dom.configurePrivileged(nil, nil)
+			return reject(Error.new(Error.PrivilegedUnavailable, "RML bridge routing identity mismatch"))
 		end
 		local privilegedCapabilities = privilegedResult
 		Dom.configurePrivileged(self.client, privilegedCapabilities)
@@ -118,7 +174,18 @@ function Core:run(): Promise.Promise
 			self.tree = self.reconciler.tree
 			Log.debug("Attached built mapping identities:", report.instances, "of", report.expected, "instances")
 		else
-			Log.trace("Reconciling frozen filesystem mappings into the confirmed open place..")
+			-- Preserve authored Studio state before the source-authoritative mapped
+			-- projection can overwrite properties or remove invalid mapped nodes.
+			-- A full native capture is also the continuity boundary when a retained
+			-- RML ledger reconnects after an edit DataModel replacement.
+			Log.trace("Capturing the open Studio place before initial mapping reconciliation..")
+			local captureStatus = self.client:requestManifestCapture(nil, true):expect()
+			self:__advanceSourceGeneration(captureStatus.sourceGeneration)
+			project = self.client:fetchDetails():expect()
+			self:__verifyProject(project):expect()
+			self.project = project
+
+			Log.trace("Reconciling frozen filesystem mappings into the captured open place..")
 			local report = self:__reconcileMappings()
 			self.tree = self.reconciler.tree
 			Log.debug("Initial mapping reconciliation:", report.instances, "instances")
@@ -193,10 +260,9 @@ function Core:captureManifest(
 end
 
 function Core:__reconcileMappings()
-	-- Filesystem mappings only contain folders and scripts. Their live-sync
-	-- surface must not depend on native manifest access, bridge attachment, or
-	-- protected instance properties. Temporarily expose exactly the ordinary
-	-- Studio property surface while producing and applying the mapped diff.
+	-- Filesystem mappings use only the ordinary Studio property surface.
+	-- Reflection-protected serialized fields are excluded while the adapter is
+	-- disabled, so engine-owned defaults cannot block script synchronization.
 	Dom.configurePrivileged(nil, nil)
 	local success, result = pcall(function()
 		return self.reconciler:reconcile(self.client, self.project)

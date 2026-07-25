@@ -4,8 +4,8 @@ local fs = require("@lune/fs")
 local process = require("@lune/process")
 local serde = require("@lune/serde")
 
+local LiveReflection = require("../src/Lib/Dom/LiveReflection")
 local MsgPack = require("../src/Lib/MsgPack")
-local Update = require("./reflection-database-update")
 
 local apiPath = process.args[1]
 local versionText = process.args[2]
@@ -22,20 +22,21 @@ for component in string.gmatch(versionText, "[^.]+") do
 end
 assert(#version == 4, `reflection version must have four components: {versionText}`)
 
-local databasePath = "src/Lib/Dom/database.msgpack"
-local overlayPath = "src/Lib/Dom/reflection.json"
-local database = MsgPack.decode(fs.readFile(databasePath))
+local database = MsgPack.decode(fs.readFile("src/Lib/Dom/database.msgpack"))
 local api = serde.decode("json", fs.readFile(apiPath))
-local overlay, skippedTypes = Update.fromApi(api, version)
-local result = Update.applyOverlay(database, overlay)
+local result = LiveReflection.apply(database, api, version)
 
-local encodedOverlay = serde.encode("json", overlay)
-encodedOverlay = string.gsub(encodedOverlay, '"tags":{}', '"tags":[]')
-fs.writeFile(overlayPath, encodedOverlay)
-fs.writeFile(databasePath, MsgPack.encode(database))
-print(
-	`Updated reflection database to {versionText}: {result.addedClasses} classes and {result.addedProperties} properties added; {result.synchronizedProperties} properties synchronized`
-)
-for qualified in skippedTypes do
-	print(`Skipped unsupported reflection type {qualified}`)
+fs.writeFile("src/Lib/Dom/database.msgpack", MsgPack.encodeCanonical(database))
+
+local skippedTypes = {}
+for dataType in result.skippedTypes do
+	table.insert(skippedTypes, dataType)
 end
+table.sort(skippedTypes)
+for _, dataType in skippedTypes do
+	print(`Skipped unsupported non-place reflection type {dataType}`)
+end
+
+print(
+	`Updated reflection database to {versionText}: {result.addedClasses} classes, {result.addedProperties} properties added`
+)

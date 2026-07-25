@@ -471,6 +471,39 @@ public sealed class ManifestIdentityLedgerTests
         Assert.Equal(2, ledger.Count);
     }
 
+    [Fact]
+    public void AuthoritativeRootIdentitySurvivesEditDataModelReattachment()
+    {
+        var digest = ManifestIdentityLedger.Digest([Root, Left]);
+        var ledger = new ManifestIdentityLedger();
+        ledger.Bootstrap([new(1, Root), new(2, Left)], Root, 2, digest);
+
+        ledger.RebindHandle(1, 9);
+
+        Assert.True(ledger.IsAuthoritative);
+        Assert.False(ledger.Contains(1));
+        Assert.True(ledger.Contains(9));
+        Assert.Equal(Root, ledger.GetOrCreate(9));
+        Assert.Equal(2, ledger.Count);
+        Assert.Equal(digest, ledger.ActiveDigest());
+    }
+
+    [Fact]
+    public void EditDataModelReattachmentRequiresTheRetainedHierarchy()
+    {
+        var digest = ManifestIdentityLedger.Digest([Root, Left]);
+        var ledger = new ManifestIdentityLedger();
+        ledger.Bootstrap([new(1, Root), new(2, Left)], Root, 2, digest);
+
+        Assert.True(ledger.MatchesRetainedAttachment([9, 2], 1, 9));
+        Assert.False(ledger.MatchesRetainedAttachment([9], 1, 9));
+        Assert.False(ledger.MatchesRetainedAttachment([9, 2], 7, 9));
+
+        var provisional = new ManifestIdentityLedger(() => Left);
+        _ = provisional.GetOrCreate(2);
+        Assert.False(provisional.MatchesRetainedAttachment([9, 2], 1, 9));
+    }
+
     private static byte[] SerializeAttributes(IReadOnlyList<AttributeWire> attributes)
     {
         using var stream = new MemoryStream();

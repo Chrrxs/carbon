@@ -27,6 +27,7 @@ local MATERIALIZED_READ_ONLY_TYPES = {
 	Int32 = true,
 	String = true,
 	Vector3 = true,
+	SecurityCapabilities = true,
 }
 
 local PrivilegedAccess = {}
@@ -192,7 +193,7 @@ end
 function PrivilegedAccess.supportsDescriptor(descriptor): boolean
 	return client ~= nil
 		and descriptor.serializes == true
-		and (descriptor.scriptability == "None" or descriptor.scriptability == "Write" or (descriptor.scriptability == "Custom" and descriptor.dataType == "OptionalCFrame"))
+		and (ProtectedProperties.requiresMaterialization(descriptor.dataType) or descriptor.scriptability == "None" or descriptor.scriptability == "Write" or (descriptor.scriptability == "Custom" and descriptor.dataType == "OptionalCFrame"))
 		and descriptor.privilegedExcluded ~= true
 		and supportedTypes[descriptor.dataType] == true
 end
@@ -200,10 +201,15 @@ end
 function PrivilegedAccess.supportsMaterializedDescriptor(descriptor): boolean
 	return client ~= nil
 		and descriptor.serializes == true
-		and descriptor.scriptability == "Read"
 		and descriptor.privilegedExcluded ~= true
 		and MATERIALIZED_READ_ONLY_TYPES[descriptor.dataType] == true
-		and ProtectedProperties.isPersistentReadOnly(descriptor.className, descriptor.name)
+		and (
+			ProtectedProperties.requiresMaterialization(descriptor.dataType)
+			or (
+				descriptor.scriptability == "Read"
+				and ProtectedProperties.isPersistentReadOnly(descriptor.className, descriptor.name)
+			)
+		)
 end
 
 function PrivilegedAccess.supportsReferenceDescriptor(descriptor): boolean
@@ -406,6 +412,10 @@ function PrivilegedAccess.writeMaterialized(instance: Instance, descriptor, valu
 			return false, "Content.Object requires full connected-graph materialization"
 		end
 		return false, `unsupported materialized value for {descriptor.dataType}`
+	end
+	local currentSuccess, current = PrivilegedAccess.read(instance, descriptor)
+	if currentSuccess and PrivilegedValueCodec.encode(descriptor.dataType, current) == raw then
+		return true
 	end
 	return materializeProperty(instance, descriptor.name, descriptor.dataType, raw)
 end

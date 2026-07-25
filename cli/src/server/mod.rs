@@ -22,6 +22,7 @@ mod exec;
 mod home;
 pub(crate) mod privileged;
 mod read;
+mod reflection;
 mod snapshot;
 mod stop;
 mod subscribe;
@@ -139,6 +140,7 @@ impl Server {
 				.app_data(Data::new(app_stop_handle.clone()))
 				.app_data(msgpack_config)
 				.service(details::main)
+				.service(reflection::main)
 				.service(subscribe::main)
 				.service(unsubscribe::main)
 				.service(snapshot::page)

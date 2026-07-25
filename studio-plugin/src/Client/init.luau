@@ -108,6 +108,16 @@ function Client:getUrl(endpoint: string?): string
 	return `http://{self.host}:{self.port}/{endpoint or ""}`
 end
 
+function Client:fetchReflection(): Promise.TypedPromise<{ version: { number }, apiDump: string }>
+	Log.trace("Client request: reflection")
+
+	local url = self:getUrl("reflection")
+
+	return Http.get(url):andThen(function(response)
+		return response:decode()
+	end)
+end
+
 function Client:fetchDetails(): Promise.TypedPromise<Types.Project>
 	Log.trace("Client request: details")
 
@@ -452,10 +462,12 @@ function Client:readPrivilegedChanges(after: number): Promise.Promise
 end
 
 function Client:requestManifestCapture(
-	onStatus: ((status: Types.ManifestCaptureStatus) -> ())?
+	onStatus: ((status: Types.ManifestCaptureStatus) -> ())?,
+	forceFull: boolean?
 ): Promise.TypedPromise<Types.ManifestCaptureStatus>
 	Log.trace("Client request: Capture Manifest")
-	return Http.post(self:getUrl("capture/request")):andThen(function(response)
+	local endpoint = if forceFull == true then "capture/request?forceFull=true" else "capture/request"
+	return Http.post(self:getUrl(endpoint)):andThen(function(response)
 		local started = HttpService:JSONDecode(response.Body) :: Types.ManifestCaptureStatus
 		local lastMessage = nil
 		local function poll(status: Types.ManifestCaptureStatus)

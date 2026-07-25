@@ -235,6 +235,7 @@ impl InstanceSource for DecodedArena {
 pub struct Deserializer<'db> {
 	database: &'db ReflectionDatabase<'db>,
 	strict: bool,
+	skip_known_non_serializing_properties: bool,
 }
 
 impl<'db> Deserializer<'db> {
@@ -243,6 +244,7 @@ impl<'db> Deserializer<'db> {
 		Self {
 			database: rbx_reflection_database::get().unwrap(),
 			strict: false,
+			skip_known_non_serializing_properties: false,
 		}
 	}
 
@@ -263,6 +265,18 @@ impl<'db> Deserializer<'db> {
 	#[inline]
 	pub fn strict(mut self, strict: bool) -> Self {
 		self.strict = strict;
+		self
+	}
+
+	/// Allows strict capture decoding to omit properties that the current
+	/// reflection schema knows Studio cannot load back from a saved place.
+	///
+	/// Studio may still emit save-only properties in native capture chunks.
+	/// This exception remains narrow: unknown properties and malformed chunks
+	/// retain strict failure behavior.
+	#[inline]
+	pub fn skip_known_non_serializing_properties(mut self, skip: bool) -> Self {
+		self.skip_known_non_serializing_properties = skip;
 		self
 	}
 

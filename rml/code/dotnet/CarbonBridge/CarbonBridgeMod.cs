@@ -28,8 +28,7 @@ internal readonly record struct ObservationRetentionPlan(
     "carbon-serialized-property-bridge",
     "1.0.0",
     Author = "Carbon",
-    Description = "Authenticated, serialized-property-only bridge for the Carbon Studio plugin",
-    LoadInDataModels = new[] { DataModelType.Edit }
+    Description = "Authenticated, serialized-property-only bridge for the Carbon Studio plugin"
 )]
 public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 {
@@ -40,6 +39,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private const string RootPropertyWrapperPrefix = "__CarbonRootProperty:";
     private static readonly TimeSpan ManagedSnapshotQuietPeriod = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan AttestedManagedSnapshotQuietPeriod = TimeSpan.FromMilliseconds(250);
+    internal static readonly TimeSpan ManagedSnapshotRetryPeriod = TimeSpan.FromMilliseconds(100);
+    internal static readonly TimeSpan ManagedSnapshotReadinessTimeout = TimeSpan.FromSeconds(30);
 
     [DllImport("roblox_modloader.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern nint carbon_rml_build_version();
@@ -235,6 +236,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private readonly ManagedBindingReleaseGate _managedBindingReleases = new();
     private readonly Dictionary<string, Task<object>> _managedIdentityResolutions = new(StringComparer.Ordinal);
     private readonly Dictionary<nuint, (string StudioSessionId, string InstanceId)> _studioIdentityCandidates = [];
+    private (string StudioSessionId, string InstanceId)? _preservedStudioRoute;
 
     private CancellationTokenSource? _shutdown;
     private HttpListener? _listener;
@@ -244,6 +246,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private Timer? _launchHydratedDefaultsTimer;
     private CaptureLeaseManager? _captureLeases;
     private DataModel? _dataModel;
+    private nuint _detachedEditDataModelHandle;
     private SerializedPropertyAccess.EngineThreadPump? _engineThreadPump;
     private Timer? _managedSnapshotTimer;
     private IDisposable? _propertyObservation;
@@ -309,9 +312,30 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
     public void OnDataModelLoaded(DataModel dataModel, DataModelType dataModelType)
     {
-        if (dataModelType != DataModelType.Edit)
+        if (!IsEditDataModelCandidate(dataModelType))
         {
             return;
+        }
+        if (dataModelType != DataModelType.Edit)
+        {
+            // Roblox's private DataModel layout can move before the loader's
+            // next offset update. An out-of-domain value is allowed to attach
+            // provisionally; Carbon's unique CoreGui route still gates every
+            // request, so valid play/client/server models remain excluded.
+            Logger.Info(
+                $"RML reported unknown DataModel type {(int)dataModelType}; " +
+                "probing it as an edit candidate until Studio routing is established");
+        }
+
+        var dataModelHandle = InstanceHierarchy.RuntimeHandle(dataModel);
+        nuint detachedDataModelHandle;
+        (string StudioSessionId, string InstanceId)? detachedStudioRoute;
+        lock (_engineStateLock)
+        {
+            detachedDataModelHandle = _detachedEditDataModelHandle;
+            detachedStudioRoute = _preservedStudioRoute;
+            _detachedEditDataModelHandle = 0;
+            _preservedStudioRoute = null;
         }
 
         _dataModel = dataModel;
@@ -350,11 +374,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _preVerificationHierarchyChanges = null;
         }
         _managedBindingReleases.Clear();
-        lock (_manifestIdentityLock)
-        {
-            _manifestIdentities.Reset();
-            _manifestIdentityRemap = null;
-        }
         lock (_managedIdentityResolutionLock)
         {
             _managedIdentityResolutions.Clear();
@@ -372,14 +391,67 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         var engineThreadPump = SerializedPropertyAccess.PumpEngineThread(
             dataModel,
             DrainEngineWork);
+        var managedSnapshotTimer = new Timer(
+            OnManagedSnapshotTimer,
+            null,
+            Timeout.InfiniteTimeSpan,
+            Timeout.InfiniteTimeSpan);
+        Timer? previousManagedSnapshotTimer;
         lock (_engineStateLock)
         {
             _engineGeneration++;
             _studioIdentityCandidates.Clear();
             _studioIdentity = null;
             _engineThreadPump = engineThreadPump;
+            previousManagedSnapshotTimer = _managedSnapshotTimer;
+            _managedSnapshotTimer = managedSnapshotTimer;
         }
+        previousManagedSnapshotTimer?.Dispose();
         PublishStudioIdentity(null);
+
+        // Studio can preserve the plugin-owned CoreGui route marker while
+        // unloading and reattaching the edit DataModel around a playtest. In
+        // that case DescendantAdded has already fired, so seed the candidates
+        // from the existing direct children before serving bridge requests.
+        foreach (var child in dataModel.GetService<CoreGui>().GetChildren())
+        {
+            TryCacheStudioIdentity(child);
+        }
+
+        (string StudioSessionId, string InstanceId)? activeStudioRoute;
+        lock (_engineStateLock)
+        {
+            activeStudioRoute = UniqueStudioRoute(_studioIdentityCandidates.Values);
+            _preservedStudioRoute = activeStudioRoute;
+        }
+        IReadOnlyList<ManagedRuntimeNode>? activeHierarchy = null;
+        if (CanResumeStudioRoute(detachedDataModelHandle, detachedStudioRoute, activeStudioRoute))
+        {
+            try
+            {
+                activeHierarchy = ManagedHierarchy.ParseRuntime(InstanceHierarchy.Read(dataModel));
+            }
+            catch (Exception error)
+            {
+                Logger.Warn($"Retained manifest identity validation failed: {error.Message}");
+            }
+        }
+        lock (_manifestIdentityLock)
+        {
+            if (activeHierarchy is not null
+                && _manifestIdentities.MatchesRetainedAttachment(
+                    activeHierarchy.Select(node => node.Handle),
+                    detachedDataModelHandle,
+                    dataModelHandle))
+            {
+                _manifestIdentities.RebindHandle(detachedDataModelHandle, dataModelHandle);
+            }
+            else
+            {
+                _manifestIdentities.Reset();
+            }
+            _manifestIdentityRemap = null;
+        }
     }
 
     public void OnDataModelUnloaded(DataModel dataModel, DataModelType dataModelType)
@@ -470,8 +542,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _engineThreadPump = null;
             managedSnapshotTimer = _managedSnapshotTimer;
             _managedSnapshotTimer = null;
+            _preservedStudioRoute = UniqueStudioRoute(_studioIdentityCandidates.Values);
             _studioIdentityCandidates.Clear();
             _studioIdentity = null;
+            _detachedEditDataModelHandle = InstanceHierarchy.RuntimeHandle(dataModel);
             _dataModel = null;
             Interlocked.Exchange(ref _excludedEditCameraHandle, 0);
         }
@@ -485,7 +559,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         _managedBindingReleases.Clear();
         lock (_manifestIdentityLock)
         {
-            _manifestIdentities.Reset();
             _manifestIdentityRemap = null;
         }
         TaskCompletionSource<bool> managedSnapshotReady;
@@ -534,6 +607,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             // before it would enlarge the unsupported pre-verification window.
             if (_studioIdentity is null)
             {
+                ArmManagedSnapshotTimer(ManagedSnapshotRetryPeriod);
                 return;
             }
         }
@@ -560,6 +634,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 || terrain.Parent is not { } terrainParent
                 || !terrainParent.Equals(workspace))
             {
+                ArmManagedSnapshotTimer(ManagedSnapshotRetryPeriod);
                 return;
             }
 
@@ -576,10 +651,12 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 ArmManagedSnapshotTimer(Timeout.InfiniteTimeSpan);
             }
         }
-        catch
+        catch (Exception error)
         {
-            // Materialization can expose transient reflection state. A later
-            // Terrain notification or bridge request will retry on this thread.
+            // Edit-mode materialization is not gated by DataModel.Loaded.
+            // Retry transient hierarchy/reflection gaps on the engine thread.
+            Logger.Info($"Managed hierarchy snapshot deferred: {error.Message}");
+            ArmManagedSnapshotTimer(ManagedSnapshotRetryPeriod);
         }
     }
 
@@ -1379,6 +1456,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         }
     }
 
+    internal static bool IsEditDataModelCandidate(DataModelType dataModelType) =>
+        dataModelType == DataModelType.Edit
+        || !System.Enum.IsDefined(typeof(DataModelType), dataModelType);
+
     internal static bool IsManagedBaselineReadyMarker(
         string className,
         string name,
@@ -2155,6 +2236,37 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         }
     }
 
+    private void OnManagedSnapshotTimer(object? _)
+    {
+        var cancellationToken = _shutdown?.Token ?? CancellationToken.None;
+        if (cancellationToken.IsCancellationRequested
+            || Volatile.Read(ref _managedSnapshotPending) == 0)
+        {
+            return;
+        }
+        _ = RetryManagedSnapshotOnEngineThreadAsync(cancellationToken);
+    }
+
+    private async Task RetryManagedSnapshotOnEngineThreadAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await OnEngineThread(() =>
+            {
+                TryCaptureManagedRuntimeSnapshot();
+                return true;
+            }, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception error)
+        {
+            Logger.Info($"Managed hierarchy snapshot retry deferred: {error.Message}");
+            ArmManagedSnapshotTimer(ManagedSnapshotRetryPeriod);
+        }
+    }
+
     private async Task<T> OnEngineThread<T>(Func<T> callback, CancellationToken cancellationToken)
     {
         var completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2481,6 +2593,9 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                     _stagedManagedSource = staged;
                     RebuildManagedObservationOwnership(staged);
                 }
+                Interlocked.Exchange(ref _managedSnapshotPending, 1);
+                ArmManagedSnapshotTimer(ManagedSnapshotQuietPeriodFor(
+                    Volatile.Read(ref _managedStartupBoundaryAttested) != 0));
                 Logger.Info(
                     $"Managed hierarchy source contract staged {source.Count} nodes " +
                     $"in {sourceParseTimer.ElapsedMilliseconds} ms");
@@ -2573,20 +2688,21 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 case "/v1/managed/attach-staged":
                     {
                         var request = await ReadAsync<ManagedHierarchyAttachmentRequest>(context.Request);
+                        ManagedSourceContract staged;
                         lock (_managedHierarchyLock)
                         {
-                            if (_stagedManagedSource is not { } staged
-                                || !string.Equals(
-                                    staged.ContractId,
+                            staged = _stagedManagedSource is { } candidate
+                                && string.Equals(
+                                    candidate.ContractId,
                                     request.ContractId,
-                                    StringComparison.Ordinal))
-                            {
-                                throw new InvalidOperationException(
-                                    "the authoritative managed hierarchy contract is not staged");
-                            }
+                                    StringComparison.Ordinal)
+                                    ? candidate
+                                    : throw new InvalidOperationException(
+                                        "the authoritative managed hierarchy contract is not staged");
                         }
-                        var result = await OnEngineThread(
-                            () => AttachStagedManagedHierarchy(request.ContractId),
+                        var result = await VerifyManagedHierarchyAsync(
+                            staged.Source,
+                            request.ContractId,
                             cancellationToken);
                         await ReplyAsync(context.Response, HttpStatusCode.OK, result);
                         break;
@@ -3069,30 +3185,15 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             catch (InvalidDataException ex)
             {
                 Logger.Info(
-                    $"Managed hierarchy attachment requires full reconciliation: {ex.Message}");
-                await OnEngineThread(() =>
-                {
-                    var dataModel = _dataModel
-                        ?? throw new InvalidOperationException("edit DataModel is unavailable");
-                    CaptureManagedRuntimeSnapshot(dataModel);
-                    return true;
-                }, cancellationToken);
-                lock (_managedHierarchyLock)
-                {
-                    if (AttachedManagedContractResponse(contractId) is { } response)
-                    {
-                        return response;
-                    }
-                }
-                return VerifyManagedHierarchy(source);
+                    $"Managed hierarchy attachment is waiting for complete edit-mode materialization: {ex.Message}");
             }
         }
 
+        Interlocked.Exchange(ref _managedSnapshotPending, 1);
+        ArmManagedSnapshotTimer(ManagedSnapshotQuietPeriodFor(startupBoundaryAttested: true));
         await OnEngineThread(() =>
         {
-            var dataModel = _dataModel
-                ?? throw new InvalidOperationException("edit DataModel is unavailable");
-            CaptureManagedRuntimeSnapshot(dataModel);
+            TryCaptureManagedRuntimeSnapshot(startupBoundaryAttested: true);
             return true;
         }, cancellationToken);
 
@@ -3109,7 +3210,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         }
         var snapshotWait = snapshotReady.IsCompleted
             ? Task.CompletedTask
-            : snapshotReady.WaitAsync(TimeSpan.FromMilliseconds(1_250), cancellationToken);
+            : snapshotReady.WaitAsync(ManagedSnapshotReadinessTimeout, cancellationToken);
         try
         {
             await snapshotWait;
@@ -3117,7 +3218,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         catch (TimeoutException)
         {
             throw new InvalidOperationException(
-                "the edit DataModel hierarchy snapshot is unavailable");
+                "the edit DataModel hierarchy did not materialize before the managed attachment deadline");
         }
         lock (_managedHierarchyLock)
         {
@@ -6444,6 +6545,29 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         return hash.ToString("x16", CultureInfo.InvariantCulture);
     }
 
+    internal static (string StudioSessionId, string InstanceId)? UniqueStudioRoute(
+        IEnumerable<(string StudioSessionId, string InstanceId)> candidates)
+    {
+        (string StudioSessionId, string InstanceId)? route = null;
+        foreach (var candidate in candidates)
+        {
+            if (route is not null)
+            {
+                return null;
+            }
+            route = candidate;
+        }
+        return route;
+    }
+
+    internal static bool CanResumeStudioRoute(
+        nuint detachedDataModelHandle,
+        (string StudioSessionId, string InstanceId)? detachedRoute,
+        (string StudioSessionId, string InstanceId)? activeRoute) =>
+        detachedDataModelHandle != 0
+        && detachedRoute is not null
+        && detachedRoute == activeRoute;
+
     private void TryCacheStudioIdentity(Instance instance)
     {
         var handle = InstanceHierarchy.RuntimeHandle(instance);
@@ -6481,6 +6605,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             {
                 _studioIdentityCandidates.Remove(handle);
             }
+            _preservedStudioRoute = UniqueStudioRoute(_studioIdentityCandidates.Values);
             var previous = _studioIdentity;
             RefreshStudioIdentityLocked();
             changed = previous != _studioIdentity;
@@ -6499,8 +6624,9 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         var changed = false;
         lock (_engineStateLock)
         {
-            var previous = _studioIdentity;
             _studioIdentityCandidates.Remove(handle);
+            _preservedStudioRoute = UniqueStudioRoute(_studioIdentityCandidates.Values);
+            var previous = _studioIdentity;
             RefreshStudioIdentityLocked();
             changed = previous != _studioIdentity;
             publishedIdentity = _studioIdentity;
@@ -6514,19 +6640,17 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private void RefreshStudioIdentityLocked()
     {
         _studioIdentity = null;
-        if (_studioIdentityCandidates.Count != 1)
+        var route = UniqueStudioRoute(_studioIdentityCandidates.Values);
+        if (route is null)
         {
             return;
         }
 
-        foreach (var route in _studioIdentityCandidates.Values)
-        {
-            _studioIdentity = new StudioIdentity(
-                route.StudioSessionId,
-                route.InstanceId,
-                _bridgeId,
-                Environment.ProcessId);
-        }
+        _studioIdentity = new StudioIdentity(
+            route.Value.StudioSessionId,
+            route.Value.InstanceId,
+            _bridgeId,
+            Environment.ProcessId);
     }
 
     private StudioIdentity GetStudioIdentity()

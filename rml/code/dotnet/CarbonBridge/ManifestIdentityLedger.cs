@@ -311,6 +311,41 @@ internal sealed class ManifestIdentityLedger
 
     public bool Contains(nuint handle) => _byHandle.ContainsKey(handle);
 
+    public bool MatchesRetainedAttachment(
+        IEnumerable<nuint> currentHandles,
+        nuint previousRootHandle,
+        nuint currentRootHandle)
+    {
+        if (!IsAuthoritative
+            || previousRootHandle == 0
+            || currentRootHandle == 0
+            || !_byHandle.ContainsKey(previousRootHandle))
+        {
+            return false;
+        }
+
+        var current = currentHandles.ToHashSet();
+        if (!current.Contains(currentRootHandle))
+        {
+            return false;
+        }
+
+        var retainedDescendants = 0;
+        foreach (var handle in _byHandle.Keys)
+        {
+            if (handle == previousRootHandle)
+            {
+                continue;
+            }
+            retainedDescendants += 1;
+            if (!current.Contains(handle))
+            {
+                return false;
+            }
+        }
+        return retainedDescendants > 0 || previousRootHandle == currentRootHandle;
+    }
+
     public void Reset()
     {
         _byHandle.Clear();
@@ -410,6 +445,28 @@ internal sealed class ManifestIdentityLedger
             }
         }
         return current.Select(GetOrCreateIdentity).ToArray();
+    }
+
+    public void RebindHandle(nuint previousHandle, nuint currentHandle)
+    {
+        if (previousHandle == 0 || currentHandle == 0)
+        {
+            throw new InvalidDataException("manifest identity cannot rebind a null native handle");
+        }
+        if (previousHandle == currentHandle)
+        {
+            return;
+        }
+        if (!_byHandle.Remove(previousHandle, out var sourceId))
+        {
+            throw new InvalidOperationException("manifest identity rebind lost the previous native handle");
+        }
+        if (_byHandle.ContainsKey(currentHandle))
+        {
+            _byHandle.Add(previousHandle, sourceId);
+            throw new InvalidOperationException("manifest identity rebind aliases an existing native handle");
+        }
+        _byHandle.Add(currentHandle, sourceId);
     }
 
     public void Release(nuint handle) => _byHandle.Remove(handle);

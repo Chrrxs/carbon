@@ -1,6 +1,6 @@
 --!strict
 
-local Update = {}
+local LiveReflection = {}
 
 local primitiveTypes = {
 	bool = "Bool",
@@ -17,23 +17,31 @@ local dataTypes = {
 	BrickColor = true,
 	CFrame = true,
 	Color3 = true,
+	Color3uint8 = true,
 	ColorSequence = true,
 	Content = true,
 	ContentId = true,
 	Faces = true,
 	Font = true,
 	NumberRange = true,
+	MaterialColors = true,
+	NetAssetRef = true,
 	NumberSequence = true,
 	PhysicalProperties = true,
 	Ray = true,
 	Rect = true,
+	Region3 = true,
 	Region3int16 = true,
+	SharedString = true,
 	SecurityCapabilities = true,
 	UDim = true,
 	UDim2 = true,
 	UniqueId = true,
 	Vector2 = true,
+	Vector2int16 = true,
 	Vector3 = true,
+	Vector3int16 = true,
+	OptionalCoordinateFrame = "OptionalCFrame",
 }
 
 local classTags = {
@@ -74,10 +82,14 @@ local function convertType(valueType, skippedTypes)
 		return { Value = "Ref" }
 	elseif valueType.Category == "Primitive" then
 		local name = primitiveTypes[valueType.Name]
-		assert(name ~= nil, `unsupported API primitive property type {valueType.Name}`)
-		return { Value = name }
-	elseif valueType.Category == "DataType" and dataTypes[valueType.Name] then
-		return { Value = valueType.Name }
+		if name ~= nil then
+			return { Value = name }
+		end
+	elseif valueType.Category == "DataType" then
+		local mapped = dataTypes[valueType.Name]
+		if mapped ~= nil then
+			return { Value = if type(mapped) == "string" then mapped else valueType.Name }
+		end
 	end
 	local qualified = `{valueType.Category}.{valueType.Name}`
 	skippedTypes[qualified] = true
@@ -142,11 +154,12 @@ local function synchronizedKind(existing, serializes: boolean)
 	return kind
 end
 
-function Update.fromApi(api, version)
+function LiveReflection.fromApi(api, version)
 	assert(type(api) == "table" and type(api.Classes) == "table" and type(api.Enums) == "table")
 	assert(type(version) == "table" and #version == 4, "reflection version must have four components")
 
 	local skippedTypes = {}
+	local skippedProperties = {}
 	local overlay = {
 		version = version,
 		classes = {},
@@ -164,6 +177,15 @@ function Update.fromApi(api, version)
 				continue
 			end
 			local dataType = convertType(member.ValueType, skippedTypes)
+			if dataType == nil then
+				local qualified = `{member.ValueType.Category}.{member.ValueType.Name}`
+				skippedProperties[`{apiClass.Name}.{member.Name}`] = {
+					className = apiClass.Name,
+					propertyName = member.Name,
+					dataType = qualified,
+					serializes = roundTrips(member),
+				}
+			end
 			if dataType ~= nil then
 				class.properties[member.Name] = {
 					dataType = dataType,
@@ -181,10 +203,10 @@ function Update.fromApi(api, version)
 		end
 		overlay.enums[apiEnum.Name] = { items = items }
 	end
-	return overlay, skippedTypes
+	return overlay, skippedTypes, skippedProperties
 end
 
-function Update.applyOverlay(database, overlay)
+function LiveReflection.applyOverlay(database, overlay)
 	assert(type(database) == "table" and type(database.Classes) == "table" and type(database.Enums) == "table")
 	local addedClasses = 0
 	local addedProperties = 0
@@ -214,7 +236,9 @@ function Update.applyOverlay(database, overlay)
 			class.Properties[propertyName] = {
 				Name = propertyName,
 				DataType = if existing == nil then property.dataType else existing.DataType,
-				Scriptability = property.scriptability,
+				Scriptability = if existing ~= nil and existing.Scriptability == "Custom"
+					then "Custom"
+					else property.scriptability,
 				Tags = property.tags,
 				Kind = synchronizedKind(existing, property.serializes),
 			}
@@ -239,11 +263,18 @@ function Update.applyOverlay(database, overlay)
 	}
 end
 
-function Update.apply(database, api, version)
-	local overlay, skippedTypes = Update.fromApi(api, version)
-	local result = Update.applyOverlay(database, overlay)
+function LiveReflection.apply(database, api, version)
+	local overlay, skippedTypes, skippedProperties = LiveReflection.fromApi(api, version)
+	local result = LiveReflection.applyOverlay(database, overlay)
 	result.skippedTypes = skippedTypes
+	result.skippedProperties = {}
+	for path, skipped in skippedProperties do
+		local class = database.Classes[skipped.className]
+		if skipped.serializes and (class == nil or class.Properties[skipped.propertyName] == nil) then
+			result.skippedProperties[path] = skipped.dataType
+		end
+	end
 	return result
 end
 
-return Update
+return LiveReflection

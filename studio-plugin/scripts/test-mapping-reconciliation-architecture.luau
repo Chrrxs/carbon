@@ -41,6 +41,13 @@ assert(
 	"managed connection must bind the disposable build's mapped identities before the first filesystem update"
 )
 
+local startupCapture = assert(string.find(core, "self.client:requestManifestCapture(nil, true):expect()", 1, true))
+local startupReconcile = assert(string.find(core, "local report = self:__reconcileMappings()", startupCapture, true))
+assert(
+	startupCapture < startupReconcile and string.find(client, '"capture/request?forceFull=true"', 1, true),
+	"an untrusted or retained-ledger attach must fully capture Studio before mapped reconciliation"
+)
+
 local primeStart = assert(string.find(reconciler, "function MappingReconciler:prime", 1, true))
 local reconcileStart = assert(string.find(reconciler, "function MappingReconciler:__bindHierarchy", primeStart, true))
 local prime = string.sub(reconciler, primeStart, reconcileStart - 1)

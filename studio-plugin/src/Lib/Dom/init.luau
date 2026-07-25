@@ -1,5 +1,8 @@
 local Carbon = script:FindFirstAncestor("Carbon")
 
+local RuntimeServices = require(Carbon.RuntimeServices)
+local HttpService = RuntimeServices.get("HttpService") :: HttpService
+
 local TransientMetadata = require(Carbon.TransientMetadata)
 local Base64 = require(Carbon.Lib.Base64)
 local database = require(script.database)
@@ -12,11 +15,43 @@ local ProtectedProperties = require(script.ProtectedProperties)
 local PrivilegedAccess = require(script.PrivilegedAccess)
 local PrivilegedReadPlan = require(script.PrivilegedReadPlan)
 local PrivilegedValueCodec = require(script.PrivilegedValueCodec)
+local LiveReflection = require(script.LiveReflection)
 
 local defaultPropertiesCache = {}
 
 local function reflectionVersion(): string
 	return table.concat(database.Version, ".")
+end
+
+local function applyReflection(version: { number }, apiDump: string | { [string]: any }, studioVersion: string)
+	assert(type(version) == "table" and #version == 4, "reflection version must be a four-component array")
+	local expectedVersion = table.concat(version, ".")
+	assert(
+		studioVersion == expectedVersion,
+		`Unsupported Studio reflection version {studioVersion}; this Carbon plugin requires exactly {expectedVersion}`
+	)
+
+	local api: { [string]: any }
+	if type(apiDump) == "string" then
+		local success, decoded = pcall(function()
+			return HttpService:JSONDecode(apiDump)
+		end)
+		assert(success and type(decoded) == "table", `failed to JSON-decode reflection API dump: {tostring(decoded)}`)
+		api = decoded
+	elseif type(apiDump) == "table" then
+		api = apiDump
+	else
+		error("reflection apiDump must be a string or decoded table", 2)
+	end
+
+	assert(
+		type(api.Classes) == "table" and type(api.Enums) == "table",
+		"invalid API dump: missing Classes or Enums table"
+	)
+
+	local result = LiveReflection.apply(database, api, version)
+	table.clear(defaultPropertiesCache)
+	return result
 end
 
 local function assertReflectionVersion(studioVersion: string)
@@ -131,6 +166,16 @@ local function getDefaultProperties(className)
 	if not class then
 		return properties
 	end
+	local protected = {}
+	for _, property in
+		ProtectedProperties.forClass(database, className, function(descriptor)
+			return PrivilegedAccess.supportsDescriptor(descriptor)
+				or PrivilegedAccess.supportsMaterializedDescriptor(descriptor)
+				or PrivilegedAccess.supportsReferenceDescriptor(descriptor)
+		end)
+	do
+		protected[property] = true
+	end
 
 	for property, default in pairs(class.DefaultProperties) do
 		local descriptor = findCanonicalPropertyDescriptor(className, property)
@@ -138,6 +183,7 @@ local function getDefaultProperties(className)
 		if
 			descriptor
 			and descriptor.serializes
+			and not protected[property]
 			and (descriptor:canRead() or PrivilegedAccess.supportsDescriptor(descriptor) or PrivilegedAccess.supportsReferenceDescriptor(
 				descriptor
 			))
@@ -148,6 +194,9 @@ local function getDefaultProperties(className)
 		end
 	end
 	deriveRuntimeDefaults(className, properties)
+	for property in protected do
+		properties[property] = nil
+	end
 	local rawDescriptors = {}
 	for property in properties do
 		local descriptor = findCanonicalPropertyDescriptor(className, property)
@@ -515,6 +564,7 @@ return {
 	hasPrivilegedAccess = PrivilegedAccess.isAvailable,
 	reflectionVersion = reflectionVersion,
 	assertReflectionVersion = assertReflectionVersion,
+	applyReflection = applyReflection,
 	isRawType = PrivilegedAccess.isRawType,
 	Error = Error,
 	EncodedValue = EncodedValue,

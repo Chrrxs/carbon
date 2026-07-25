@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::{
 	fmt, fs,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	process::{Command, Stdio},
 	sync::{Arc, Mutex},
 	thread,
@@ -310,12 +310,12 @@ impl std::error::Error for ManagedLaunchFailure {
 }
 
 pub fn launch(path: Option<PathBuf>) -> Result<Option<u32>> {
-	let (rml_launch, _plugin_launch) = prepare_launch()?;
+	let (rml_launch, _plugin_launch) = prepare_launch(None)?;
 	launch_prepared(path, rml_launch)
 }
 
-pub fn launch_managed(path: PathBuf) -> Result<ManagedStudio> {
-	let (rml_launch, plugin_launch) = prepare_launch()?;
+pub fn launch_managed(path: PathBuf, studio_dir: &Path) -> Result<ManagedStudio> {
+	let (rml_launch, plugin_launch) = prepare_launch(Some(studio_dir))?;
 	let lifecycle = if let Some(mcp) = discover_mcp_lifecycle()? {
 		log::debug!(
 			"Selected robloxstudio-mcp lifecycle owner at {} for managed Studio launch",
@@ -367,7 +367,7 @@ pub fn launch_managed(path: PathBuf) -> Result<ManagedStudio> {
 	})
 }
 
-fn prepare_launch() -> Result<(rml::Launch, studio_plugin::Installation)> {
+fn prepare_launch(studio_dir: Option<&Path>) -> Result<(rml::Launch, studio_plugin::Installation)> {
 	let installation = studio_plugin::ensure_current()?;
 	match installation.status {
 		studio_plugin::InstallStatus::Current => {}
@@ -378,7 +378,7 @@ fn prepare_launch() -> Result<(rml::Launch, studio_plugin::Installation)> {
 			crate::carbon_info!("Updated Carbon Studio plugin at {}", installation.path.display());
 		}
 	}
-	Ok((rml::prepare_launch(None, None)?, installation))
+	Ok((rml::prepare_launch(studio_dir, None)?, installation))
 }
 
 fn discover_mcp_lifecycle() -> Result<Option<McpLifecycle>> {
@@ -571,6 +571,29 @@ fn mcp_lifecycle_endpoint(base_url: &str, health: &Value) -> Option<String> {
 	url.set_path(path);
 	Some(url.into())
 }
+fn managed_launch_identity(result: &Value) -> Result<(String, u32)> {
+	let launch_id = result
+		.get("launch_id")
+		.and_then(Value::as_str)
+		.filter(|value| !value.is_empty())
+		.context("robloxstudio-mcp launch response did not include launch_id")?
+		.to_owned();
+	let process_id = result
+		.get("pid")
+		.and_then(Value::as_u64)
+		.filter(|value| *value > 0)
+		.and_then(|value| u32::try_from(value).ok())
+		.context("robloxstudio-mcp launch response did not include a valid native Studio PID")?;
+	anyhow::ensure!(
+		result.get("managed").and_then(Value::as_bool) == Some(true)
+			&& result.get("source").and_then(Value::as_str) == Some("local_file"),
+		"robloxstudio-mcp did not return a managed local-file Studio launch"
+	);
+	// With wait_for_connection=false, the broker may return while its native
+	// process observation still says "launching". The PID and launch ID already
+	// transfer lifecycle ownership; Carbon's connection wait verifies startup.
+	Ok((launch_id, process_id))
+}
 
 fn launch_through_mcp(
 	path: PathBuf,
@@ -579,6 +602,15 @@ fn launch_through_mcp(
 ) -> std::result::Result<ManagedStudioLifecycle, ManagedLaunchFailure> {
 	let (studio_executable, loader_path) =
 		mcp_launch_paths(rml_launch).map_err(|error| ManagedLaunchFailure::pre_dispatch(&mcp.endpoint, error))?;
+	#[cfg(target_os = "linux")]
+	let path = windows_path(&path, "Studio place")
+		.map(PathBuf::from)
+		.map_err(|error| ManagedLaunchFailure::pre_dispatch(&mcp.endpoint, error))?;
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	let dotnet_root = Some(
+		windows_dotnet_root(&loader_path).map_err(|error| ManagedLaunchFailure::pre_dispatch(&mcp.endpoint, error))?,
+	);
+	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 	let dotnet_root = std::env::var("DOTNET_ROOT")
 		.ok()
 		.filter(|value| !value.trim().is_empty());
@@ -596,36 +628,14 @@ fn launch_through_mcp(
 		MCP_LIFECYCLE_TIMEOUT,
 	)
 	.map_err(ManagedLaunchFailure::from_request)?;
-	(|| -> Result<ManagedStudioLifecycle> {
-		let launch_id = result
-			.get("launch_id")
-			.and_then(Value::as_str)
-			.filter(|value| !value.is_empty())
-			.context("robloxstudio-mcp launch response did not include launch_id")?
-			.to_owned();
-		let process_id = result
-			.get("pid")
-			.and_then(Value::as_u64)
-			.filter(|value| *value > 0)
-			.and_then(|value| u32::try_from(value).ok())
-			.context("robloxstudio-mcp launch response did not include a valid native Studio PID")?;
-		anyhow::ensure!(
-			result.get("managed").and_then(Value::as_bool) == Some(true)
-				&& result.get("source").and_then(Value::as_str) == Some("local_file"),
-			"robloxstudio-mcp did not return a managed local-file Studio launch"
-		);
-		anyhow::ensure!(
-			result.get("process_running").and_then(Value::as_bool) == Some(true),
-			"robloxstudio-mcp did not confirm that Studio launch {launch_id} is running"
-		);
-		Ok(ManagedStudioLifecycle::Mcp {
-			endpoint: mcp.endpoint.clone(),
-			auth_token: mcp.auth_token.clone(),
-			launch_id,
-			process_id,
-		})
-	})()
-	.map_err(|error| ManagedLaunchFailure::invalid_response(&mcp.endpoint, error))
+	let (launch_id, process_id) = managed_launch_identity(&result)
+		.map_err(|error| ManagedLaunchFailure::invalid_response(&mcp.endpoint, error))?;
+	Ok(ManagedStudioLifecycle::Mcp {
+		endpoint: mcp.endpoint.clone(),
+		auth_token: mcp.auth_token.clone(),
+		launch_id,
+		process_id,
+	})
 }
 
 fn mcp_launch_request(
@@ -903,10 +913,12 @@ fn launch_prepared(path: Option<PathBuf>, rml_launch: rml::Launch) -> Result<Opt
 			.unwrap_or_default();
 		let windows_studio = windows_path(rml_launch.studio_executable(), "Roblox Studio executable")?;
 		let windows_loader = windows_path(rml_launch.loader_path(), "RML loader")?;
+		let windows_dotnet_root = windows_dotnet_root(&windows_loader)?;
 		let script = powershell_launch_script(
 			&windows_studio,
 			&windows_loader,
 			rml_launch.build_version(),
+			&windows_dotnet_root,
 			&windows_place,
 		);
 		// Windows PowerShell 5 concatenates everything after `-Command` into the
@@ -930,15 +942,26 @@ fn launch_prepared(path: Option<PathBuf>, rml_launch: rml::Launch) -> Result<Opt
 
 	#[cfg(not(target_os = "linux"))]
 	{
-		let child = Command::new(rml_launch.studio_executable())
+		let mut command = Command::new(rml_launch.studio_executable());
+		command
 			.arg(path.unwrap_or_default())
 			.env(rml::LOADER_ENV, rml_launch.loader_path())
 			.env(rml::EXPECTED_BUILD_ENV, rml_launch.build_version())
 			.env_remove(rml::LOADED_BUILD_ENV)
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.spawn()?;
+			.stderr(Stdio::null());
+		#[cfg(target_os = "windows")]
+		command.env(
+			"DOTNET_ROOT",
+			windows_dotnet_root(
+				rml_launch
+					.loader_path()
+					.to_str()
+					.context("RML loader path is not valid UTF-8")?,
+			)?,
+		);
+		let child = command.spawn()?;
 		Ok(Some(child.id()))
 	}
 }
@@ -953,20 +976,104 @@ fn windows_path(path: &std::path::Path, description: &str) -> Result<String> {
 	Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn windows_dotnet_root_script(loader: &str) -> String {
+	let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
+	r#"
+$loader = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_LOADER_BASE64__'))
+$runtimeConfigPath = Join-Path (Split-Path -Parent $loader) 'runtime\RML.runtimeconfig.json'
+if (-not (Test-Path -LiteralPath $runtimeConfigPath -PathType Leaf)) {
+    Write-Error "Carbon RML runtime configuration is missing: $runtimeConfigPath"
+    exit 4
+}
+$runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw | ConvertFrom-Json
+$frameworks = @()
+if ($null -ne $runtimeConfig.runtimeOptions.framework) {
+    $frameworks += $runtimeConfig.runtimeOptions.framework
+}
+if ($null -ne $runtimeConfig.runtimeOptions.frameworks) {
+    $frameworks += @($runtimeConfig.runtimeOptions.frameworks)
+}
+$framework = $frameworks | Where-Object { $_.name -eq 'Microsoft.NETCore.App' } | Select-Object -First 1
+if ($null -eq $framework) {
+    Write-Error "Carbon RML runtime configuration does not name Microsoft.NETCore.App"
+    exit 4
+}
+$requiredVersion = [Version]$framework.version
+$candidates = @()
+if (-not [string]::IsNullOrWhiteSpace($env:DOTNET_ROOT)) {
+    $candidates += $env:DOTNET_ROOT
+}
+if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+    $candidates += Join-Path $env:USERPROFILE '.dotnet'
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+    $candidates += Join-Path $env:ProgramFiles 'dotnet'
+}
+$dotnet = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+if ($null -ne $dotnet) {
+    $candidates += Split-Path -Parent $dotnet.Source
+}
+foreach ($root in $candidates | Select-Object -Unique) {
+    $hostfxr = Get-ChildItem -Path (Join-Path $root 'host\fxr\*\hostfxr.dll') -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $runtimePath = Join-Path $root 'shared\Microsoft.NETCore.App'
+    $compatibleRuntime = Get-ChildItem -LiteralPath $runtimePath -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            try {
+                $candidateVersion = [Version]$_.Name
+                $candidateVersion.Major -eq $requiredVersion.Major -and $candidateVersion -ge $requiredVersion
+            } catch {
+                $false
+            }
+        } |
+        Select-Object -First 1
+    if ($null -ne $hostfxr -and $null -ne $compatibleRuntime) {
+        Write-Output $root
+        exit 0
+    }
+}
+Write-Error "A Windows Microsoft.NETCore.App runtime compatible with $requiredVersion is required by Carbon RML"
+exit 3
+"#
+	.replace("__CARBON_LOADER_BASE64__", &encoded_loader)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn windows_dotnet_root(loader: &str) -> Result<String> {
+	let script = windows_dotnet_root_script(loader);
+	let output = Command::new("powershell.exe")
+		.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+		.output()
+		.context("failed to locate the Windows .NET runtime required by Carbon RML")?;
+	anyhow::ensure!(
+		output.status.success(),
+		"failed to locate the Windows .NET runtime required by Carbon RML: {}",
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	let root = String::from_utf8(output.stdout)?.trim().to_owned();
+	anyhow::ensure!(!root.is_empty(), "Windows .NET returned an empty installation path");
+	Ok(root)
+}
+
 #[cfg(target_os = "linux")]
-fn powershell_launch_script(studio: &str, loader: &str, build_version: &str, place: &str) -> String {
+fn powershell_launch_script(studio: &str, loader: &str, build_version: &str, dotnet_root: &str, place: &str) -> String {
 	let encoded_studio = BASE64_STANDARD.encode(studio.as_bytes());
 	let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
 	let encoded_build_version = BASE64_STANDARD.encode(build_version.as_bytes());
+	let encoded_dotnet_root = BASE64_STANDARD.encode(dotnet_root.as_bytes());
 	let encoded_place = BASE64_STANDARD.encode(place.as_bytes());
 	r#"
 $studio = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_STUDIO_BASE64__'))
 $loader = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_LOADER_BASE64__'))
 $buildVersion = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_BUILD_VERSION_BASE64__'))
+$dotnetRoot = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_DOTNET_ROOT_BASE64__'))
 $place = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_PLACE_BASE64__'))
 if (-not [IO.Path]::IsPathRooted($loader)) { throw "Carbon supplied a non-absolute RML loader path" }
+if (-not [IO.Path]::IsPathRooted($dotnetRoot)) { throw "Carbon supplied a non-absolute .NET runtime path" }
 $env:CARBON_RML_LOADER = $loader
 $env:CARBON_RML_BUILD_VERSION = $buildVersion
+$env:DOTNET_ROOT = $dotnetRoot
 Remove-Item Env:CARBON_RML_LOADED_BUILD_VERSION -ErrorAction SilentlyContinue
 if ([string]::IsNullOrEmpty($place)) {
     $process = Start-Process -FilePath $studio -PassThru
@@ -979,6 +1086,7 @@ $process.Id
 	.replace("__CARBON_STUDIO_BASE64__", &encoded_studio)
 	.replace("__CARBON_LOADER_BASE64__", &encoded_loader)
 	.replace("__CARBON_BUILD_VERSION_BASE64__", &encoded_build_version)
+	.replace("__CARBON_DOTNET_ROOT_BASE64__", &encoded_dotnet_root)
 	.replace("__CARBON_PLACE_BASE64__", &encoded_place)
 }
 
@@ -1546,7 +1654,7 @@ mod tests {
 	#[test]
 	fn managed_launch_transfers_exact_rml_environment() {
 		let payload = mcp_launch_request(
-			std::path::Path::new("/tmp/carbon-managed.rbxl"),
+			std::path::Path::new(r"\\wsl.localhost\Ubuntu\tmp\carbon-managed.rbxl"),
 			r"C:\Roblox\RobloxStudioBeta.exe",
 			r"C:\Carbon\RobloxModLoader\roblox_modloader.dll",
 			"0.0.0+build.test",
@@ -1555,8 +1663,10 @@ mod tests {
 
 		assert_eq!(payload["action"], "launch");
 		assert_eq!(payload["source"], "local_file");
-		assert_eq!(payload["local_place_file"], "/tmp/carbon-managed.rbxl");
-		assert_eq!(payload["studio_executable"], r"C:\Roblox\RobloxStudioBeta.exe");
+		assert_eq!(
+			payload["local_place_file"],
+			r"\\wsl.localhost\Ubuntu\tmp\carbon-managed.rbxl"
+		);
 		assert_eq!(
 			payload["process_environment"]["set"][rml::LOADER_ENV],
 			r"C:\Carbon\RobloxModLoader\roblox_modloader.dll"
@@ -1571,6 +1681,23 @@ mod tests {
 		);
 		assert_eq!(payload["process_environment"]["remove"], json!([rml::LOADED_BUILD_ENV]));
 		assert_eq!(payload["wait_for_connection"], false);
+	}
+
+	#[test]
+	fn mcp_launch_accepts_native_pid_before_process_observation_catches_up() {
+		let response = json!({
+			"launch_id": "launch-starting",
+			"managed": true,
+			"source": "local_file",
+			"state": "launching",
+			"pid": 47312,
+			"process_running": false
+		});
+
+		assert_eq!(
+			managed_launch_identity(&response).unwrap(),
+			("launch-starting".to_owned(), 47312)
+		);
 	}
 
 	#[test]
@@ -1654,17 +1781,33 @@ mod tests {
 		let studio = r#"C:\Roblox\Versions\worktree'; throw 'studio\RobloxStudioBeta.exe"#;
 		let loader = r#"C:\Carbon\rml\worktree'; throw 'loader\RobloxModLoader\roblox_modloader.dll"#;
 		let build = "0.0.0+worktree'; throw 'build";
+		let dotnet_root = r#"C:\Users\builder\worktree'; throw 'dotnet\.dotnet"#;
 		let place = r#"C:\places\worktree'; throw 'place.rbxl"#;
-		let script = powershell_launch_script(studio, loader, build, place);
+		let script = powershell_launch_script(studio, loader, build, dotnet_root, place);
 
-		for untrusted in [studio, loader, build, place] {
+		for untrusted in [studio, loader, build, dotnet_root, place] {
 			assert!(!script.contains(untrusted));
 		}
 		assert!(script.contains("$env:CARBON_RML_LOADER = $loader"));
 		assert!(script.contains("$env:CARBON_RML_BUILD_VERSION = $buildVersion"));
+		assert!(script.contains("$env:DOTNET_ROOT = $dotnetRoot"));
 		assert!(script.contains("Remove-Item Env:CARBON_RML_LOADED_BUILD_VERSION"));
 		assert!(script.contains("Start-Process -FilePath $studio"));
 		assert!(!script.contains("Get-ChildItem"));
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn powershell_dotnet_discovery_matches_the_rml_runtime_contract() {
+		let loader = r#"C:\Carbon\rml\worktree'; throw 'loader\RobloxModLoader\roblox_modloader.dll"#;
+		let script = windows_dotnet_root_script(loader);
+
+		assert!(!script.contains(loader));
+		assert!(script.contains("runtime\\RML.runtimeconfig.json"));
+		assert!(script.contains("Microsoft.NETCore.App"));
+		assert!(script.contains("$candidateVersion.Major -eq $requiredVersion.Major"));
+		assert!(script.contains("$candidateVersion -ge $requiredVersion"));
+		assert!(script.contains("host\\fxr\\*\\hostfxr.dll"));
 	}
 
 	#[test]

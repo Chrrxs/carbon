@@ -1,6 +1,6 @@
 --!strict
 
-local Update = require("./reflection-database-update")
+local LiveReflection = require("../src/Lib/Dom/LiveReflection")
 
 local database = {
 	Version = { 0, 1, 0, 1 },
@@ -21,7 +21,7 @@ local database = {
 				LegacyAlias = {
 					Name = "LegacyAlias",
 					DataType = { Value = "Ref" },
-					Scriptability = "ReadWrite",
+					Scriptability = "Custom",
 					Tags = { "Deprecated" },
 					Kind = { Alias = { AliasFor = "PersistentBinding" } },
 				},
@@ -44,6 +44,12 @@ local function property(name: string, valueType, canLoad: boolean, canSave: bool
 	}
 end
 
+local preferredBinding = property("PreferredBinding", { Category = "Class", Name = "InputBinding" }, false, true)
+preferredBinding.Tags = {
+	"ReadOnly",
+	{ PreferredDescriptorName = "LegacyPreferredBinding", ThreadSafety = "Unknown" },
+}
+
 local api = {
 	Classes = {
 		{
@@ -51,9 +57,13 @@ local api = {
 			Superclass = "Instance",
 			Tags = { "NotReplicated" },
 			Members = {
-				property("PreferredBinding", { Category = "Class", Name = "InputBinding" }, false, true),
+				preferredBinding,
 				property("PersistentBinding", { Category = "Class", Name = "InputBinding" }, true, true),
 				property("LegacyAlias", { Category = "Class", Name = "InputBinding" }, true, true),
+				property("Icon", { Category = "DataType", Name = "ContentId" }, true, true),
+				property("HistoricalProperty", { Category = "DataType", Name = "FutureType" }, true, true),
+				property("NewUnsupported", { Category = "DataType", Name = "FutureType" }, true, true),
+				property("NewPrimitiveUnsupported", { Category = "Primitive", Name = "uint128" }, true, true),
 			},
 		},
 	},
@@ -67,7 +77,7 @@ local api = {
 	},
 }
 
-local result = Update.apply(database, api, { 0, 999, 0, 9990001 })
+local result = LiveReflection.apply(database, api, { 0, 999, 0, 9990001 })
 local class = database.Classes.FutureInput
 local preferred = class.Properties.PreferredBinding
 assert(preferred.DataType.Value == "Ref", "future class references must be classified without hand editing")
@@ -80,8 +90,16 @@ assert(
 	"loadable and saveable references must round-trip"
 )
 assert(class.Properties.LegacyAlias.Kind.Alias.AliasFor == "PersistentBinding", "patched aliases must survive refresh")
+assert(class.Properties.LegacyAlias.Scriptability == "Custom", "custom property interfaces must survive refresh")
+assert(class.Properties.Icon.DataType.Value == "ContentId", "ContentId must retain legacy wire semantics")
 assert(class.Properties.HistoricalProperty ~= nil, "historical descriptors must remain readable for old artifacts")
 assert(database.Enums.ObsoleteEnum == nil and database.Enums.FutureMode.items.Enabled == 1, "enums must synchronize")
-assert(database.Version[2] == 999 and result.addedProperties == 2, "refresh result must describe generated additions")
+assert(
+	result.skippedProperties["FutureInput.NewUnsupported"] == "DataType.FutureType"
+		and result.skippedProperties["FutureInput.NewPrimitiveUnsupported"] == "Primitive.uint128"
+		and result.skippedProperties["FutureInput.HistoricalProperty"] == nil,
+	"unsupported new properties must be diagnosed while bundled adapters remain available"
+)
+assert(database.Version[2] == 999 and result.addedProperties == 3, "refresh result must describe generated additions")
 
-print("Reflection database update checks passed")
+print("Live reflection database overlay checks passed")

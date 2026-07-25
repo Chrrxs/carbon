@@ -17,6 +17,22 @@ public sealed class PolicyAndEngineWorkTests
 	}
 
     [Theory]
+    [InlineData((int)DataModelType.Edit, true)]
+    [InlineData((int)DataModelType.Client, false)]
+    [InlineData((int)DataModelType.Server, false)]
+    [InlineData((int)DataModelType.Standalone, false)]
+    [InlineData((int)DataModelType.Null, false)]
+    [InlineData(1_097_167_477, true)]
+    public void UnknownNativeDataModelTypeRemainsAnAuthenticatedEditCandidate(
+        int rawDataModelType,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CarbonBridgeMod.IsEditDataModelCandidate((DataModelType)rawDataModelType));
+    }
+
+    [Theory]
     [InlineData("session\ninstance", "session", "instance")]
     [InlineData("session-with-dashes\ninstance-with-dashes", "session-with-dashes", "instance-with-dashes")]
     public void StudioRouteRequiresOneNonEmptySeparator(
@@ -56,6 +72,37 @@ public sealed class PolicyAndEngineWorkTests
             CarbonBridgeMod.StudioRouteKey("other-session", "studio-instance"));
     }
 
+    [Fact]
+    public void ActiveStudioRouteRequiresExactlyOneLiveMarker()
+    {
+        Assert.Null(CarbonBridgeMod.UniqueStudioRoute(
+            Array.Empty<(string StudioSessionId, string InstanceId)>()));
+        Assert.Equal(
+            ("studio-session", "studio-instance"),
+            CarbonBridgeMod.UniqueStudioRoute(
+                [("studio-session", "studio-instance")]));
+        Assert.Null(CarbonBridgeMod.UniqueStudioRoute(
+            [
+                ("studio-session", "studio-instance"),
+                ("studio-session", "studio-instance")
+            ]));
+    }
+
+    [Fact]
+    public void ManifestLedgerResumeRequiresTheSameActiveStudioRoute()
+    {
+        var detached = ("studio-session", "studio-instance");
+
+        Assert.True(CarbonBridgeMod.CanResumeStudioRoute(41, detached, detached));
+        Assert.False(CarbonBridgeMod.CanResumeStudioRoute(0, detached, detached));
+        Assert.False(CarbonBridgeMod.CanResumeStudioRoute(
+            41,
+            detached,
+            ("other-session", "other-instance")));
+        Assert.False(CarbonBridgeMod.CanResumeStudioRoute(41, detached, null));
+        Assert.False(CarbonBridgeMod.CanResumeStudioRoute(41, null, detached));
+    }
+
     [Theory]
     [InlineData("BoolValue", "__CarbonManagedBaselineReady", false, "CoreGui", true, true)]
     [InlineData("StringValue", "__CarbonManagedBaselineReady", false, "CoreGui", true, false)]
@@ -82,7 +129,7 @@ public sealed class PolicyAndEngineWorkTests
     }
 
     [Fact]
-    public void ManagedStartupAttestationUsesShortSettlingWindow()
+    public void ManagedStartupAttestationUsesShortSettlingWindowAndRetriesUntilReady()
     {
         Assert.Equal(
             TimeSpan.FromMilliseconds(500),
@@ -90,6 +137,12 @@ public sealed class PolicyAndEngineWorkTests
         Assert.Equal(
             TimeSpan.FromMilliseconds(250),
             CarbonBridgeMod.ManagedSnapshotQuietPeriodFor(true));
+        Assert.Equal(
+            TimeSpan.FromMilliseconds(100),
+            CarbonBridgeMod.ManagedSnapshotRetryPeriod);
+        Assert.Equal(
+            TimeSpan.FromSeconds(30),
+            CarbonBridgeMod.ManagedSnapshotReadinessTimeout);
     }
 
     [Fact]
