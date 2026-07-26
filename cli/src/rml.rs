@@ -608,7 +608,7 @@ fn bundled_file_permissions_are_current(relative: &Path, destination: &Path) -> 
 		|| fs::metadata(destination).is_ok_and(|metadata| metadata.permissions().mode() & 0o100 != 0)
 }
 
-#[cfg(all(not(unix), any(carbon_bundled_rml, test)))]
+#[cfg(all(not(unix), carbon_bundled_rml))]
 fn bundled_file_permissions_are_current(_relative: &Path, _destination: &Path) -> bool {
 	true
 }
@@ -651,7 +651,7 @@ fn install_bundled_files(files: &[(&str, &[u8])], package: &Path) -> Result<Bund
 	}
 }
 
-#[cfg(any(carbon_bundled_rml, test))]
+#[cfg(any(carbon_bundled_rml, all(test, unix)))]
 fn bundled_files_are_current(files: &[(&str, &[u8])], package: &Path) -> bool {
 	files.iter().all(|(relative, bytes)| {
 		let Ok(relative) = safe_bundle_path(relative) else {
