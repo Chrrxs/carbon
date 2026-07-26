@@ -33,6 +33,7 @@ internal readonly record struct ObservationRetentionPlan(
 public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 {
     private const int ProtocolVersion = 2;
+    private const string BridgeIdEnvironmentVariable = "CARBON_RML_BRIDGE_ID";
     internal const int EngineWorkBatchSize = 256;
     private const string StudioRouteMarker = "__CarbonStudioRoute";
     private const string ManagedBaselineReadyMarker = "__CarbonManagedBaselineReady";
@@ -284,7 +285,21 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             Timeout.InfiniteTimeSpan,
             Timeout.InfiniteTimeSpan);
         _token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-        _bridgeId = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        _bridgeId = ResolveBridgeId(
+            Environment.GetEnvironmentVariable(BridgeIdEnvironmentVariable),
+            () => Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant());
+        try
+        {
+            var removed = PruneStaleDiscoveryRecords(DiscoveryRoot(), IsStudioProcessRunning);
+            if (removed != 0)
+            {
+                Logger.Info($"Pruned {removed} stale Carbon bridge discovery record(s)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Failed to prune stale Carbon bridge discovery records: {ex.Message}");
+        }
         _captureLeases = new CaptureLeaseManager(
             IOPath.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -6853,8 +6868,115 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
     private string DiscoveryPath()
     {
+        return IOPath.Combine(DiscoveryRoot(), "v1", $"{_bridgeId}.json");
+    }
+
+    private static string DiscoveryRoot()
+    {
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return IOPath.Combine(local, "RobloxModLoader", "carbon-bridges", "v1", $"{_bridgeId}.json");
+        return IOPath.Combine(local, "RobloxModLoader", "carbon-bridges");
+    }
+
+    internal static string ResolveBridgeId(string? configured, Func<string> generate)
+    {
+        if (configured is not null
+            && configured.Length == 32
+            && configured.All(Uri.IsHexDigit))
+        {
+            return configured;
+        }
+        return generate();
+    }
+
+    internal static int PruneStaleDiscoveryRecords(
+        string root,
+        Func<int, bool> processIsRunning)
+    {
+        var paths = new List<string>();
+        var main = IOPath.Combine(root, "v1");
+        var routes = IOPath.Combine(root, "routes", "v1");
+        try
+        {
+            if (Directory.Exists(main))
+            {
+                paths.AddRange(Directory.GetFiles(main, "*.json", SearchOption.TopDirectoryOnly));
+            }
+        }
+        catch
+        {
+        }
+        try
+        {
+            if (Directory.Exists(routes))
+            {
+                paths.AddRange(Directory.GetFiles(routes, "*.json", SearchOption.AllDirectories));
+            }
+        }
+        catch
+        {
+        }
+
+        var removed = 0;
+        foreach (var path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var processId = DiscoveryProcessId(path);
+                if (processId is null || processIsRunning(processId.Value))
+                {
+                    continue;
+                }
+
+                // Re-read immediately before deletion so a concurrent atomic
+                // replacement for a later process can never lose its record.
+                var currentProcessId = DiscoveryProcessId(path);
+                if (currentProcessId != processId
+                    || currentProcessId is null
+                    || processIsRunning(currentProcessId.Value))
+                {
+                    continue;
+                }
+                IOFile.Delete(path);
+                removed++;
+            }
+            catch
+            {
+                // An unreadable or concurrently replaced record is preserved.
+            }
+        }
+        return removed;
+    }
+
+    private static int? DiscoveryProcessId(string path)
+    {
+        using var document = JsonDocument.Parse(IOFile.ReadAllText(path));
+        return document.RootElement.TryGetProperty("processId", out var processId)
+            && processId.TryGetInt32(out var value)
+            && value > 0
+                ? value
+                : null;
+    }
+
+    internal static bool IsStudioProcessRunning(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return string.Equals(
+                    process.ProcessName,
+                    "RobloxStudioBeta",
+                    StringComparison.OrdinalIgnoreCase)
+                && !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch
+        {
+            // Permission and transient inspection failures must preserve data.
+            return true;
+        }
     }
 
     private static int ReserveLoopbackPort()

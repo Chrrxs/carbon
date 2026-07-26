@@ -22,6 +22,7 @@ pub const BUILD_VERSION: &str = env!("CARBON_BUILD_IDENTITY");
 pub const LOADER_ENV: &str = "CARBON_RML_LOADER";
 pub const EXPECTED_BUILD_ENV: &str = "CARBON_RML_BUILD_VERSION";
 pub const LOADED_BUILD_ENV: &str = "CARBON_RML_LOADED_BUILD_VERSION";
+pub const BRIDGE_ID_ENV: &str = "CARBON_RML_BRIDGE_ID";
 const MARKER_SCHEMA: u32 = 1;
 const MARKER_PATH: &str = "RobloxModLoader/carbon-rml.json";
 const BOOTSTRAP_PATH: &str = "dwmapi.dll";
@@ -96,6 +97,7 @@ pub struct Launch {
 	studio_executable: PathBuf,
 	loader_path: PathBuf,
 	helper_path: PathBuf,
+	bridge_id: String,
 	bootstrap_updated: bool,
 	_bootstrap_lock: File,
 }
@@ -111,6 +113,10 @@ impl Launch {
 
 	pub fn helper_path(&self) -> &Path {
 		&self.helper_path
+	}
+
+	pub fn bridge_id(&self) -> &str {
+		&self.bridge_id
 	}
 
 	pub fn build_version(&self) -> &'static str {
@@ -740,6 +746,7 @@ pub fn prepare_launch(explicit_studio: Option<&Path>, explicit_package: Option<&
 		studio_executable: fs::canonicalize(studio_executable)?,
 		loader_path: fs::canonicalize(package.join(LOADER_PATH))?,
 		helper_path,
+		bridge_id: uuid::Uuid::new_v4().simple().to_string(),
 		bootstrap_updated,
 		_bootstrap_lock: lock,
 	})
@@ -1064,6 +1071,9 @@ mod tests {
 			launch_b.loader_path(),
 			package_b.join("RobloxModLoader/roblox_modloader.dll")
 		);
+		assert_eq!(launch_a.bridge_id().len(), 32);
+		assert!(launch_a.bridge_id().bytes().all(|byte| byte.is_ascii_hexdigit()));
+		assert_ne!(launch_a.bridge_id(), launch_b.bridge_id());
 		assert_eq!(
 			fs::read(studio.join("RobloxModLoader/roblox_modloader.dll")).unwrap(),
 			b"global-sentinel"

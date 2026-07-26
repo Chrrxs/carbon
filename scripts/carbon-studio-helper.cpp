@@ -226,7 +226,8 @@ static int cmd_launch(
     const std::string& managed_str,
     const std::string& loader_b64,
     const std::string& build_b64,
-    const std::string& dotnet_root_b64
+    const std::string& dotnet_root_b64,
+    const std::string& bridge_id_b64
 ) {
     if (managed_str != "0" && managed_str != "1") {
         std::cerr << "Invalid managed flag (must be 0 or 1)\n";
@@ -272,6 +273,18 @@ static int cmd_launch(
         return 1;
     }
 
+    std::wstring bridge_id;
+    if (!decode_base64_utf8(bridge_id_b64, bridge_id)
+        || bridge_id.length() != 32
+        || !std::all_of(bridge_id.begin(), bridge_id.end(), [](wchar_t value) {
+            return (value >= L'0' && value <= L'9')
+                || (value >= L'a' && value <= L'f')
+                || (value >= L'A' && value <= L'F');
+        })) {
+        std::cerr << "Invalid base64/UTF-8 RML bridge ID\n";
+        return 1;
+    }
+
     struct EnvironmentValue {
         const wchar_t* name;
         const std::wstring* value;
@@ -279,6 +292,7 @@ static int cmd_launch(
     const EnvironmentValue environment[] = {
         { L"CARBON_RML_LOADER", &loader_path },
         { L"CARBON_RML_BUILD_VERSION", &build_version },
+        { L"CARBON_RML_BRIDGE_ID", &bridge_id },
         { L"DOTNET_ROOT", &dotnet_root },
     };
     for (const auto& entry : environment) {
@@ -727,12 +741,12 @@ int main(int argc, char* argv[]) {
 
     std::string cmd = argv[1];
     if (cmd == "launch") {
-        if (argc != 8) {
+        if (argc != 9) {
             std::cerr << "Usage: carbon-studio-helper launch <studio_b64> <place_b64> <managed_0_or_1> "
-                         "<loader_b64> <build_b64> <dotnet_root_b64>\n";
+                         "<loader_b64> <build_b64> <dotnet_root_b64> <bridge_id_b64>\n";
             return 1;
         }
-        return cmd_launch(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
+        return cmd_launch(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
     } else if (cmd == "inject") {
         if (argc != 6) {
             std::cerr << "Usage: carbon-studio-helper inject <pid> <filetime> <loader_b64> <studio_b64>\n";

@@ -342,6 +342,7 @@ pub fn launch(path: Option<PathBuf>) -> Result<Option<u32>> {
 	let require_engine_ready = path.is_some();
 	let (rml_launch, _plugin_launch) = prepare_launch(None)?;
 	let loader_path = rml_launch.loader_path().to_owned();
+	let expected_bridge_id = rml_launch.bridge_id().to_owned();
 	let (studio_executable, _) = mcp_launch_paths(&rml_launch)?;
 	let Some(mut launched) = launch_prepared(path, rml_launch, false)? else {
 		return Ok(None);
@@ -363,17 +364,13 @@ pub fn launch(path: Option<PathBuf>) -> Result<Option<u32>> {
 		)
 		.with_context(|| format!("failed to load Carbon RML into Roblox Studio process {process_id}"))?;
 		launched.verify_identity()?;
-		let loaded_bridge_id = attest_rml_bridge(process_id, false)?;
+		let bridge = attest_loaded_rml_bridge(&expected_bridge_id, process_id)?;
 		launched.verify_identity()?;
-		bridge_id = Some(loaded_bridge_id.clone());
+		bridge_id = Some(bridge.bridge_id().to_owned());
 		if require_engine_ready {
 			launched.verify_identity()?;
-			let ready_bridge_id = attest_rml_bridge(process_id, true)?;
+			attest_ready_rml_bridge(&bridge, process_id)?;
 			launched.verify_identity()?;
-			anyhow::ensure!(
-				ready_bridge_id == loaded_bridge_id,
-				"RML bridge identity changed while Roblox Studio initialized"
-			);
 		}
 		launched.finish()?;
 		Ok::<(), anyhow::Error>(())
@@ -428,6 +425,7 @@ fn prefer_suspended_direct_lifecycle(preference: LifecyclePreference) -> bool {
 pub fn launch_managed(path: PathBuf, studio_dir: &Path) -> Result<ManagedStudio> {
 	let (rml_launch, plugin_launch) = prepare_launch(Some(studio_dir))?;
 	let loader_path = rml_launch.loader_path().to_owned();
+	let expected_bridge_id = rml_launch.bridge_id().to_owned();
 	let (studio_executable, _) = mcp_launch_paths(&rml_launch)?;
 	let mut direct_launch = None;
 	let preference = LifecyclePreference::from_env()?;
@@ -527,22 +525,18 @@ pub fn launch_managed(path: PathBuf, studio_dir: &Path) -> Result<ManagedStudio>
 		if let Some(launched) = direct_launch.as_mut() {
 			launched.verify_identity()?;
 		}
-		let bridge_id = attest_rml_bridge(process_id, false)?;
+		let bridge = attest_loaded_rml_bridge(&expected_bridge_id, process_id)?;
 		if let Some(launched) = direct_launch.as_mut() {
 			launched.verify_identity()?;
 		}
-		managed.bridge_id = Some(bridge_id.clone());
+		managed.bridge_id = Some(bridge.bridge_id().to_owned());
 		if let Some(launched) = direct_launch.as_mut() {
 			launched.verify_identity()?;
 		}
-		let ready_bridge_id = attest_rml_bridge(process_id, true)?;
+		attest_ready_rml_bridge(&bridge, process_id)?;
 		if let Some(launched) = direct_launch.as_mut() {
 			launched.verify_identity()?;
 		}
-		anyhow::ensure!(
-			ready_bridge_id == bridge_id,
-			"RML bridge identity changed while managed Roblox Studio initialized"
-		);
 		if let Some(launched) = direct_launch.as_mut() {
 			launched.finish()?;
 		}
@@ -871,16 +865,15 @@ fn managed_completion_status_has_identity(
 		&& result.get("process_ownership_released").and_then(Value::as_bool) == Some(true)
 }
 
-fn attest_rml_bridge(process_id: u32, require_engine_ready: bool) -> Result<String> {
-	let attestation = if require_engine_ready {
-		crate::privileged_bridge::Bridge::wait_for_process(process_id, Duration::from_secs(30))
-	} else {
-		crate::privileged_bridge::Bridge::wait_for_loaded_process(process_id, Duration::from_secs(30))
-	};
-	let bridge = attestation.with_context(|| {
-		format!("RML bridge for Roblox Studio process {process_id} did not attest this Carbon build")
-	})?;
-	Ok(bridge.bridge_id().to_owned())
+fn attest_loaded_rml_bridge(bridge_id: &str, process_id: u32) -> Result<crate::privileged_bridge::Bridge> {
+	crate::privileged_bridge::Bridge::wait_for_loaded_process(bridge_id, process_id, Duration::from_secs(30))
+		.with_context(|| format!("RML bridge for Roblox Studio process {process_id} did not attest this Carbon build"))
+}
+
+fn attest_ready_rml_bridge(bridge: &crate::privileged_bridge::Bridge, process_id: u32) -> Result<()> {
+	bridge
+		.wait_until_process_ready(process_id, Duration::from_secs(30))
+		.with_context(|| format!("RML bridge for Roblox Studio process {process_id} did not attest this Carbon build"))
 }
 
 fn stop_mcp_owned_process<C, T>(
@@ -951,6 +944,7 @@ fn launch_through_mcp(
 		&studio_executable,
 		&loader_path,
 		rml_launch.build_version(),
+		rml_launch.bridge_id(),
 		dotnet_root.as_deref(),
 	);
 	let result = mcp_tool(&mcp.endpoint, mcp.auth_token.as_deref(), &payload, MCP_LAUNCH_TIMEOUT)
@@ -973,6 +967,7 @@ fn mcp_launch_request(
 	studio: &str,
 	loader: &str,
 	build_version: &str,
+	bridge_id: &str,
 	dotnet_root: Option<&str>,
 ) -> Value {
 	let mut payload = json!({
@@ -983,7 +978,8 @@ fn mcp_launch_request(
 		"process_environment": {
 			"set": {
 				rml::LOADER_ENV: loader,
-				rml::EXPECTED_BUILD_ENV: build_version
+				rml::EXPECTED_BUILD_ENV: build_version,
+				rml::BRIDGE_ID_ENV: bridge_id
 			},
 			"remove": [rml::LOADED_BUILD_ENV]
 		},
@@ -1510,6 +1506,7 @@ fn launch_prepared(
 		let encoded_loader = BASE64_STANDARD.encode(windows_loader.as_bytes());
 		let encoded_build = BASE64_STANDARD.encode(rml_launch.build_version().as_bytes());
 		let encoded_dotnet_root = BASE64_STANDARD.encode(windows_dotnet_root.as_bytes());
+		let encoded_bridge_id = BASE64_STANDARD.encode(rml_launch.bridge_id().as_bytes());
 		let mut child = Command::new(rml_launch.helper_path())
 			.args([
 				"launch",
@@ -1519,6 +1516,7 @@ fn launch_prepared(
 				&encoded_loader,
 				&encoded_build,
 				&encoded_dotnet_root,
+				&encoded_bridge_id,
 			])
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
@@ -1579,6 +1577,7 @@ fn launch_prepared(
 			.arg(path.unwrap_or_default())
 			.env(rml::LOADER_ENV, rml_launch.loader_path())
 			.env(rml::EXPECTED_BUILD_ENV, rml_launch.build_version())
+			.env(rml::BRIDGE_ID_ENV, rml_launch.bridge_id())
 			.env_remove(rml::LOADED_BUILD_ENV)
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
@@ -2423,6 +2422,7 @@ mod tests {
 			r"C:\Roblox\RobloxStudioBeta.exe",
 			r"C:\Carbon\RobloxModLoader\roblox_modloader.dll",
 			"0.0.0+build.test",
+			"0123456789abcdef0123456789abcdef",
 			Some(r"C:\Users\builder\.dotnet"),
 		);
 
@@ -2436,6 +2436,10 @@ mod tests {
 		assert_eq!(
 			payload["process_environment"]["set"][rml::EXPECTED_BUILD_ENV],
 			"0.0.0+build.test"
+		);
+		assert_eq!(
+			payload["process_environment"]["set"][rml::BRIDGE_ID_ENV],
+			"0123456789abcdef0123456789abcdef"
 		);
 		assert_eq!(
 			payload["process_environment"]["set"]["DOTNET_ROOT"],
@@ -2644,11 +2648,13 @@ mod tests {
 		let loader = r"C:\Carbon\RobloxModLoader.dll";
 		let build = "26.7.252257";
 		let dotnet_root = r"C:\Program Files\dotnet";
+		let bridge_id = "0123456789abcdef0123456789abcdef";
 		let encoded_studio = BASE64_STANDARD.encode(studio.as_bytes());
 		let encoded_place = BASE64_STANDARD.encode(place.as_bytes());
 		let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
 		let encoded_build = BASE64_STANDARD.encode(build.as_bytes());
 		let encoded_dotnet_root = BASE64_STANDARD.encode(dotnet_root.as_bytes());
+		let encoded_bridge_id = BASE64_STANDARD.encode(bridge_id.as_bytes());
 		let args = [
 			"launch".to_string(),
 			encoded_studio.clone(),
@@ -2657,6 +2663,7 @@ mod tests {
 			encoded_loader.clone(),
 			encoded_build.clone(),
 			encoded_dotnet_root.clone(),
+			encoded_bridge_id.clone(),
 		];
 		assert_eq!(args[0], "launch");
 		assert_eq!(
@@ -2679,6 +2686,10 @@ mod tests {
 		assert_eq!(
 			String::from_utf8(BASE64_STANDARD.decode(args[6].as_bytes()).unwrap()).unwrap(),
 			dotnet_root
+		);
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[7].as_bytes()).unwrap()).unwrap(),
+			bridge_id
 		);
 	}
 

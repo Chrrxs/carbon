@@ -406,26 +406,43 @@ impl Bridge {
 		}
 	}
 
-	pub fn wait_for_process(process_id: u32, timeout: Duration) -> Result<Self> {
-		Self::wait_for_process_attestation(process_id, timeout, true)
-	}
-
-	pub fn wait_for_loaded_process(process_id: u32, timeout: Duration) -> Result<Self> {
-		Self::wait_for_process_attestation(process_id, timeout, false)
-	}
-
-	fn wait_for_process_attestation(process_id: u32, timeout: Duration, require_engine_ready: bool) -> Result<Self> {
+	pub fn wait_for_loaded_process(bridge_id: &str, process_id: u32, timeout: Duration) -> Result<Self> {
+		validate_bridge_id(bridge_id)?;
 		let deadline = std::time::Instant::now() + timeout;
 		loop {
-			let candidates = Self::active_bridge_ids_for_process(Some(process_id), require_engine_ready)?
-				.into_iter()
-				.collect::<Vec<_>>();
-			match candidates.as_slice() {
-				[bridge_id] => return Self::discover(bridge_id),
-				[] if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(250)),
-				[] => anyhow::bail!("timed out waiting for RML bridge process {process_id}"),
-				_ => anyhow::bail!("multiple RML bridges claimed Studio process {process_id}"),
+			if let Ok(bridge) = Self::discover(bridge_id) {
+				if bridge
+					.get::<Capabilities>("v1/capabilities")
+					.ok()
+					.is_some_and(|capabilities| is_loaded_bridge(&bridge.discovery, &capabilities, Some(process_id)))
+				{
+					return Ok(bridge);
+				}
 			}
+			if std::time::Instant::now() >= deadline {
+				anyhow::bail!("timed out waiting for RML bridge {bridge_id} process {process_id}");
+			}
+			thread::sleep(Duration::from_millis(250));
+		}
+	}
+
+	pub fn wait_until_process_ready(&self, process_id: u32, timeout: Duration) -> Result<()> {
+		let deadline = std::time::Instant::now() + timeout;
+		loop {
+			if self
+				.get::<Capabilities>("v1/capabilities")
+				.ok()
+				.is_some_and(|capabilities| is_ready_bridge(&self.discovery, &capabilities, Some(process_id)))
+			{
+				return Ok(());
+			}
+			if std::time::Instant::now() >= deadline {
+				anyhow::bail!(
+					"timed out waiting for RML bridge {} process {process_id} to attach an engine generation",
+					self.bridge_id()
+				);
+			}
+			thread::sleep(Duration::from_millis(250));
 		}
 	}
 
@@ -1093,6 +1110,40 @@ mod tests {
 		capabilities.engine_generation = 1;
 		assert!(is_ready_bridge(&discovery, &capabilities, Some(42)));
 		assert!(!is_ready_bridge(&discovery, &capabilities, Some(7)));
+	}
+
+	#[test]
+	fn ready_attestation_reuses_the_exact_discovered_bridge_without_registry_access() {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let (mut discovery, capabilities) = discovery_and_capabilities(true, 1);
+		discovery.endpoint = format!("http://{}/", listener.local_addr().unwrap());
+		let path = env::temp_dir().join(format!(
+			"carbon-exact-rml-bridge-{}-{}.json",
+			std::process::id(),
+			uuid::Uuid::new_v4().simple()
+		));
+		fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
+		let bridge =
+			Bridge::from_path_with_timeouts(&path, None, Duration::from_millis(100), Duration::from_millis(100))
+				.unwrap();
+		fs::remove_file(&path).unwrap();
+
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			let mut request = [0_u8; 2048];
+			std::io::Read::read(&mut stream, &mut request).unwrap();
+			let body = serde_json::to_vec(&capabilities).unwrap();
+			write!(
+				stream,
+				"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+				body.len()
+			)
+			.unwrap();
+			stream.write_all(&body).unwrap();
+		});
+
+		bridge.wait_until_process_ready(42, Duration::from_millis(100)).unwrap();
+		server.join().unwrap();
 	}
 
 	#[test]
