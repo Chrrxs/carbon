@@ -71,9 +71,13 @@ or `carbon stop`. Both commands also accept `--port` for explicit endpoint
 selection. During startup, `serve` reports managed-place building, Studio
 launch, and connection waiting separately. The waiting message omits the ID
 until Studio has connected and MCP has assigned it. In automatic lifecycle
-mode, Carbon uses direct launch when no compatible broker is available or when
-it can prove a selected broker failed before dispatch. If a broker request may
-have been dispatched, Carbon withholds direct fallback to avoid a duplicate or
+mode, including on Linux/WSL, Carbon delegates launch ownership to a compatible
+broker. The broker's process-identity launch remains suspended until Carbon has
+prepared exact-process RML injection and sends authorization, then retains
+ownership until Carbon attests the injected runtime and completes the launch.
+Carbon uses direct launch when no compatible broker is available or when it can
+prove a selected broker failed before dispatch. If a broker request may have
+been dispatched, Carbon withholds direct fallback to avoid a duplicate or
 unowned Studio process and reports the broker endpoint, failure stage, complete
 cause chain, and recovery command. After inspecting or restarting the broker,
 explicitly select direct lifecycle for a subsequent attempt with

@@ -418,8 +418,8 @@ fn prepare_direct_managed_launch(
 	))
 }
 
-fn prefer_suspended_direct_lifecycle(preference: LifecyclePreference) -> bool {
-	cfg!(target_os = "linux") && preference == LifecyclePreference::Auto
+fn should_discover_mcp_lifecycle(preference: LifecyclePreference) -> bool {
+	preference != LifecyclePreference::Direct
 }
 
 pub fn launch_managed(path: PathBuf, studio_dir: &Path) -> Result<ManagedStudio> {
@@ -429,13 +429,11 @@ pub fn launch_managed(path: PathBuf, studio_dir: &Path) -> Result<ManagedStudio>
 	let (studio_executable, _) = mcp_launch_paths(&rml_launch)?;
 	let mut direct_launch = None;
 	let preference = LifecyclePreference::from_env()?;
-	let mcp_lifecycle = if prefer_suspended_direct_lifecycle(preference) {
-		log::debug!(
-			"Selected suspended direct Studio lifecycle so Carbon stages exact-process RML injection before releasing Roblox Studio; set {LIFECYCLE_ENV}=mcp to explicitly delegate process ownership"
-		);
-		None
-	} else {
+	let mcp_lifecycle = if should_discover_mcp_lifecycle(preference) {
 		discover_mcp_lifecycle()?
+	} else {
+		log::debug!("Selected suspended direct Studio lifecycle because {LIFECYCLE_ENV}=direct");
+		None
 	};
 	let lifecycle = if let Some(mcp) = mcp_lifecycle {
 		log::debug!(
@@ -827,7 +825,7 @@ fn managed_launch_identity(result: &Value) -> Result<(String, u32, Option<u64>)>
 		) && result.get("process_running").and_then(Value::as_bool) == Some(true),
 		"robloxstudio-mcp did not return a running managed Studio launch"
 	);
-	// Protocol v2 requires the exact process to remain suspended until Carbon
+	// Protocol v3 requires the exact process to remain suspended until Carbon
 	// has prepared its injector and explicitly authorizes this launch ID.
 	Ok((launch_id, process_id, started_at_file_time))
 }
@@ -2129,10 +2127,10 @@ mod tests {
 	}
 
 	#[test]
-	fn automatic_wsl_lifecycle_is_suspended_direct_but_explicit_modes_are_honored() {
-		assert!(prefer_suspended_direct_lifecycle(LifecyclePreference::Auto));
-		assert!(!prefer_suspended_direct_lifecycle(LifecyclePreference::Mcp));
-		assert!(!prefer_suspended_direct_lifecycle(LifecyclePreference::Direct));
+	fn automatic_wsl_lifecycle_does_not_bypass_suspended_mcp() {
+		assert!(should_discover_mcp_lifecycle(LifecyclePreference::Auto));
+		assert!(should_discover_mcp_lifecycle(LifecyclePreference::Mcp));
+		assert!(!should_discover_mcp_lifecycle(LifecyclePreference::Direct));
 	}
 
 	#[test]
