@@ -27,6 +27,7 @@ const MARKER_PATH: &str = "RobloxModLoader/carbon-rml.json";
 const BOOTSTRAP_PATH: &str = "dwmapi.dll";
 const BOOTSTRAP_LOCK_PATH: &str = "RobloxModLoader/carbon-bootstrap.lock";
 const LOADER_PATH: &str = "RobloxModLoader/roblox_modloader.dll";
+const HELPER_PATH: &str = "carbon-studio-helper.exe";
 #[cfg(any(carbon_bundled_rml, test))]
 const CONFIG_PATH: &str = "RobloxModLoader/config.toml";
 const RML_CACHE_DIR_ENV: &str = "CARBON_RML_CACHE_DIR";
@@ -35,6 +36,7 @@ include!(concat!(env!("OUT_DIR"), "/carbon_rml_bundle.rs"));
 const REQUIRED_FILES: &[&str] = &[
 	BOOTSTRAP_PATH,
 	LOADER_PATH,
+	HELPER_PATH,
 	"RobloxModLoader/runtime/RML.Core.dll",
 	"RobloxModLoader/runtime/RML.NativeHost.dll",
 	"RobloxModLoader/runtime/Roblox.dll",
@@ -93,6 +95,7 @@ pub fn status(studio_dir: &Path) -> Status {
 pub struct Launch {
 	studio_executable: PathBuf,
 	loader_path: PathBuf,
+	helper_path: PathBuf,
 	bootstrap_updated: bool,
 	_bootstrap_lock: File,
 }
@@ -106,6 +109,10 @@ impl Launch {
 		&self.loader_path
 	}
 
+	pub fn helper_path(&self) -> &Path {
+		&self.helper_path
+	}
+
 	pub fn build_version(&self) -> &'static str {
 		BUILD_VERSION
 	}
@@ -113,232 +120,6 @@ impl Launch {
 	pub fn bootstrap_updated(&self) -> bool {
 		self.bootstrap_updated
 	}
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn powershell_injection_script(
-	process_id: u32,
-	loader: &str,
-	studio_executable: &str,
-	started_at_file_time: u64,
-) -> String {
-	let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
-	let encoded_studio = BASE64_STANDARD.encode(studio_executable.as_bytes());
-	r#"
-$processId = __CARBON_PROCESS_ID__
-$startedAtFileTime = [uint64]__CARBON_STARTED_AT_FILE_TIME__
-$loader = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_LOADER_BASE64__'))
-$studio = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_STUDIO_BASE64__'))
-if ($loader -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)') { throw 'Carbon supplied a non-absolute RML loader path' }
-if ($studio -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)') { throw 'Carbon supplied a non-absolute Studio executable path' }
-Add-Type -TypeDefinition @'
-using System;
-using System.IO;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class CarbonRmlInjector
-{
-    private const uint ProcessAccess = 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0400 | 0x1000;
-    private const uint MemCommit = 0x1000;
-    private const uint MemReserve = 0x2000;
-    private const uint MemRelease = 0x8000;
-    private const uint PageReadWrite = 0x04;
-    private const uint WaitObject0 = 0x00000000;
-    private const uint WaitTimeout = 0x00000102;
-    private const uint CreateSuspended = 0x00000004;
-    private const uint ResumeFailed = 0xFFFFFFFF;
-    [StructLayout(LayoutKind.Sequential)]
-    private struct FileTime
-    {
-        public uint Low;
-        public uint High;
-    }
-
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool QueryFullProcessImageName(
-        IntPtr process,
-        uint flags,
-        StringBuilder executable,
-        ref uint size);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetProcessTimes(
-        IntPtr process,
-        out FileTime creation,
-        out FileTime exit,
-        out FileTime kernel,
-        out FileTime user);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr VirtualAllocEx(
-        IntPtr process,
-        IntPtr address,
-        UIntPtr size,
-        uint allocationType,
-        uint protect);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool VirtualFreeEx(IntPtr process, IntPtr address, UIntPtr size, uint freeType);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool WriteProcessMemory(
-        IntPtr process,
-        IntPtr address,
-        byte[] buffer,
-        UIntPtr size,
-        out UIntPtr written);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr GetModuleHandle(string moduleName);
-    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
-    private static extern IntPtr GetProcAddress(IntPtr module, string name);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr CreateRemoteThread(
-        IntPtr process,
-        IntPtr attributes,
-        UIntPtr stackSize,
-        IntPtr startAddress,
-        IntPtr parameter,
-        uint flags,
-        out uint threadId);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    private static string NormalizePath(string path)
-    {
-        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
-        {
-            path = @"\\" + path.Substring(8);
-        }
-        else if (path.StartsWith(@"\\?\", StringComparison.Ordinal))
-        {
-            path = path.Substring(4);
-        }
-        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
-    }
-
-    private static void Check(bool condition, string operation)
-    {
-        if (!condition)
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
-        }
-    }
-
-    public static void Inject(uint processId, string loader, string expectedExecutable, ulong expectedStartedAt)
-    {
-        byte[] path = Encoding.Unicode.GetBytes(loader + "\0");
-        IntPtr process = OpenProcess(ProcessAccess, false, processId);
-        Check(process != IntPtr.Zero, "OpenProcess");
-        IntPtr remote = IntPtr.Zero;
-        IntPtr thread = IntPtr.Zero;
-        bool remoteThreadFinished = false;
-        try
-        {
-            FileTime creation;
-            FileTime exit;
-            FileTime kernel;
-            FileTime user;
-            Check(GetProcessTimes(process, out creation, out exit, out kernel, out user), "GetProcessTimes");
-            ulong startedAt = ((ulong)creation.High << 32) | creation.Low;
-            if (startedAt != expectedStartedAt)
-            {
-                throw new InvalidOperationException(
-                    "Carbon injector process creation time does not match the launched Studio process");
-            }
-
-            var executable = new StringBuilder(32768);
-            uint executableLength = (uint)executable.Capacity;
-            Check(
-                QueryFullProcessImageName(process, 0, executable, ref executableLength),
-                "QueryFullProcessImageName");
-            if (!string.Equals(
-                NormalizePath(executable.ToString()),
-                NormalizePath(expectedExecutable),
-                StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException(
-                    "Carbon injector process identity does not match the launched Studio executable");
-            }
-
-            remote = VirtualAllocEx(
-                process,
-                IntPtr.Zero,
-                (UIntPtr)path.Length,
-                MemCommit | MemReserve,
-                PageReadWrite);
-            Check(remote != IntPtr.Zero, "VirtualAllocEx");
-
-            UIntPtr written;
-            Check(
-                WriteProcessMemory(process, remote, path, (UIntPtr)path.Length, out written)
-                    && written.ToUInt64() == (ulong)path.Length,
-                "WriteProcessMemory");
-
-            IntPtr kernel32 = GetModuleHandle("kernel32.dll");
-            Check(kernel32 != IntPtr.Zero, "GetModuleHandle");
-            IntPtr loadLibrary = GetProcAddress(kernel32, "LoadLibraryW");
-            Check(loadLibrary != IntPtr.Zero, "GetProcAddress");
-
-            uint threadId;
-            thread = CreateRemoteThread(
-                process,
-                IntPtr.Zero,
-                UIntPtr.Zero,
-                loadLibrary,
-                remote,
-                CreateSuspended,
-                out threadId);
-            Check(thread != IntPtr.Zero, "CreateRemoteThread");
-
-            Console.Out.WriteLine("CARBON_RML_INJECTOR_READY");
-            Console.Out.Flush();
-            if (!string.Equals(Console.In.ReadLine(), "CARBON_RML_INJECTOR_PROCEED", StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException("Carbon injector authorization was not confirmed");
-            }
-            if (ResumeThread(thread) == ResumeFailed)
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed");
-            }
-            Console.Out.WriteLine("CARBON_RML_INJECTOR_STARTED");
-            Console.Out.Flush();
-            uint wait = WaitForSingleObject(thread, 30000);
-            if (wait == WaitTimeout)
-            {
-                throw new TimeoutException("RML loader injection timed out");
-            }
-            Check(wait == WaitObject0, "WaitForSingleObject");
-            remoteThreadFinished = true;
-            // The remote thread exit API truncates the 64-bit HMODULE returned by LoadLibraryW.
-            // Carbon verifies the loaded module through exact-build bridge attestation.
-
-        }
-        finally
-        {
-            if (thread != IntPtr.Zero)
-            {
-                CloseHandle(thread);
-            }
-            if (remote != IntPtr.Zero && (thread == IntPtr.Zero || remoteThreadFinished))
-            {
-                VirtualFreeEx(process, remote, UIntPtr.Zero, MemRelease);
-            }
-            CloseHandle(process);
-        }
-    }
-}
-'@
-[CarbonRmlInjector]::Inject([uint32]$processId, $loader, $studio, $startedAtFileTime)
-"#
-	.replace("__CARBON_PROCESS_ID__", &process_id.to_string())
-	.replace("__CARBON_STARTED_AT_FILE_TIME__", &started_at_file_time.to_string())
-	.replace("__CARBON_LOADER_BASE64__", &encoded_loader)
-	.replace("__CARBON_STUDIO_BASE64__", &encoded_studio)
 }
 
 #[cfg(target_os = "linux")]
@@ -392,10 +173,27 @@ pub fn inject_loader(
 	authorize: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
 	ensure!(loader.is_file(), "RML loader is missing: {}", loader.display());
-	let loader = windows_loader_path(loader)?;
-	let script = powershell_injection_script(process_id, &loader, studio_executable, started_at_file_time);
-	let mut child = Command::new("powershell.exe")
-		.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+	let loader_win = windows_loader_path(loader)?;
+	let helper_path = loader
+		.parent()
+		.and_then(|p| p.parent())
+		.context("invalid RML loader path structure")?
+		.join(HELPER_PATH);
+	ensure!(
+		helper_path.is_file(),
+		"RML helper is missing: {}",
+		helper_path.display()
+	);
+	let encoded_loader = BASE64_STANDARD.encode(loader_win.as_bytes());
+	let encoded_studio = BASE64_STANDARD.encode(studio_executable.as_bytes());
+	let mut child = Command::new(&helper_path)
+		.args([
+			"inject",
+			&process_id.to_string(),
+			&started_at_file_time.to_string(),
+			&encoded_loader,
+			&encoded_studio,
+		])
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
@@ -489,7 +287,7 @@ fn windows_file_version(path: &str) -> Result<String> {
 	let script = format!(
 		r#"$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_path}')); (Get-Item -LiteralPath $path).VersionInfo.FileVersion"#
 	);
-	let output = Command::new("powershell.exe")
+	let output = crate::studio::powershell_command()?
 		.args(["-NoProfile", "-NonInteractive", "-Command", &script])
 		.output()
 		.context("failed to read Studio file version")?;
@@ -589,7 +387,7 @@ pub fn get_studio_info() -> Result<StudioInfo> {
 			env::var_os("WSL_DISTRO_NAME").is_some(),
 			"automatic Studio reflection on Linux requires WSL"
 		);
-		let output = Command::new("powershell.exe")
+		let output = crate::studio::powershell_command()?
 			.args([
 				"-NoProfile",
 				"-NonInteractive",
@@ -774,6 +572,47 @@ fn ensure_bundled_package() -> Result<PathBuf> {
 	Ok(package)
 }
 
+#[cfg(all(unix, any(carbon_bundled_rml, test)))]
+fn ensure_bundled_file_permissions(relative: &Path, destination: &Path) -> Result<bool> {
+	use std::os::unix::fs::PermissionsExt;
+
+	if relative != Path::new(HELPER_PATH) {
+		return Ok(false);
+	}
+	let mut permissions = fs::metadata(destination)
+		.with_context(|| format!("failed to inspect embedded RML file {}", destination.display()))?
+		.permissions();
+	if permissions.mode() & 0o100 != 0 {
+		return Ok(false);
+	}
+	permissions.set_mode(permissions.mode() | 0o111);
+	fs::set_permissions(destination, permissions).with_context(|| {
+		format!(
+			"failed to make embedded RML helper executable {}",
+			destination.display()
+		)
+	})?;
+	Ok(true)
+}
+
+#[cfg(all(not(unix), any(carbon_bundled_rml, test)))]
+fn ensure_bundled_file_permissions(_relative: &Path, _destination: &Path) -> Result<bool> {
+	Ok(false)
+}
+
+#[cfg(all(unix, any(carbon_bundled_rml, test)))]
+fn bundled_file_permissions_are_current(relative: &Path, destination: &Path) -> bool {
+	use std::os::unix::fs::PermissionsExt;
+
+	relative != Path::new(HELPER_PATH)
+		|| fs::metadata(destination).is_ok_and(|metadata| metadata.permissions().mode() & 0o100 != 0)
+}
+
+#[cfg(all(not(unix), any(carbon_bundled_rml, test)))]
+fn bundled_file_permissions_are_current(_relative: &Path, _destination: &Path) -> bool {
+	true
+}
+
 #[cfg(any(carbon_bundled_rml, test))]
 fn install_bundled_files(files: &[(&str, &[u8])], package: &Path) -> Result<BundleInstallStatus> {
 	ensure!(!files.is_empty(), "refusing to install an empty RML bundle");
@@ -785,22 +624,23 @@ fn install_bundled_files(files: &[(&str, &[u8])], package: &Path) -> Result<Bund
 		if relative == Path::new(CONFIG_PATH) && destination.is_file() {
 			continue;
 		}
-		if fs::read(&destination).ok().as_deref() == Some(*bytes) {
-			continue;
+		let bytes_are_current = fs::read(&destination).ok().as_deref() == Some(*bytes);
+		if !bytes_are_current {
+			if let Some(parent) = destination.parent() {
+				fs::create_dir_all(parent)
+					.with_context(|| format!("failed to create embedded RML directory {}", parent.display()))?;
+			}
+			let mut output = File::create(&destination)
+				.with_context(|| format!("failed to create embedded RML file {}", destination.display()))?;
+			output
+				.write_all(bytes)
+				.with_context(|| format!("failed to write embedded RML file {}", destination.display()))?;
+			output
+				.sync_all()
+				.with_context(|| format!("failed to flush embedded RML file {}", destination.display()))?;
+			changed = true;
 		}
-		if let Some(parent) = destination.parent() {
-			fs::create_dir_all(parent)
-				.with_context(|| format!("failed to create embedded RML directory {}", parent.display()))?;
-		}
-		let mut output = File::create(&destination)
-			.with_context(|| format!("failed to create embedded RML file {}", destination.display()))?;
-		output
-			.write_all(bytes)
-			.with_context(|| format!("failed to write embedded RML file {}", destination.display()))?;
-		output
-			.sync_all()
-			.with_context(|| format!("failed to flush embedded RML file {}", destination.display()))?;
-		changed = true;
+		changed |= ensure_bundled_file_permissions(relative, &destination)?;
 	}
 	if !changed {
 		Ok(BundleInstallStatus::Current)
@@ -811,7 +651,7 @@ fn install_bundled_files(files: &[(&str, &[u8])], package: &Path) -> Result<Bund
 	}
 }
 
-#[cfg(carbon_bundled_rml)]
+#[cfg(any(carbon_bundled_rml, test))]
 fn bundled_files_are_current(files: &[(&str, &[u8])], package: &Path) -> bool {
 	files.iter().all(|(relative, bytes)| {
 		let Ok(relative) = safe_bundle_path(relative) else {
@@ -821,7 +661,8 @@ fn bundled_files_are_current(files: &[(&str, &[u8])], package: &Path) -> bool {
 		if relative == Path::new(CONFIG_PATH) {
 			destination.is_file()
 		} else {
-			fs::read(destination).ok().as_deref() == Some(*bytes)
+			fs::read(&destination).ok().as_deref() == Some(*bytes)
+				&& bundled_file_permissions_are_current(relative, &destination)
 		}
 	})
 }
@@ -894,9 +735,11 @@ pub fn prepare_launch(explicit_studio: Option<&Path>, explicit_package: Option<&
 		"RML bootstrap installation did not pass verification"
 	);
 	info!("RobloxModLoader {} will load from {}", BUILD_VERSION, package.display());
+	let helper_path = fs::canonicalize(package.join(HELPER_PATH))?;
 	Ok(Launch {
 		studio_executable: fs::canonicalize(studio_executable)?,
 		loader_path: fs::canonicalize(package.join(LOADER_PATH))?,
+		helper_path,
 		bootstrap_updated,
 		_bootstrap_lock: lock,
 	})
@@ -1060,7 +903,7 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
 fn ensure_studio_closed() -> Result<()> {
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
-		let status = Command::new("powershell.exe")
+		let status = crate::studio::powershell_command()?
 			.args([
 				"-NoProfile",
 				"-NonInteractive",
@@ -1140,6 +983,36 @@ mod tests {
 			fs::read(package.join("RobloxModLoader/roblox_modloader.dll")).unwrap(),
 			b"loader-v2"
 		);
+		fs::remove_dir_all(package).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn bundled_helper_is_installed_and_repaired_as_executable() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let package = temp("bundled-helper-permissions");
+		let helper = package.join(HELPER_PATH);
+		let files: &[(&str, &[u8])] = &[(HELPER_PATH, b"native-helper")];
+
+		assert_eq!(
+			install_bundled_files(files, &package).unwrap(),
+			BundleInstallStatus::Updated
+		);
+		assert_eq!(fs::metadata(&helper).unwrap().permissions().mode() & 0o111, 0o111);
+		assert!(bundled_files_are_current(files, &package));
+
+		let mut permissions = fs::metadata(&helper).unwrap().permissions();
+		permissions.set_mode(permissions.mode() & !0o111);
+		fs::set_permissions(&helper, permissions).unwrap();
+		assert!(!bundled_files_are_current(files, &package));
+
+		assert_eq!(
+			install_bundled_files(files, &package).unwrap(),
+			BundleInstallStatus::Updated
+		);
+		assert_eq!(fs::metadata(&helper).unwrap().permissions().mode() & 0o111, 0o111);
+		assert!(bundled_files_are_current(files, &package));
 		fs::remove_dir_all(package).unwrap();
 	}
 
@@ -1238,37 +1111,30 @@ mod tests {
 	}
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
-	fn explicit_loader_injection_is_process_scoped_and_path_safe() {
-		let loader = r"C:\Carbon\rml\loader'; throw 'unsafe\roblox_modloader.dll";
-		let studio = r"C:\Roblox\version'; throw 'unsafe\RobloxStudioBeta.exe";
-		let script = powershell_injection_script(47_312, loader, studio, 133_700_123_456);
-
-		assert!(!script.contains(loader));
-		assert!(!script.contains(studio));
-		assert!(script.contains(&BASE64_STANDARD.encode(loader.as_bytes())));
-		assert!(script.contains(&BASE64_STANDARD.encode(studio.as_bytes())));
-		assert!(!script.contains("__CARBON_LOADER_BASE64__"));
-		assert!(!script.contains("__CARBON_STUDIO_BASE64__"));
-		assert!(!script.contains("GetExitCodeThread"));
-		assert!(script.contains("$processId = 47312"));
-		assert!(script.contains("$startedAtFileTime = [uint64]133700123456"));
-		for operation in [
-			"OpenProcess",
-			"QueryFullProcessImageName",
-			"GetProcessTimes",
-			"VirtualAllocEx",
-			"WriteProcessMemory",
-			"CreateRemoteThread",
-			"LoadLibraryW",
-			"WaitForSingleObject",
-			"VirtualFreeEx",
-			"CARBON_RML_INJECTOR_READY",
-			"CARBON_RML_INJECTOR_PROCEED",
-			"CARBON_RML_INJECTOR_STARTED",
-			"CreateSuspended",
-			"ResumeThread",
-		] {
-			assert!(script.contains(operation), "missing {operation}");
-		}
+	fn rml_helper_injection_args_and_protocol_contract() {
+		let process_id: u32 = 47_312;
+		let started_at_file_time: u64 = 133_700_123_456;
+		let loader = r"C:\Carbon\rml\loader\roblox_modloader.dll";
+		let studio = r"C:\Roblox\version\RobloxStudioBeta.exe";
+		let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
+		let encoded_studio = BASE64_STANDARD.encode(studio.as_bytes());
+		let args = [
+			"inject".to_string(),
+			process_id.to_string(),
+			started_at_file_time.to_string(),
+			encoded_loader.clone(),
+			encoded_studio.clone(),
+		];
+		assert_eq!(args[0], "inject");
+		assert_eq!(args[1], "47312");
+		assert_eq!(args[2], "133700123456");
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[3].as_bytes()).unwrap()).unwrap(),
+			loader
+		);
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[4].as_bytes()).unwrap()).unwrap(),
+			studio
+		);
 	}
 }

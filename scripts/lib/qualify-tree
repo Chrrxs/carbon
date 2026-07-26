@@ -428,7 +428,7 @@ fi
 carbon_plugin_updated=0
 if ((needs_carbon_plugin == 1)); then
 	step "Updating the Carbon Studio plugin"
-	install -m 0644 "$built_plugin" "$carbon_plugin"
+	cp "$built_plugin" "$carbon_plugin"
 	carbon_plugin_source_fingerprint="$(release_source_fingerprint "$CARBON_REPO" studio-plugin scripts/build-studio-plugin scripts/build-version)"
 	carbon_plugin_fingerprint="$(printf '%s\n%s\n' "$carbon_plugin_source_fingerprint" "$build_version" | sha256sum | cut -d ' ' -f 1)"
 	write_component_stamp carbon-plugin "$carbon_plugin_fingerprint" "$carbon_plugin"

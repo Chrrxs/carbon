@@ -120,6 +120,10 @@ grep -Fq '$thirdPartyNotices = Join-Path $SourceDir "THIRD_PARTY_NOTICES.md"' \
 grep -Fq 'Copy-Item -LiteralPath $thirdPartyNotices -Destination (Join-Path $stageRml "THIRD_PARTY_NOTICES.md") -Force' \
 	"${REPO}/scripts/build-rml.ps1" ||
 	fail "RML packaging must include the third-party notices"
+grep -Fq 'carbon-studio-helper.cpp' "${REPO}/scripts/build-rml.ps1" ||
+	fail "RML packaging must compile carbon-studio-helper.cpp"
+grep -Fq '(Join-Path $stage "carbon-studio-helper.exe")' "${REPO}/scripts/build-rml.ps1" ||
+	fail "RML packaging must require carbon-studio-helper.exe"
 
 grep -Fq '## Platform support' "${REPO}/README.md" ||
 	fail "README.md must state platform support"

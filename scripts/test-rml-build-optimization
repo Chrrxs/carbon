@@ -30,6 +30,15 @@ if ! grep -Fq -- 'Get-Command ninja.exe' "$BUILD_SCRIPT"; then
 	echo "FAIL: RML package build does not fall back to Ninja on PATH" >&2
 	failure=1
 fi
+if ! grep -Fq -- 'carbon-studio-helper.cpp' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not compile carbon-studio-helper.cpp" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- '(Join-Path $stage "carbon-studio-helper.exe")' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not require carbon-studio-helper.exe" >&2
+	failure=1
+fi
 
 if ((failure != 0)); then
 	exit "$failure"

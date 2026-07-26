@@ -312,16 +312,26 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
     public void OnDataModelLoaded(DataModel dataModel, DataModelType dataModelType)
     {
-        if (!IsEditDataModelCandidate(dataModelType))
+        bool hasAuthenticatedEditDataModel;
+        lock (_engineStateLock)
         {
+            hasAuthenticatedEditDataModel = _dataModel is not null && _studioIdentity is not null;
+        }
+        if (!ShouldAttachEditDataModelCandidate(dataModelType, hasAuthenticatedEditDataModel))
+        {
+            if (IsEditDataModelCandidate(dataModelType))
+            {
+                Logger.Info(
+                    $"Ignoring unknown DataModel type {(int)dataModelType}; " +
+                    "an authenticated edit DataModel is already attached");
+            }
             return;
         }
         if (dataModelType != DataModelType.Edit)
         {
             // Roblox's private DataModel layout can move before the loader's
             // next offset update. An out-of-domain value is allowed to attach
-            // provisionally; Carbon's unique CoreGui route still gates every
-            // request, so valid play/client/server models remain excluded.
+            // provisionally until the unique CoreGui route authenticates it.
             Logger.Info(
                 $"RML reported unknown DataModel type {(int)dataModelType}; " +
                 "probing it as an edit candidate until Studio routing is established");
@@ -1459,6 +1469,12 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     internal static bool IsEditDataModelCandidate(DataModelType dataModelType) =>
         dataModelType == DataModelType.Edit
         || !System.Enum.IsDefined(typeof(DataModelType), dataModelType);
+
+    internal static bool ShouldAttachEditDataModelCandidate(
+        DataModelType dataModelType,
+        bool hasAuthenticatedEditDataModel) =>
+        IsEditDataModelCandidate(dataModelType)
+        && !hasAuthenticatedEditDataModel;
 
     internal static bool IsManagedBaselineReadyMarker(
         string className,

@@ -33,6 +33,24 @@ public sealed class PolicyAndEngineWorkTests
     }
 
     [Theory]
+    [InlineData((int)DataModelType.Edit, false, true)]
+    [InlineData((int)DataModelType.Edit, true, false)]
+    [InlineData((int)DataModelType.Client, false, false)]
+    [InlineData(1_097_167_477, false, true)]
+    [InlineData(1_097_167_477, true, false)]
+    public void AuthenticatedEditRouteRejectsReplacementDataModels(
+        int rawDataModelType,
+        bool hasAuthenticatedEditDataModel,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CarbonBridgeMod.ShouldAttachEditDataModelCandidate(
+                (DataModelType)rawDataModelType,
+                hasAuthenticatedEditDataModel));
+    }
+
+    [Theory]
     [InlineData("session\ninstance", "session", "instance")]
     [InlineData("session-with-dashes\ninstance-with-dashes", "session-with-dashes", "instance-with-dashes")]
     public void StudioRouteRequiresOneNonEmptySeparator(

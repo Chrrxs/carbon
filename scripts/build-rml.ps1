@@ -315,6 +315,22 @@ Invoke-Checked -Program $cmake -Arguments @(
 )
 Invoke-Checked -Program $cmake -Arguments @("--build", $BuildDir, "--parallel", "--target", "roblox_modloader")
 
+Write-Host "[fresh-rml] Compiling Carbon Studio helper"
+$helperSource = Join-Path $PSScriptRoot "carbon-studio-helper.cpp"
+if (-not (Test-Path -LiteralPath $helperSource -PathType Leaf)) {
+    throw "carbon-studio-helper.cpp was not found: $helperSource"
+}
+$clCompiler = Join-Path $vcTools.FullName "bin\Hostx64\x64\cl.exe"
+$helperBuildDir = Join-Path $BuildDir "helper"
+New-Item -ItemType Directory -Force -Path $helperBuildDir | Out-Null
+$helperObj = Join-Path $helperBuildDir "carbon-studio-helper.obj"
+$helperOut = Join-Path $helperBuildDir "carbon-studio-helper.exe"
+Invoke-Checked -Program $clCompiler -Arguments @(
+    "/nologo", "/O2", "/MT", "/std:c++17", "/EHsc", "/W4", "/WX",
+    "/Fo:$helperObj", "/Fe:$helperOut", $helperSource,
+    "/link", "/Brepro", "/INCREMENTAL:NO", "kernel32.lib", "user32.lib", "advapi32.lib"
+)
+
 Write-Host "[fresh-rml] Testing the complete managed runtime"
 $bridgeTests = Join-Path $SourceDir "code\dotnet\CarbonBridge.Tests\CarbonBridge.Tests.csproj"
 $runtimeTests = Join-Path $SourceDir "code\dotnet\Runtime\Runtime.slnx"
@@ -373,8 +389,9 @@ $loader = Find-OneBuildFile -Root $BuildDir -Name "roblox_modloader.dll" -Requir
 $proxy = Find-OneBuildFile -Root $BuildDir -Name "dwmapi.dll"
 Copy-Item -LiteralPath $loader -Destination (Join-Path $stageRml "roblox_modloader.dll") -Force
 Copy-Item -LiteralPath $proxy -Destination (Join-Path $stage "dwmapi.dll") -Force
+Copy-Item -LiteralPath $helperOut -Destination (Join-Path $stage "carbon-studio-helper.exe") -Force
 
-foreach ($optional in @("roblox_modloader.pdb", "dwmapi.pdb")) {
+foreach ($optional in @("roblox_modloader.pdb", "dwmapi.pdb", "carbon-studio-helper.pdb")) {
     $built = Get-ChildItem -LiteralPath $BuildDir -Recurse -File -Filter $optional -ErrorAction SilentlyContinue |
         Where-Object {
             $_.FullName -notmatch "[\\/]_deps[\\/]" -and
@@ -428,6 +445,7 @@ Copy-Item -LiteralPath $defaultConfig -Destination (Join-Path $stageRml "config.
 
 $required = @(
     (Join-Path $stage "dwmapi.dll"),
+    (Join-Path $stage "carbon-studio-helper.exe"),
     (Join-Path $stageRml "roblox_modloader.dll"),
     (Join-Path $stageRuntime "RML.Core.dll"),
     (Join-Path $stageRuntime "RML.NativeHost.dll"),

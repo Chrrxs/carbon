@@ -79,7 +79,7 @@ fn plugins_directory() -> Result<PathBuf> {
 			env::var_os("WSL_DISTRO_NAME").is_some(),
 			"automatic Carbon Studio plugin installation on Linux requires WSL or {PLUGINS_DIR_ENV}"
 		);
-		let local_app_data = Command::new("powershell.exe")
+		let local_app_data = crate::studio::powershell_command()?
 			.args([
 				"-NoProfile",
 				"-NonInteractive",

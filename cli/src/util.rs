@@ -392,7 +392,7 @@ fn windows_path(path: &std::path::Path) -> Result<std::ffi::OsString> {
 #[cfg(target_os = "linux")]
 fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Path) -> Result<()> {
 	let (studio, output) = (windows_path(&studio_info.executable)?, windows_path(output_path)?);
-	let mut command = Command::new("powershell.exe");
+	let mut command = crate::studio::powershell_command()?;
 	command
 		.args(["-NoProfile", "-NonInteractive", "-Command", FULL_API_POWERSHELL])
 		.env("CARBON_REFLECTION_STUDIO", studio)

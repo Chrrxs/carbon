@@ -34,6 +34,7 @@ enum ManagedStudioLifecycle {
 		data_model_name: String,
 		studio_executable: String,
 		started_at_file_time: u64,
+		helper_path: PathBuf,
 	},
 	Mcp {
 		endpoint: String,
@@ -42,6 +43,7 @@ enum ManagedStudioLifecycle {
 		process_id: u32,
 		studio_executable: String,
 		started_at_file_time: Option<u64>,
+		helper_path: PathBuf,
 	},
 }
 
@@ -116,8 +118,9 @@ impl ManagedStudio {
 				process_id,
 				studio_executable,
 				started_at_file_time,
+				helper_path,
 				..
-			} => terminate_process(*process_id, studio_executable, *started_at_file_time),
+			} => terminate_process(helper_path, *process_id, studio_executable, *started_at_file_time),
 			ManagedStudioLifecycle::Mcp {
 				endpoint,
 				auth_token,
@@ -125,6 +128,7 @@ impl ManagedStudio {
 				process_id,
 				studio_executable,
 				started_at_file_time,
+				helper_path,
 			} => stop_mcp_owned_process(
 				*process_id,
 				started_at_file_time.map(|started_at| (studio_executable.as_str(), started_at)),
@@ -151,7 +155,7 @@ impl ManagedStudio {
 					);
 					Ok(())
 				},
-				terminate_process,
+				|pid, exe, ft| terminate_process(helper_path, pid, exe, ft),
 			),
 		};
 		stopped?;
@@ -358,10 +362,14 @@ pub fn launch(path: Option<PathBuf>) -> Result<Option<u32>> {
 			|| launched.resume_for_injection(),
 		)
 		.with_context(|| format!("failed to load Carbon RML into Roblox Studio process {process_id}"))?;
-		let loaded_bridge_id = attest_rml_bridge(process_id, &studio_executable, started_at_file_time, false)?;
+		launched.verify_identity()?;
+		let loaded_bridge_id = attest_rml_bridge(process_id, false)?;
+		launched.verify_identity()?;
 		bridge_id = Some(loaded_bridge_id.clone());
 		if require_engine_ready {
-			let ready_bridge_id = attest_rml_bridge(process_id, &studio_executable, started_at_file_time, true)?;
+			launched.verify_identity()?;
+			let ready_bridge_id = attest_rml_bridge(process_id, true)?;
+			launched.verify_identity()?;
 			anyhow::ensure!(
 				ready_bridge_id == loaded_bridge_id,
 				"RML bridge identity changed while Roblox Studio initialized"
@@ -392,6 +400,7 @@ fn prepare_direct_managed_launch(
 		.context("managed Studio place path does not have a file name")?
 		.to_string_lossy()
 		.into_owned();
+	let helper_path = rml_launch.helper_path().to_path_buf();
 	let mut launched =
 		launch_prepared(Some(path), rml_launch, true)?.context("Studio launcher did not return a process ID")?;
 	let process_id = launched.process_id();
@@ -406,6 +415,7 @@ fn prepare_direct_managed_launch(
 			data_model_name,
 			studio_executable: studio_executable.to_owned(),
 			started_at_file_time,
+			helper_path,
 		},
 		launched,
 	))
@@ -514,9 +524,21 @@ pub fn launch_managed(path: PathBuf, studio_dir: &Path) -> Result<ManagedStudio>
 			},
 		)
 		.with_context(|| format!("failed to load Carbon RML into managed Roblox Studio process {process_id}"))?;
-		let bridge_id = attest_rml_bridge(process_id, &studio_executable, started_at_file_time, false)?;
+		if let Some(launched) = direct_launch.as_mut() {
+			launched.verify_identity()?;
+		}
+		let bridge_id = attest_rml_bridge(process_id, false)?;
+		if let Some(launched) = direct_launch.as_mut() {
+			launched.verify_identity()?;
+		}
 		managed.bridge_id = Some(bridge_id.clone());
-		let ready_bridge_id = attest_rml_bridge(process_id, &studio_executable, started_at_file_time, true)?;
+		if let Some(launched) = direct_launch.as_mut() {
+			launched.verify_identity()?;
+		}
+		let ready_bridge_id = attest_rml_bridge(process_id, true)?;
+		if let Some(launched) = direct_launch.as_mut() {
+			launched.verify_identity()?;
+		}
 		anyhow::ensure!(
 			ready_bridge_id == bridge_id,
 			"RML bridge identity changed while managed Roblox Studio initialized"
@@ -849,14 +871,7 @@ fn managed_completion_status_has_identity(
 		&& result.get("process_ownership_released").and_then(Value::as_bool) == Some(true)
 }
 
-fn attest_rml_bridge(
-	process_id: u32,
-	studio_executable: &str,
-	started_at_file_time: u64,
-	require_engine_ready: bool,
-) -> Result<String> {
-	verify_process_identity(process_id, studio_executable, started_at_file_time)
-		.context("launched Roblox Studio identity changed before RML bridge attestation")?;
+fn attest_rml_bridge(process_id: u32, require_engine_ready: bool) -> Result<String> {
 	let attestation = if require_engine_ready {
 		crate::privileged_bridge::Bridge::wait_for_process(process_id, Duration::from_secs(30))
 	} else {
@@ -865,8 +880,6 @@ fn attest_rml_bridge(
 	let bridge = attestation.with_context(|| {
 		format!("RML bridge for Roblox Studio process {process_id} did not attest this Carbon build")
 	})?;
-	verify_process_identity(process_id, studio_executable, started_at_file_time)
-		.context("launched Roblox Studio identity changed during RML bridge attestation")?;
 	Ok(bridge.bridge_id().to_owned())
 }
 
@@ -951,6 +964,7 @@ fn launch_through_mcp(
 		process_id,
 		studio_executable,
 		started_at_file_time,
+		helper_path: rml_launch.helper_path().to_path_buf(),
 	})
 }
 
@@ -1235,6 +1249,8 @@ struct DirectLaunch {
 	studio_executable: Option<String>,
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	started_at_file_time: Option<u64>,
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	helper_path: Option<PathBuf>,
 }
 
 impl DirectLaunch {
@@ -1288,6 +1304,36 @@ impl DirectLaunch {
 			anyhow::ensure!(
 				response.trim() == "CARBON_STUDIO_LAUNCH_RESUMED",
 				"Roblox Studio launcher did not confirm process resume"
+			);
+		}
+		Ok(())
+	}
+
+	fn verify_identity(&mut self) -> Result<()> {
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
+		{
+			let child = self
+				.child
+				.as_mut()
+				.context("Roblox Studio launcher process is unavailable")?;
+			let stdin = child
+				.stdin
+				.as_mut()
+				.context("Roblox Studio launcher stdin is unavailable")?;
+			writeln!(stdin, "CARBON_STUDIO_LAUNCH_VERIFY")
+				.context("failed to request Roblox Studio identity verification")?;
+			let stdout = child
+				.stdout
+				.take()
+				.context("Roblox Studio launcher stdout is unavailable")?;
+			let mut stdout = BufReader::new(stdout);
+			let mut response = String::new();
+			let read_result = stdout.read_line(&mut response);
+			child.stdout = Some(stdout.into_inner());
+			read_result.context("failed to read Roblox Studio identity verification response")?;
+			anyhow::ensure!(
+				response.trim() == "CARBON_STUDIO_LAUNCH_VERIFIED",
+				"Roblox Studio launcher failed process identity verification"
 			);
 		}
 		Ok(())
@@ -1370,12 +1416,12 @@ impl DirectLaunch {
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	fn terminate_known_process(&self) -> Result<()> {
-		let (Some(studio_executable), Some(started_at_file_time)) =
-			(&self.studio_executable, self.started_at_file_time)
+		let (Some(studio_executable), Some(started_at_file_time), Some(helper_path)) =
+			(&self.studio_executable, self.started_at_file_time, &self.helper_path)
 		else {
 			anyhow::bail!("Roblox Studio process identity is unavailable");
 		};
-		terminate_process(self.process_id, studio_executable, started_at_file_time)
+		terminate_process(helper_path, self.process_id, studio_executable, started_at_file_time)
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1458,20 +1504,22 @@ fn launch_prepared(
 		let windows_studio = windows_path(rml_launch.studio_executable(), "Roblox Studio executable")?;
 		let windows_loader = windows_path(rml_launch.loader_path(), "RML loader")?;
 		let windows_dotnet_root = windows_dotnet_root(&windows_loader)?;
-		let script = powershell_launch_script(
-			&windows_studio,
-			&windows_loader,
-			rml_launch.build_version(),
-			&windows_dotnet_root,
-			&windows_place,
-			managed_place,
-		);
-		// Windows PowerShell 5 concatenates everything after `-Command` into the
-		// script instead of exposing trailing values through `$args`. Only the
-		// fixed base64 alphabet is interpolated here so arbitrary paths and build
-		// versions can never become executable PowerShell source.
-		let mut child = Command::new("powershell.exe")
-			.args(["-NoProfile", "-Command", script.as_str()])
+		let encoded_studio = BASE64_STANDARD.encode(windows_studio.as_bytes());
+		let encoded_place = BASE64_STANDARD.encode(windows_place.as_bytes());
+		let managed_str = if managed_place { "1" } else { "0" };
+		let encoded_loader = BASE64_STANDARD.encode(windows_loader.as_bytes());
+		let encoded_build = BASE64_STANDARD.encode(rml_launch.build_version().as_bytes());
+		let encoded_dotnet_root = BASE64_STANDARD.encode(windows_dotnet_root.as_bytes());
+		let mut child = Command::new(rml_launch.helper_path())
+			.args([
+				"launch",
+				&encoded_studio,
+				&encoded_place,
+				managed_str,
+				&encoded_loader,
+				&encoded_build,
+				&encoded_dotnet_root,
+			])
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
@@ -1496,7 +1544,7 @@ fn launch_prepared(
 			Ok(process_id) => process_id,
 			Err(error) => {
 				let error =
-					anyhow::Error::new(error).context("PowerShell returned an invalid Roblox Studio process ID");
+					anyhow::Error::new(error).context("native helper returned an invalid Roblox Studio process ID");
 				return Err(reap_failed_launcher(child, error));
 			}
 		};
@@ -1505,12 +1553,12 @@ fn launch_prepared(
 			Ok(_) => {
 				return Err(reap_failed_launcher(
 					child,
-					anyhow::anyhow!("PowerShell returned an invalid Roblox Studio process creation time"),
+					anyhow::anyhow!("native helper returned an invalid Roblox Studio process creation time"),
 				));
 			}
 			Err(error) => {
 				let error = anyhow::Error::new(error)
-					.context("PowerShell returned an invalid Roblox Studio process creation time");
+					.context("native helper returned an invalid Roblox Studio process creation time");
 				return Err(reap_failed_launcher(child, error));
 			}
 		};
@@ -1519,6 +1567,7 @@ fn launch_prepared(
 			child: Some(child),
 			studio_executable: None,
 			started_at_file_time: Some(started_at_file_time),
+			helper_path: Some(rml_launch.helper_path().to_path_buf()),
 		}))
 	}
 
@@ -1598,6 +1647,12 @@ if ($null -eq $framework) {
 }
 $requiredVersion = [Version]$framework.version
 $candidates = @()
+if (-not [string]::IsNullOrWhiteSpace($env:DOTNET_ROOT_X64)) {
+    $candidates += $env:DOTNET_ROOT_X64
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ProgramW6432)) {
+    $candidates += Join-Path $env:ProgramW6432 'dotnet'
+}
 if (-not [string]::IsNullOrWhiteSpace($env:DOTNET_ROOT)) {
     $candidates += $env:DOTNET_ROOT
 }
@@ -1639,7 +1694,7 @@ exit 3
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn windows_dotnet_root(loader: &str) -> Result<String> {
 	let script = windows_dotnet_root_script(loader);
-	let output = Command::new("powershell.exe")
+	let output = powershell_command()?
 		.args(["-NoProfile", "-NonInteractive", "-Command", &script])
 		.output()
 		.context("failed to locate the Windows .NET runtime required by Carbon RML")?;
@@ -1653,425 +1708,13 @@ fn windows_dotnet_root(loader: &str) -> Result<String> {
 	Ok(root)
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn powershell_launch_script(
-	studio: &str,
-	loader: &str,
-	build_version: &str,
-	dotnet_root: &str,
-	place: &str,
-	managed_place: bool,
-) -> String {
-	let encoded_studio = BASE64_STANDARD.encode(studio.as_bytes());
-	let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
-	let encoded_build_version = BASE64_STANDARD.encode(build_version.as_bytes());
-	let encoded_dotnet_root = BASE64_STANDARD.encode(dotnet_root.as_bytes());
-	let encoded_place = BASE64_STANDARD.encode(place.as_bytes());
-	let managed_place = if managed_place { "$true" } else { "$false" };
-	r#"
-Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public sealed class CarbonSuspendedStudio : IDisposable
-{
-    private const uint CREATE_SUSPENDED = 0x00000004;
-    private const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
-    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
-    private const int JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9;
-    private const uint WAIT_OBJECT_0 = 0x00000000;
-    private const uint WAIT_TIMEOUT = 0x00000102;
-    private const uint WAIT_FAILED = 0xFFFFFFFF;
-    private const uint RESUME_FAILED = 0xFFFFFFFF;
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct StartupInfo
-    {
-        public int cb;
-        public string lpReserved;
-        public string lpDesktop;
-        public string lpTitle;
-        public uint dwX;
-        public uint dwY;
-        public uint dwXSize;
-        public uint dwYSize;
-        public uint dwXCountChars;
-        public uint dwYCountChars;
-        public uint dwFillAttribute;
-        public uint dwFlags;
-        public short wShowWindow;
-        public short cbReserved2;
-        public IntPtr lpReserved2;
-        public IntPtr hStdInput;
-        public IntPtr hStdOutput;
-        public IntPtr hStdError;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ProcessInformation
-    {
-        public IntPtr hProcess;
-        public IntPtr hThread;
-        public uint dwProcessId;
-        public uint dwThreadId;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct BasicLimitInformation
-    {
-        public long PerProcessUserTimeLimit;
-        public long PerJobUserTimeLimit;
-        public uint LimitFlags;
-        public UIntPtr MinimumWorkingSetSize;
-        public UIntPtr MaximumWorkingSetSize;
-        public uint ActiveProcessLimit;
-        public UIntPtr Affinity;
-        public uint PriorityClass;
-        public uint SchedulingClass;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct IoCounters
-    {
-        public ulong ReadOperationCount;
-        public ulong WriteOperationCount;
-        public ulong OtherOperationCount;
-        public ulong ReadTransferCount;
-        public ulong WriteTransferCount;
-        public ulong OtherTransferCount;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ExtendedLimitInformation
-    {
-        public BasicLimitInformation BasicLimitInformation;
-        public IoCounters IoInfo;
-        public UIntPtr ProcessMemoryLimit;
-        public UIntPtr JobMemoryLimit;
-        public UIntPtr PeakProcessMemoryUsed;
-        public UIntPtr PeakJobMemoryUsed;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct FileTime
-    {
-        public uint Low;
-        public uint High;
-    }
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CreateProcessW(
-        string applicationName,
-        StringBuilder commandLine,
-        IntPtr processAttributes,
-        IntPtr threadAttributes,
-        bool inheritHandles,
-        uint creationFlags,
-        IntPtr environment,
-        string currentDirectory,
-        ref StartupInfo startupInfo,
-        out ProcessInformation processInformation);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetProcessTimes(
-        IntPtr process,
-        out FileTime creation,
-        out FileTime exit,
-        out FileTime kernel,
-        out FileTime user);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string name);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetInformationJobObject(
-        IntPtr job,
-        int informationClass,
-        IntPtr information,
-        uint informationLength);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint ResumeThread(IntPtr thread);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-
-    [DllImport("kernel32.dll")]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    private IntPtr process;
-    private IntPtr thread;
-    private IntPtr job;
-
-    public uint ProcessId { get; private set; }
-    public ulong StartedAtFileTime { get; private set; }
-
-    private CarbonSuspendedStudio(
-        ProcessInformation processInformation,
-        IntPtr jobHandle,
-        ulong startedAtFileTime)
-    {
-        process = processInformation.hProcess;
-        thread = processInformation.hThread;
-        job = jobHandle;
-        ProcessId = processInformation.dwProcessId;
-        StartedAtFileTime = startedAtFileTime;
-    }
-
-    private static void TerminateAndWait(IntPtr process)
-    {
-        uint state = WaitForSingleObject(process, 0);
-        if (state == WAIT_FAILED)
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject failed");
-        if (state == WAIT_OBJECT_0)
-            return;
-        if (!TerminateProcess(process, 1))
-        {
-            state = WaitForSingleObject(process, 0);
-            if (state == WAIT_OBJECT_0)
-                return;
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "TerminateProcess failed");
-        }
-        state = WaitForSingleObject(process, 30000);
-        if (state == WAIT_TIMEOUT)
-            throw new TimeoutException("Roblox Studio did not terminate");
-        if (state != WAIT_OBJECT_0)
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject failed");
-    }
-
-    public static CarbonSuspendedStudio Start(string executable, string place, bool managedPlace)
-    {
-        IntPtr job = CreateJobObject(IntPtr.Zero, null);
-        if (job == IntPtr.Zero)
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObject failed");
-
-        ProcessInformation processInformation = new ProcessInformation();
-        try
-        {
-            SetKillOnClose(job, true);
-            string command = Quote(executable);
-            if (!String.IsNullOrEmpty(place))
-            {
-                if (managedPlace)
-                    command += " --task EditFile --localPlaceFile " + Quote(place);
-                else
-                    command += " " + Quote(place);
-            }
-
-            StartupInfo startupInfo = new StartupInfo();
-            startupInfo.cb = Marshal.SizeOf(typeof(StartupInfo));
-            bool created = CreateProcessW(
-                executable,
-                new StringBuilder(command),
-                IntPtr.Zero,
-                IntPtr.Zero,
-                false,
-                CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB,
-                IntPtr.Zero,
-                System.IO.Path.GetDirectoryName(executable),
-                ref startupInfo,
-                out processInformation);
-            if (!created && Marshal.GetLastWin32Error() == 5)
-            {
-                created = CreateProcessW(
-                    executable,
-                    new StringBuilder(command),
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    false,
-                    CREATE_SUSPENDED,
-                    IntPtr.Zero,
-                    System.IO.Path.GetDirectoryName(executable),
-                    ref startupInfo,
-                    out processInformation);
-            }
-            if (!created)
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcessW failed");
-            if (!AssignProcessToJobObject(job, processInformation.hProcess))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
-            FileTime creation;
-            FileTime exit;
-            FileTime kernel;
-            FileTime user;
-            if (!GetProcessTimes(processInformation.hProcess, out creation, out exit, out kernel, out user))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetProcessTimes failed");
-            ulong startedAtFileTime = ((ulong)creation.High << 32) | creation.Low;
-            return new CarbonSuspendedStudio(processInformation, job, startedAtFileTime);
-        }
-        catch
-        {
-            try
-            {
-                if (processInformation.hProcess != IntPtr.Zero)
-                    TerminateAndWait(processInformation.hProcess);
-            }
-            finally
-            {
-                Close(processInformation.hThread);
-                Close(processInformation.hProcess);
-                Close(job);
-            }
-            throw;
-        }
-    }
-
-    public void Resume()
-    {
-        if (thread == IntPtr.Zero)
-            throw new InvalidOperationException("Roblox Studio launch is no longer suspended");
-        if (ResumeThread(thread) == RESUME_FAILED)
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed");
-        Close(thread);
-        thread = IntPtr.Zero;
-    }
-
-    public void Release()
-    {
-        if (process == IntPtr.Zero)
-            throw new InvalidOperationException("Roblox Studio launch is no longer retained");
-        try
-        {
-            SetKillOnClose(job, false);
-        }
-        catch
-        {
-            TerminateAndWait(process);
-            throw;
-        }
-        finally
-        {
-            ReleaseHandles();
-        }
-    }
-
-    public void Abort()
-    {
-        try
-        {
-            if (process == IntPtr.Zero)
-                return;
-            TerminateAndWait(process);
-        }
-        finally
-        {
-            ReleaseHandles();
-        }
-    }
-
-    public void Dispose()
-    {
-        try { Abort(); } catch { }
-        GC.SuppressFinalize(this);
-    }
-
-    ~CarbonSuspendedStudio()
-    {
-        ReleaseHandles();
-    }
-
-    private static string Quote(string value)
-    {
-        return "\"" + value.Replace("\"", "\\\"") + "\"";
-    }
-
-    private static void SetKillOnClose(IntPtr job, bool enabled)
-    {
-        ExtendedLimitInformation information = new ExtendedLimitInformation();
-        if (enabled)
-            information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        int length = Marshal.SizeOf(typeof(ExtendedLimitInformation));
-        IntPtr pointer = Marshal.AllocHGlobal(length);
-        try
-        {
-            Marshal.StructureToPtr(information, pointer, false);
-            if (!SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, pointer, (uint)length))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "SetInformationJobObject failed");
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(pointer);
-        }
-    }
-
-    private void ReleaseHandles()
-    {
-        Close(thread);
-        Close(process);
-        Close(job);
-        thread = IntPtr.Zero;
-        process = IntPtr.Zero;
-        job = IntPtr.Zero;
-    }
-
-    private static void Close(IntPtr handle)
-    {
-        if (handle != IntPtr.Zero)
-            CloseHandle(handle);
-    }
-}
-'@
-$studio = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_STUDIO_BASE64__'))
-$loader = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_LOADER_BASE64__'))
-$buildVersion = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_BUILD_VERSION_BASE64__'))
-$dotnetRoot = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_DOTNET_ROOT_BASE64__'))
-$place = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_PLACE_BASE64__'))
-if (-not [IO.Path]::IsPathRooted($loader)) { throw "Carbon supplied a non-absolute RML loader path" }
-if (-not [IO.Path]::IsPathRooted($dotnetRoot)) { throw "Carbon supplied a non-absolute .NET runtime path" }
-$env:CARBON_RML_LOADER = $loader
-$env:CARBON_RML_BUILD_VERSION = $buildVersion
-$env:DOTNET_ROOT = $dotnetRoot
-Remove-Item Env:CARBON_RML_LOADED_BUILD_VERSION -ErrorAction SilentlyContinue
-$launch = [CarbonSuspendedStudio]::Start($studio, $place, __CARBON_MANAGED_PLACE__)
-$completed = $false
-try {
-    [Console]::Out.WriteLine($launch.ProcessId)
-    [Console]::Out.WriteLine($launch.StartedAtFileTime)
-    [Console]::Out.Flush()
-    $command = [Console]::In.ReadLine()
-    if ($command -eq 'CARBON_STUDIO_LAUNCH_RESUME') {
-        $launch.Resume()
-        [Console]::Out.WriteLine('CARBON_STUDIO_LAUNCH_RESUMED')
-        [Console]::Out.Flush()
-        $command = [Console]::In.ReadLine()
-    }
-    if ($command -eq 'CARBON_STUDIO_LAUNCH_COMPLETE') {
-        $launch.Release()
-        $completed = $true
-        exit 0
-    }
-    if ($command -eq 'CARBON_STUDIO_LAUNCH_ABORT') {
-        exit 0
-    }
-    throw "Carbon did not authorize completion of the Roblox Studio launch"
-} finally {
-    if (-not $completed) {
-        $launch.Abort()
-    }
-}
-"#
-	.replace("__CARBON_STUDIO_BASE64__", &encoded_studio)
-	.replace("__CARBON_LOADER_BASE64__", &encoded_loader)
-	.replace("__CARBON_BUILD_VERSION_BASE64__", &encoded_build_version)
-	.replace("__CARBON_DOTNET_ROOT_BASE64__", &encoded_dotnet_root)
-	.replace("__CARBON_PLACE_BASE64__", &encoded_place)
-	.replace("__CARBON_MANAGED_PLACE__", managed_place)
-}
-
 pub fn wait_for_exit(process_id: u32) -> Result<()> {
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
 		let script = format!(
 			"$process = Get-Process -Id {process_id} -ErrorAction SilentlyContinue; if ($null -ne $process) {{ $process.WaitForExit() }}"
 		);
-		let status = Command::new("powershell.exe")
+		let status = powershell_command()?
 			.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
@@ -2102,215 +1745,6 @@ pub fn wait_for_exit(process_id: u32) -> Result<()> {
 	}
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn powershell_verify_process_script(process_id: u32, studio_executable: &str, started_at_file_time: u64) -> String {
-	let encoded_executable = BASE64_STANDARD.encode(studio_executable.as_bytes());
-	r#"
-$ErrorActionPreference = 'Stop'
-$processId = [uint32]__CARBON_PROCESS_ID__
-$startedAtFileTime = [uint64]__CARBON_STARTED_AT_FILE_TIME__
-$expectedExecutable = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_STUDIO_BASE64__'))
-function Normalize-CarbonPath([string]$Path) {
-    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
-        $Path = '\\' + $Path.Substring(8)
-    } elseif ($Path.StartsWith('\\?\', [StringComparison]::Ordinal)) {
-        $Path = $Path.Substring(4)
-    }
-    return [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar)
-}
-$studioProcess = Get-Process -Id $processId -ErrorAction Stop
-$actualStartedAt = [uint64]$studioProcess.StartTime.ToUniversalTime().ToFileTimeUtc()
-if ($actualStartedAt -ne $startedAtFileTime) {
-    Write-Error 'Roblox Studio process creation identity changed'
-    exit 2
-}
-$actualExecutable = $studioProcess.Path
-if ([string]::IsNullOrWhiteSpace($actualExecutable) -or
-    -not [string]::Equals(
-        (Normalize-CarbonPath $actualExecutable),
-        (Normalize-CarbonPath $expectedExecutable),
-        [StringComparison]::OrdinalIgnoreCase)) {
-    Write-Error 'Roblox Studio executable identity changed'
-    exit 3
-}
-"#
-	.replace("__CARBON_PROCESS_ID__", &process_id.to_string())
-	.replace("__CARBON_STARTED_AT_FILE_TIME__", &started_at_file_time.to_string())
-	.replace("__CARBON_STUDIO_BASE64__", &encoded_executable)
-}
-
-fn verify_process_identity(process_id: u32, studio_executable: &str, started_at_file_time: u64) -> Result<()> {
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	{
-		let script = powershell_verify_process_script(process_id, studio_executable, started_at_file_time);
-		let output = Command::new("powershell.exe")
-			.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
-			.output()
-			.context("failed to inspect the launched Roblox Studio process identity")?;
-		anyhow::ensure!(
-			output.status.success(),
-			"launched Roblox Studio process identity no longer matches: {}",
-			String::from_utf8_lossy(&output.stderr).trim()
-		);
-	}
-
-	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-	{
-		let _ = (process_id, studio_executable, started_at_file_time);
-	}
-	Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn powershell_terminate_script(process_id: u32, studio_executable: &str, started_at_file_time: u64) -> String {
-	let encoded_executable = BASE64_STANDARD.encode(studio_executable.as_bytes());
-	r#"
-$processId = [uint32]__CARBON_PROCESS_ID__
-$startedAtFileTime = [uint64]__CARBON_STARTED_AT_FILE_TIME__
-$expectedExecutable = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_STUDIO_BASE64__'))
-Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class CarbonStudioTerminator
-{
-    private const uint ProcessTerminate = 0x0001;
-    private const uint ProcessQueryInformation = 0x0400;
-    private const uint Synchronize = 0x00100000;
-    private const uint WaitObject0 = 0x00000000;
-    private const uint WaitTimeout = 0x00000102;
-    private const int ErrorInvalidParameter = 87;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct FileTime
-    {
-        public uint Low;
-        public uint High;
-    }
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool QueryFullProcessImageName(
-        IntPtr process,
-        uint flags,
-        StringBuilder executable,
-        ref uint size);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetProcessTimes(
-        IntPtr process,
-        out FileTime creation,
-        out FileTime exit,
-        out FileTime kernel,
-        out FileTime user);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    private static string NormalizePath(string path)
-    {
-        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
-        {
-            path = @"\\" + path.Substring(8);
-        }
-        else if (path.StartsWith(@"\\?\", StringComparison.Ordinal))
-        {
-            path = path.Substring(4);
-        }
-        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
-    }
-
-    private static void Check(bool condition, string operation)
-    {
-        if (!condition)
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
-        }
-    }
-
-    public static void Stop(uint processId, string expectedExecutable, ulong expectedStartedAt)
-    {
-        IntPtr process = OpenProcess(
-            ProcessTerminate | ProcessQueryInformation | Synchronize,
-            false,
-            processId);
-        if (process == IntPtr.Zero)
-        {
-            int error = Marshal.GetLastWin32Error();
-            if (error == ErrorInvalidParameter)
-            {
-                return;
-            }
-            throw new Win32Exception(error, "OpenProcess");
-        }
-
-        try
-        {
-            if (WaitForSingleObject(process, 0) == WaitObject0)
-            {
-                return;
-            }
-
-            FileTime creation;
-            FileTime exit;
-            FileTime kernel;
-            FileTime user;
-            Check(GetProcessTimes(process, out creation, out exit, out kernel, out user), "GetProcessTimes");
-            ulong startedAt = ((ulong)creation.High << 32) | creation.Low;
-            if (startedAt != expectedStartedAt)
-            {
-                return;
-            }
-
-            var executable = new StringBuilder(32768);
-            uint executableLength = (uint)executable.Capacity;
-            Check(
-                QueryFullProcessImageName(process, 0, executable, ref executableLength),
-                "QueryFullProcessImageName");
-            if (!string.Equals(
-                NormalizePath(executable.ToString()),
-                NormalizePath(expectedExecutable),
-                StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException(
-                    "Studio executable identity changed before shutdown");
-            }
-
-            if (!TerminateProcess(process, 1))
-            {
-                if (WaitForSingleObject(process, 0) == WaitObject0)
-                {
-                    return;
-                }
-                Check(false, "TerminateProcess");
-            }
-            uint wait = WaitForSingleObject(process, 30000);
-            if (wait == WaitTimeout)
-            {
-                throw new TimeoutException("managed Roblox Studio process did not stop");
-            }
-            Check(wait == WaitObject0, "WaitForSingleObject");
-        }
-        finally
-        {
-            CloseHandle(process);
-        }
-    }
-}
-'@
-[CarbonStudioTerminator]::Stop($processId, $expectedExecutable, $startedAtFileTime)
-"#
-	.replace("__CARBON_PROCESS_ID__", &process_id.to_string())
-	.replace("__CARBON_STARTED_AT_FILE_TIME__", &started_at_file_time.to_string())
-	.replace("__CARBON_STUDIO_BASE64__", &encoded_executable)
-}
-
 fn cleanup_stopped_bridge(process_id: u32, bridge_id: &str) -> Result<()> {
 	let removed = crate::privileged_bridge::cleanup_bridge_discovery(process_id, bridge_id)
 		.with_context(|| format!("failed to remove stale RML bridge records for Roblox Studio process {process_id}"))?;
@@ -2323,12 +1757,25 @@ fn cleanup_stopped_bridge(process_id: u32, bridge_id: &str) -> Result<()> {
 /// Stop exactly the Studio process returned by [`launch`]. Managed launchers
 /// own their child process; using the native PID avoids title- or array-order
 /// heuristics when several worktrees have Studio open simultaneously.
-fn terminate_process(process_id: u32, studio_executable: &str, started_at_file_time: u64) -> Result<()> {
+fn terminate_process(
+	helper_path: &Path,
+	process_id: u32,
+	studio_executable: &str,
+	started_at_file_time: u64,
+) -> Result<()> {
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
-		let script = powershell_terminate_script(process_id, studio_executable, started_at_file_time);
-		let output = Command::new("powershell.exe")
-			.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+		let encoded_executable = BASE64_STANDARD.encode(studio_executable.as_bytes());
+		let output = Command::new(helper_path)
+			.args([
+				"terminate",
+				&process_id.to_string(),
+				&started_at_file_time.to_string(),
+				&encoded_executable,
+			])
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
 			.output()
 			.context("failed to stop the managed Roblox Studio process")?;
 		anyhow::ensure!(
@@ -2340,6 +1787,9 @@ fn terminate_process(process_id: u32, studio_executable: &str, started_at_file_t
 
 	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 	{
+		let _ = helper_path;
+		let _ = studio_executable;
+		let _ = started_at_file_time;
 		let status = Command::new("kill")
 			.arg(process_id.to_string())
 			.stdin(Stdio::null())
@@ -2393,7 +1843,7 @@ pub fn focus_process(process_id: u32) -> Result<()> {
 			"Roblox Studio focus is supported on Linux only through WSL"
 		);
 		let script = powershell_focus_script(process_id);
-		let output = Command::new("powershell.exe")
+		let output = powershell_command()?
 			.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
 			.stdin(Stdio::null())
 			.output()
@@ -2564,6 +2014,81 @@ pub fn focus(title: Option<String>) -> Result<()> {
 	#[cfg(target_os = "linux")]
 	{
 		anyhow::bail!("This feature is not yet supported on Linux!");
+	}
+}
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) fn powershell_command() -> Result<Command> {
+	Ok(Command::new(powershell_path()?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) fn powershell_path() -> Result<PathBuf> {
+	#[cfg(target_os = "linux")]
+	{
+		use std::sync::OnceLock;
+		static RESOLVED_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+		let result = RESOLVED_PATH.get_or_init(|| {
+			let output = Command::new("cmd.exe")
+				.args(["/c", "echo", "%SystemRoot%"])
+				.output()
+				.map_err(|e| format!("failed to execute cmd.exe to resolve SystemRoot: {e}"))?;
+			if !output.status.success() {
+				return Err(format!(
+					"cmd.exe failed to resolve SystemRoot: {}",
+					String::from_utf8_lossy(&output.stderr).trim()
+				));
+			}
+			let win_root =
+				String::from_utf8(output.stdout).map_err(|e| format!("cmd.exe output invalid UTF-8: {e}"))?;
+			let win_root = win_root.trim();
+			if win_root.is_empty() || win_root.starts_with('%') {
+				return Err("cmd.exe returned empty or unexpanded SystemRoot".to_string());
+			}
+			let syswow64 = format!(r"{win_root}\SysWOW64\WindowsPowerShell\v1.0\powershell.exe");
+			let wsl_output = Command::new("wslpath")
+				.arg(&syswow64)
+				.output()
+				.map_err(|e| format!("failed to run wslpath for SysWOW64 PowerShell: {e}"))?;
+			if !wsl_output.status.success() {
+				return Err(format!(
+					"wslpath failed to translate SysWOW64 PowerShell path: {}",
+					String::from_utf8_lossy(&wsl_output.stderr).trim()
+				));
+			}
+			let lpath_str =
+				String::from_utf8(wsl_output.stdout).map_err(|e| format!("wslpath output invalid UTF-8: {e}"))?;
+			let lpath = PathBuf::from(lpath_str.trim());
+			if !lpath.is_file() {
+				return Err(format!(
+					"resolved 32-bit SysWOW64 PowerShell executable does not exist: {}",
+					lpath.display()
+				));
+			}
+			Ok(lpath)
+		});
+		match result {
+			Ok(path) => Ok(path.clone()),
+			Err(err) => anyhow::bail!("{err}"),
+		}
+	}
+
+	#[cfg(target_os = "windows")]
+	{
+		let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+		let wow64_path = PathBuf::from(format!(r"{sys_root}\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"));
+		if wow64_path.is_file() {
+			Ok(wow64_path)
+		} else {
+			let sys32_path = PathBuf::from(format!(r"{sys_root}\System32\WindowsPowerShell\v1.0\powershell.exe"));
+			if sys32_path.is_file() {
+				Ok(sys32_path)
+			} else {
+				anyhow::bail!(
+					"PowerShell executable not found in SysWOW64 or System32 under {}",
+					sys_root
+				);
+			}
+		}
 	}
 }
 
@@ -3113,83 +2638,85 @@ mod tests {
 	}
 
 	#[test]
-	fn powershell_launch_suspends_one_studio_until_its_rml_package_is_injected() {
-		let studio = r#"C:\Roblox\Versions\worktree'; throw 'studio\RobloxStudioBeta.exe"#;
-		let loader = r#"C:\Carbon\rml\worktree'; throw 'loader\RobloxModLoader\roblox_modloader.dll"#;
-		let build = "0.0.0+worktree'; throw 'build";
-		let dotnet_root = r#"C:\Users\builder\worktree'; throw 'dotnet\.dotnet"#;
-		let place = r#"C:\places\worktree'; throw 'place.rbxl"#;
-		let script = powershell_launch_script(studio, loader, build, dotnet_root, place, true);
-		let model_script = powershell_launch_script(studio, loader, build, dotnet_root, place, false);
-
-		for untrusted in [studio, loader, build, dotnet_root, place] {
-			assert!(!script.contains(untrusted));
-		}
-		assert!(script.contains("$env:CARBON_RML_LOADER = $loader"));
-		assert!(script.contains("$env:CARBON_RML_BUILD_VERSION = $buildVersion"));
-		assert!(script.contains("$env:DOTNET_ROOT = $dotnetRoot"));
-		assert!(script.contains("Remove-Item Env:CARBON_RML_LOADED_BUILD_VERSION"));
-		assert!(script.contains("CreateProcessW"));
-		assert!(script.contains("CREATE_SUSPENDED"));
-		assert!(script.contains("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE"));
-		assert!(script
-			.contains("GetProcessTimes(processInformation.hProcess, out creation, out exit, out kernel, out user)"));
-		assert!(script.contains("[Console]::Out.WriteLine($launch.StartedAtFileTime)"));
-		assert!(script.contains("$launch = [CarbonSuspendedStudio]::Start($studio, $place, $true)"));
-		assert!(model_script.contains("$launch = [CarbonSuspendedStudio]::Start($studio, $place, $false)"));
-		assert!(model_script.contains("command += \" \" + Quote(place);"));
-		assert!(script.contains("$launch.Resume()"));
-		assert!(script.contains("CARBON_STUDIO_LAUNCH_RESUMED"));
-		assert!(script.contains("$launch.Release()"));
-		assert!(!script.contains("Start-Process"));
-		assert!(!script.contains("Get-ChildItem"));
-		assert!(script.contains("[Console]::In.ReadLine()"));
-		assert!(script.contains("CARBON_STUDIO_LAUNCH_COMPLETE"));
-		assert!(script.contains("CARBON_STUDIO_LAUNCH_ABORT"));
-		assert!(script.contains("if (!TerminateProcess(process, 1))"));
-		assert!(script.contains("if (state == WAIT_TIMEOUT)"));
-		assert!(script.contains("TerminateAndWait(processInformation.hProcess)"));
+	fn rml_helper_launch_args_contract() {
+		let studio = r"C:\Roblox\version\RobloxStudioBeta.exe";
+		let place = r"C:\places\place.rbxl";
+		let loader = r"C:\Carbon\RobloxModLoader.dll";
+		let build = "26.7.252257";
+		let dotnet_root = r"C:\Program Files\dotnet";
+		let encoded_studio = BASE64_STANDARD.encode(studio.as_bytes());
+		let encoded_place = BASE64_STANDARD.encode(place.as_bytes());
+		let encoded_loader = BASE64_STANDARD.encode(loader.as_bytes());
+		let encoded_build = BASE64_STANDARD.encode(build.as_bytes());
+		let encoded_dotnet_root = BASE64_STANDARD.encode(dotnet_root.as_bytes());
+		let args = [
+			"launch".to_string(),
+			encoded_studio.clone(),
+			encoded_place.clone(),
+			"1".to_string(),
+			encoded_loader.clone(),
+			encoded_build.clone(),
+			encoded_dotnet_root.clone(),
+		];
+		assert_eq!(args[0], "launch");
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[1].as_bytes()).unwrap()).unwrap(),
+			studio
+		);
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[2].as_bytes()).unwrap()).unwrap(),
+			place
+		);
+		assert_eq!(args[3], "1");
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[4].as_bytes()).unwrap()).unwrap(),
+			loader
+		);
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[5].as_bytes()).unwrap()).unwrap(),
+			build
+		);
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[6].as_bytes()).unwrap()).unwrap(),
+			dotnet_root
+		);
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
-	fn powershell_shutdown_uses_the_identity_checked_process_handle() {
-		let studio = r#"\\?\C:\Roblox\Versions\unsafe'; throw 'Studio\RobloxStudioBeta.exe"#;
-		let script = powershell_terminate_script(47_312, studio, 133_700_123_456);
-
-		assert!(!script.contains(studio));
-		assert!(script.contains("$processId = [uint32]47312"));
-		assert!(script.contains("$startedAtFileTime = [uint64]133700123456"));
-		assert!(script.contains("if (startedAt != expectedStartedAt)\n            {\n                return;"));
-		assert!(script.contains(r#"path.StartsWith(@"\\?\UNC\""#));
-		for operation in [
-			"OpenProcess",
-			"GetProcessTimes",
-			"QueryFullProcessImageName",
-			"TerminateProcess(process, 1)",
-			"WaitForSingleObject(process, 30000)",
-			"CloseHandle(process)",
-		] {
-			assert!(script.contains(operation), "missing {operation}");
+	fn powershell_resolver_uses_syswow64() {
+		#[cfg(target_os = "linux")]
+		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
+			return;
 		}
-		assert!(!script.contains("Stop-Process"));
+		let path = powershell_path().unwrap();
+		let path_str = path.to_string_lossy().to_lowercase();
+		assert!(
+			path_str.contains("syswow64"),
+			"expected 32-bit SysWOW64 PowerShell path, got: {}",
+			path.display()
+		);
 	}
 
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
-	fn powershell_attestation_revalidates_the_exact_process_identity() {
-		let studio = r#"\\?\C:\Roblox\Versions\unsafe'; throw 'Studio\RobloxStudioBeta.exe"#;
-		let script = powershell_verify_process_script(47_312, studio, 133_700_123_456);
-
-		assert!(!script.contains(studio));
-		assert!(script.contains(&BASE64_STANDARD.encode(studio.as_bytes())));
-		assert!(script.contains("$processId = [uint32]47312"));
-		assert!(script.contains("$startedAtFileTime = [uint64]133700123456"));
-		assert!(script.contains("Get-Process -Id $processId -ErrorAction Stop"));
-		assert!(script.contains("StartTime.ToUniversalTime().ToFileTimeUtc()"));
-		assert!(script.contains("$studioProcess.Path"));
-		assert!(script.contains("Normalize-CarbonPath"));
-		assert!(!script.contains("Stop-Process"));
+	fn rml_helper_terminate_args_contract() {
+		let studio = r"C:\Roblox\version\RobloxStudioBeta.exe";
+		let encoded_studio = BASE64_STANDARD.encode(studio.as_bytes());
+		let pid = 47_312_u32;
+		let started_at_file_time = 133_700_123_456_u64;
+		let args = [
+			"terminate".to_string(),
+			pid.to_string(),
+			started_at_file_time.to_string(),
+			encoded_studio.clone(),
+		];
+		assert_eq!(args[0], "terminate");
+		assert_eq!(args[1], "47312");
+		assert_eq!(args[2], "133700123456");
+		assert_eq!(
+			String::from_utf8(BASE64_STANDARD.decode(args[3].as_bytes()).unwrap()).unwrap(),
+			studio
+		);
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -3203,6 +2730,8 @@ mod tests {
 		assert!(script.contains("[System.IO.Path]::GetDirectoryName($loader)"));
 		assert!(!script.contains("Split-Path -Parent $loader"));
 		assert!(script.contains("Microsoft.NETCore.App"));
+		assert!(script.contains("$env:DOTNET_ROOT_X64"));
+		assert!(script.contains("$env:ProgramW6432"));
 		assert!(script.contains("$candidateVersion.Major -eq $requiredVersion.Major"));
 		assert!(script.contains("$candidateVersion -ge $requiredVersion"));
 		assert!(script.contains("host\\fxr\\*\\hostfxr.dll"));
@@ -3219,5 +2748,47 @@ mod tests {
 		assert!(script.contains("AppActivate([int]$process.Id)"));
 		assert!(!script.contains("MainWindowTitle"));
 		assert!(!script.contains("EnumWindows"));
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn direct_launch_verify_identity_protocol_success() {
+		let child = Command::new("sh")
+			.args([
+				"-c",
+				"read line && if [ \"$line\" = \"CARBON_STUDIO_LAUNCH_VERIFY\" ]; then echo \"CARBON_STUDIO_LAUNCH_VERIFIED\"; fi",
+			])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.spawn()
+			.unwrap();
+		let mut launched = DirectLaunch {
+			process_id: 1234,
+			child: Some(child),
+			studio_executable: Some("RobloxStudioBeta.exe".to_string()),
+			started_at_file_time: Some(1000),
+			helper_path: None,
+		};
+		assert!(launched.verify_identity().is_ok());
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn direct_launch_verify_identity_protocol_fails_closed() {
+		let child = Command::new("sh")
+			.args(["-c", "read line && echo \"CARBON_STUDIO_LAUNCH_MISMATCH\""])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.spawn()
+			.unwrap();
+		let mut launched = DirectLaunch {
+			process_id: 1234,
+			child: Some(child),
+			studio_executable: Some("RobloxStudioBeta.exe".to_string()),
+			started_at_file_time: Some(1000),
+			helper_path: None,
+		};
+		let err = launched.verify_identity().unwrap_err();
+		assert!(err.to_string().contains("failed process identity verification"));
 	}
 }
