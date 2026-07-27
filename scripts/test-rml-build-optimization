@@ -62,8 +62,8 @@ if ! grep -Fq -- 'paths_equal' "$HELPER_SOURCE"; then
 	failure=1
 fi
 
-if ! grep -Fq -- 'keybd_event(VK_MENU' "$HELPER_SOURCE"; then
-	echo "FAIL: Carbon studio helper focus does not handle synthetic Alt input retry" >&2
+if ! grep -Fq -- 'AttachThreadInput' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus does not attach foreground input queues" >&2
 	failure=1
 fi
 
