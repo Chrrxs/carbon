@@ -1815,15 +1815,29 @@ public static class CarbonStudioWindow {
     public static extern bool ShowWindowAsync(IntPtr window, int command);
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
 }
 '@
 [CarbonStudioWindow]::ShowWindowAsync($window, 9) | Out-Null
 $focused = [CarbonStudioWindow]::SetForegroundWindow($window)
-if (-not $focused) {
+if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
     $shell = New-Object -ComObject WScript.Shell
     $focused = $shell.AppActivate([int]$process.Id)
 }
-if (-not $focused) { throw "Windows denied foreground activation for Roblox Studio process __CARBON_STUDIO_PID__" }
+if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
+    [CarbonStudioWindow]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    try {
+        [CarbonStudioWindow]::SetForegroundWindow($window) | Out-Null
+    } finally {
+        [CarbonStudioWindow]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    }
+}
+if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
+    throw "Windows denied foreground activation for Roblox Studio process __CARBON_STUDIO_PID__"
+}
 "#
 	.replace("__CARBON_STUDIO_PID__", &process_id.to_string())
 }
@@ -2755,6 +2769,12 @@ mod tests {
 		assert!(script.contains("$process.MainWindowHandle"));
 		assert!(script.contains("SetForegroundWindow($window)"));
 		assert!(script.contains("AppActivate([int]$process.Id)"));
+		assert!(script.contains("GetForegroundWindow()"));
+		assert!(!script.contains("SetWindowPos"));
+		assert!(script.contains("keybd_event(0x12, 0, 0, [UIntPtr]::Zero)"));
+		assert!(script.contains("keybd_event(0x12, 0, 2, [UIntPtr]::Zero)"));
+		assert!(!script.contains("SwitchToThisWindow"));
+		assert!(script.contains("GetForegroundWindow() -ne $window"));
 		assert!(!script.contains("MainWindowTitle"));
 		assert!(!script.contains("EnumWindows"));
 	}
