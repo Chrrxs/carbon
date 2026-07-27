@@ -135,7 +135,7 @@ grep -Fq '## Architectural differences from Rojo' "${REPO}/README.md" ||
 	fail "README.md must identify the architectural differences from Rojo"
 grep -Fq '### Use narrow mappings' "${REPO}/README.md" ||
 	fail "README.md must recommend narrow mappings"
-grep -Fq 'cannot retain a new Studio-owned instance in that service.' "${REPO}/README.md" ||
+grep -Fq 'cannot retain a new Studio-owned instance in that service.' <<<"$(tr '\n' ' ' < "${REPO}/README.md")" ||
 	fail "README.md must explain the full-service mapping limitation"
 grep -Fq '### Do not mix source domains below a mapping' "${REPO}/README.md" ||
 	fail "README.md must prohibit mixed source domains below a mapping"
