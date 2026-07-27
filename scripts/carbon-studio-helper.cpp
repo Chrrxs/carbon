@@ -831,7 +831,9 @@ static int cmd_focus(
 
     HWND target_hwnd = ctx.candidates.front().hwnd;
 
-    ShowWindowAsync(target_hwnd, SW_RESTORE);
+    if (IsIconic(target_hwnd)) {
+        ShowWindowAsync(target_hwnd, SW_RESTORE);
+    }
     SetForegroundWindow(target_hwnd);
 
     if (GetForegroundWindow() != target_hwnd) {

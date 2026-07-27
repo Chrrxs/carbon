@@ -72,6 +72,11 @@ if ! grep -Fq -- 'GetForegroundWindow' "$HELPER_SOURCE"; then
 	failure=1
 fi
 
+if ! grep -Fq -- 'if (IsIconic(target_hwnd))' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper must only restore minimized Studio windows" >&2
+	failure=1
+fi
+
 if ((failure != 0)); then
 	exit "$failure"
 fi

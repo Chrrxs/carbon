@@ -1856,6 +1856,8 @@ public static class CarbonStudioWindow {
     [DllImport("user32.dll")]
     public static extern bool ShowWindowAsync(IntPtr window, int command);
     [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
@@ -1863,7 +1865,9 @@ public static class CarbonStudioWindow {
     public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
 }
 '@
-[CarbonStudioWindow]::ShowWindowAsync($window, 9) | Out-Null
+if ([CarbonStudioWindow]::IsIconic($window)) {
+    [CarbonStudioWindow]::ShowWindowAsync($window, 9) | Out-Null
+}
 $focused = [CarbonStudioWindow]::SetForegroundWindow($window)
 if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
     $shell = New-Object -ComObject WScript.Shell
@@ -2853,6 +2857,7 @@ mod tests {
 		assert!(script.contains("SetForegroundWindow($window)"));
 		assert!(script.contains("AppActivate([int]$process.Id)"));
 		assert!(script.contains("GetForegroundWindow()"));
+		assert!(script.contains("if ([CarbonStudioWindow]::IsIconic($window))"));
 		assert!(!script.contains("SetWindowPos"));
 		assert!(script.contains("keybd_event(0x12, 0, 0, [UIntPtr]::Zero)"));
 		assert!(script.contains("keybd_event(0x12, 0, 2, [UIntPtr]::Zero)"));
