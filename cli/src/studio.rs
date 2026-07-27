@@ -1860,13 +1860,13 @@ pub fn focus_process(process_id: u32, creation_filetime: Option<u64>, studio_exe
 
 	#[cfg(target_os = "linux")]
 	{
+		let (creation_filetime, studio_executable) = metadata.context(
+			"incomplete focus metadata: creation_filetime and studio_executable are required for Roblox Studio focus",
+		)?;
 		anyhow::ensure!(
 			std::env::var_os("WSL_DISTRO_NAME").is_some(),
 			"Roblox Studio focus is supported on Linux only through WSL"
 		);
-		let (creation_filetime, studio_executable) = metadata.context(
-			"incomplete focus metadata: creation_filetime and studio_executable are required for Roblox Studio focus",
-		)?;
 		let helper_path = crate::rml::helper_path()?;
 		let encoded_executable = BASE64_STANDARD.encode(studio_executable.as_bytes());
 		let output = Command::new(&helper_path)
