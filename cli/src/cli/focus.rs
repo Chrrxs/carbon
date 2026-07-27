@@ -56,8 +56,13 @@ impl Focus {
 				"the Carbon serve session for {target} does not record a managed Studio PID; restart that serve session with this Carbon version"
 			)
 		})?;
-		studio::focus_process(session.helper_path.as_deref(), studio_pid)
-			.with_context(|| format!("failed to focus the Studio process registered for {target}"))?;
+		studio::focus_process(
+			session.helper_path.as_deref(),
+			studio_pid,
+			session.creation_filetime,
+			session.studio_executable.as_deref(),
+		)
+		.with_context(|| format!("failed to focus the Studio process registered for {target}"))?;
 		crate::carbon_info!("Focused Roblox Studio PID {studio_pid} for {target}");
 		Ok(())
 	}

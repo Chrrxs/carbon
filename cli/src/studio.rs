@@ -46,6 +46,12 @@ enum ManagedStudioLifecycle {
 		helper_path: PathBuf,
 	},
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FocusHelperMetadata {
+	pub helper_path: PathBuf,
+	pub studio_executable: String,
+	pub creation_filetime: u64,
+}
 
 #[derive(Clone)]
 pub struct ManagedStudio {
@@ -69,11 +75,40 @@ impl ManagedStudio {
 			ManagedStudioLifecycle::Mcp { .. } => "robloxstudio-mcp",
 		}
 	}
-	pub fn helper_path(&self) -> &Path {
-		match &self.lifecycle {
-			ManagedStudioLifecycle::Direct { helper_path, .. } | ManagedStudioLifecycle::Mcp { helper_path, .. } => {
-				helper_path
+	pub fn focus_helper_metadata(&self) -> Option<FocusHelperMetadata> {
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
+		{
+			match &self.lifecycle {
+				ManagedStudioLifecycle::Direct {
+					helper_path,
+					studio_executable,
+					started_at_file_time,
+					..
+				} => Some(FocusHelperMetadata {
+					helper_path: helper_path.clone(),
+					studio_executable: studio_executable.clone(),
+					creation_filetime: *started_at_file_time,
+				}),
+				ManagedStudioLifecycle::Mcp {
+					helper_path,
+					studio_executable,
+					started_at_file_time: Some(started_at_file_time),
+					..
+				} => Some(FocusHelperMetadata {
+					helper_path: helper_path.clone(),
+					studio_executable: studio_executable.clone(),
+					creation_filetime: *started_at_file_time,
+				}),
+				ManagedStudioLifecycle::Mcp {
+					started_at_file_time: None,
+					..
+				} => None,
 			}
+		}
+
+		#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+		{
+			None
 		}
 	}
 
@@ -1852,25 +1887,48 @@ if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
 /// Focus exactly the managed Roblox Studio process identified at launch.
 /// Process-name validation prevents a recycled native PID from targeting an
 /// unrelated application after Studio exits.
-pub fn focus_process(helper_path: Option<&Path>, process_id: u32) -> Result<()> {
-	if let Some(helper_path) = helper_path {
-		let output = Command::new(helper_path)
-			.args(["focus", &process_id.to_string()])
-			.stdin(Stdio::null())
-			.stdout(Stdio::piped())
-			.stderr(Stdio::piped())
-			.output()
-			.context("failed to focus the Roblox Studio window")?;
-		anyhow::ensure!(
-			output.status.success(),
-			"Roblox Studio window activation failed: {}",
-			String::from_utf8_lossy(&output.stderr).trim()
-		);
-		return Ok(());
-	}
+pub fn focus_process(
+	helper_path: Option<&Path>,
+	process_id: u32,
+	creation_filetime: Option<u64>,
+	studio_executable: Option<&str>,
+) -> Result<()> {
+	let metadata = match (helper_path, creation_filetime, studio_executable) {
+		(Some(helper_path), Some(creation_filetime), Some(studio_executable)) => {
+			Some((helper_path, creation_filetime, studio_executable))
+		}
+		(None, None, None) => None,
+		_ => {
+			anyhow::bail!(
+				"incomplete focus helper metadata: helper_path, creation_filetime, and studio_executable must all be present or all absent"
+			);
+		}
+	};
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
+		if let Some((helper_path, creation_filetime, studio_executable)) = metadata {
+			let encoded_executable = BASE64_STANDARD.encode(studio_executable.as_bytes());
+			let output = Command::new(helper_path)
+				.args([
+					"focus",
+					&process_id.to_string(),
+					&creation_filetime.to_string(),
+					&encoded_executable,
+				])
+				.stdin(Stdio::null())
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped())
+				.output()
+				.context("failed to focus the Roblox Studio window")?;
+			anyhow::ensure!(
+				output.status.success(),
+				"Roblox Studio window activation failed: {}",
+				String::from_utf8_lossy(&output.stderr).trim()
+			);
+			return Ok(());
+		}
+
 		#[cfg(target_os = "linux")]
 		anyhow::ensure!(
 			std::env::var_os("WSL_DISTRO_NAME").is_some(),
@@ -1892,6 +1950,7 @@ pub fn focus_process(helper_path: Option<&Path>, process_id: u32) -> Result<()> 
 
 	#[cfg(target_os = "macos")]
 	{
+		let _ = metadata;
 		let script = format!(
 			r#"tell application "System Events"
 	set matches to every process whose unix id is {process_id} and name is "RobloxStudio"
@@ -1913,6 +1972,7 @@ end tell"#
 
 	#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 	{
+		let _ = metadata;
 		let _ = process_id;
 		anyhow::bail!("Roblox Studio window activation is not supported on this platform")
 	}
@@ -2862,10 +2922,12 @@ mod tests {
 		use std::os::unix::fs::PermissionsExt;
 		fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
-		let result = focus_process(Some(&script_path), 54321);
+		let exe_path = r"C:\Roblox\version\RobloxStudioBeta.exe";
+		let expected_b64 = BASE64_STANDARD.encode(exe_path.as_bytes());
+		let result = focus_process(Some(&script_path), 54321, Some(133700123456), Some(exe_path));
 		assert!(result.is_ok());
 		let recorded_args = fs::read_to_string(&log_path).unwrap();
-		assert_eq!(recorded_args.trim(), "focus 54321");
+		assert_eq!(recorded_args.trim(), format!("focus 54321 133700123456 {expected_b64}"));
 		let _ = fs::remove_dir_all(&temp_dir);
 	}
 
@@ -2887,8 +2949,50 @@ mod tests {
 		use std::os::unix::fs::PermissionsExt;
 		fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
-		let err = focus_process(Some(&script_path), 54321).unwrap_err();
+		let err = focus_process(
+			Some(&script_path),
+			54321,
+			Some(133700123456),
+			Some(r"C:\Roblox\version\RobloxStudioBeta.exe"),
+		)
+		.unwrap_err();
 		assert!(err.to_string().contains("native focus helper failed"));
 		let _ = fs::remove_dir_all(&temp_dir);
+	}
+
+	#[test]
+	fn focus_process_fails_on_partial_metadata() {
+		let path = std::path::Path::new("/bin/true");
+		let err = focus_process(Some(path), 54321, None, None).unwrap_err();
+		assert!(err.to_string().contains("incomplete focus helper metadata"));
+
+		let err = focus_process(None, 54321, Some(12345), Some("exe")).unwrap_err();
+		assert!(err.to_string().contains("incomplete focus helper metadata"));
+	}
+	#[test]
+	fn managed_studio_focus_metadata_exposure() {
+		let direct = ManagedStudio {
+			lifecycle: ManagedStudioLifecycle::Direct {
+				process_id: 1234,
+				data_model_name: "test".to_string(),
+				studio_executable: "Studio.exe".to_string(),
+				started_at_file_time: 1000000,
+				helper_path: PathBuf::from("/path/helper"),
+			},
+			startup_guard: Arc::new(Mutex::new(None)),
+			bridge_id: None,
+		};
+
+		#[cfg(any(target_os = "linux", target_os = "windows"))]
+		{
+			let meta = direct.focus_helper_metadata().unwrap();
+			assert_eq!(meta.helper_path, PathBuf::from("/path/helper"));
+			assert_eq!(meta.studio_executable, "Studio.exe");
+			assert_eq!(meta.creation_filetime, 1000000);
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+		{
+			assert!(direct.focus_helper_metadata().is_none());
+		}
 	}
 }

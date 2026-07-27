@@ -502,69 +502,110 @@ static int cmd_launch(
     return 1;
 }
 
-static int cmd_inject(
+static bool validate_process_identity(
     const std::string& pid_str,
     const std::string& filetime_str,
-    const std::string& loader_b64,
-    const std::string& studio_b64
+    const std::string& studio_b64,
+    DWORD desired_access,
+    DWORD& out_pid,
+    SafeHandle& out_hProcess,
+    bool allow_not_running_or_mismatch = false
 ) {
     uint32_t parsed_pid = 0;
     uint64_t expected_filetime = 0;
     if (!parse_uint32(pid_str, parsed_pid)) {
         std::cerr << "Invalid PID argument\n";
-        return 1;
+        return false;
     }
-    DWORD pid = static_cast<DWORD>(parsed_pid);
+    out_pid = static_cast<DWORD>(parsed_pid);
     if (!parse_uint64(filetime_str, expected_filetime)) {
         std::cerr << "Invalid FILETIME argument\n";
-        return 1;
-    }
-
-    std::wstring loader_path;
-    if (!decode_base64_utf8(loader_b64, loader_path) || loader_path.empty()) {
-        std::cerr << "Invalid base64/UTF-8 loader path\n";
-        return 1;
+        return false;
     }
 
     std::wstring studio_path;
     if (!decode_base64_utf8(studio_b64, studio_path) || studio_path.empty()) {
         std::cerr << "Invalid base64/UTF-8 studio path\n";
-        return 1;
+        return false;
     }
 
-    SafeHandle hProcess(OpenProcess(
-        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-        FALSE,
-        pid
-    ));
+    SafeHandle hProcess(OpenProcess(desired_access, FALSE, out_pid));
+    if (!hProcess && (desired_access & PROCESS_QUERY_INFORMATION) != 0) {
+        hProcess.reset(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, out_pid));
+    }
     if (!hProcess) {
-        std::cerr << "OpenProcess failed: " << GetLastError() << "\n";
-        return 1;
+        DWORD err = GetLastError();
+        if (allow_not_running_or_mismatch && (err == ERROR_INVALID_PARAMETER || err == ERROR_PROC_NOT_FOUND)) {
+            return true;
+        }
+        std::cerr << "OpenProcess failed: " << err << "\n";
+        return false;
+    }
+
+    DWORD exitCode = 0;
+    if (GetExitCodeProcess(hProcess.get(), &exitCode) && exitCode != STILL_ACTIVE) {
+        if (allow_not_running_or_mismatch) {
+            return true;
+        }
+        std::cerr << "Process is not running\n";
+        return false;
     }
 
     FILETIME ftCreate, ftExit, ftKernel, ftUser;
     if (!GetProcessTimes(hProcess.get(), &ftCreate, &ftExit, &ftKernel, &ftUser)) {
         std::cerr << "GetProcessTimes failed: " << GetLastError() << "\n";
-        return 1;
+        return false;
     }
 
     ULARGE_INTEGER uli;
     uli.LowPart = ftCreate.dwLowDateTime;
     uli.HighPart = ftCreate.dwHighDateTime;
     if (uli.QuadPart != expected_filetime) {
+        if (allow_not_running_or_mismatch) {
+            return true;
+        }
         std::cerr << "Process creation time mismatch\n";
-        return 1;
+        return false;
     }
 
     wchar_t exePath[32768] = { 0 };
     DWORD size = 32768;
     if (!QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &size)) {
         std::cerr << "QueryFullProcessImageNameW failed: " << GetLastError() << "\n";
-        return 1;
+        return false;
     }
 
     if (!paths_equal(exePath, studio_path)) {
         std::cerr << "Process image path mismatch\n";
+        return false;
+    }
+
+    out_hProcess = std::move(hProcess);
+    return true;
+}
+
+static int cmd_inject(
+    const std::string& pid_str,
+    const std::string& filetime_str,
+    const std::string& loader_b64,
+    const std::string& studio_b64
+) {
+    std::wstring loader_path;
+    if (!decode_base64_utf8(loader_b64, loader_path) || loader_path.empty()) {
+        std::cerr << "Invalid base64/UTF-8 loader path\n";
+        return 1;
+    }
+
+    DWORD pid = 0;
+    SafeHandle hProcess;
+    if (!validate_process_identity(
+            pid_str,
+            filetime_str,
+            studio_b64,
+            PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+            pid,
+            hProcess
+        )) {
         return 1;
     }
 
@@ -645,73 +686,31 @@ static int cmd_inject(
     std::cerr << "WaitForSingleObject failed or timed out: " << waitResult << "\n";
     return 1;
 }
+
 static int cmd_terminate(
     const std::string& pid_str,
     const std::string& filetime_str,
     const std::string& studio_b64
 ) {
-    uint32_t parsed_pid = 0;
-    uint64_t expected_filetime = 0;
-    if (!parse_uint32(pid_str, parsed_pid)) {
-        std::cerr << "Invalid PID argument\n";
-        return 1;
-    }
-    DWORD pid = static_cast<DWORD>(parsed_pid);
-    if (!parse_uint64(filetime_str, expected_filetime)) {
-        std::cerr << "Invalid FILETIME argument\n";
-        return 1;
-    }
-
-    std::wstring studio_path;
-    if (!decode_base64_utf8(studio_b64, studio_path) || studio_path.empty()) {
-        std::cerr << "Invalid base64/UTF-8 studio path\n";
+    DWORD pid = 0;
+    SafeHandle hProcess;
+    if (!validate_process_identity(
+            pid_str,
+            filetime_str,
+            studio_b64,
+            PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
+            pid,
+            hProcess,
+            true
+        )) {
         return 1;
     }
 
-    SafeHandle hProcess(OpenProcess(
-        PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
-        FALSE,
-        pid
-    ));
-    if (!hProcess) {
-        DWORD err = GetLastError();
-        if (err == ERROR_INVALID_PARAMETER || err == ERROR_PROC_NOT_FOUND) {
-            return 0;
-        }
-        std::cerr << "OpenProcess failed: " << err << "\n";
-        return 1;
+    if (!hProcess.is_valid()) {
+        return 0;
     }
 
     DWORD exitCode = 0;
-    if (GetExitCodeProcess(hProcess.get(), &exitCode) && exitCode != STILL_ACTIVE) {
-        return 0;
-    }
-
-    FILETIME ftCreate, ftExit, ftKernel, ftUser;
-    if (!GetProcessTimes(hProcess.get(), &ftCreate, &ftExit, &ftKernel, &ftUser)) {
-        std::cerr << "GetProcessTimes failed: " << GetLastError() << "\n";
-        return 1;
-    }
-
-    ULARGE_INTEGER uli;
-    uli.LowPart = ftCreate.dwLowDateTime;
-    uli.HighPart = ftCreate.dwHighDateTime;
-    if (uli.QuadPart != expected_filetime) {
-        return 0;
-    }
-
-    wchar_t exePath[32768] = { 0 };
-    DWORD size = 32768;
-    if (!QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &size)) {
-        std::cerr << "QueryFullProcessImageNameW failed: " << GetLastError() << "\n";
-        return 1;
-    }
-
-    if (!paths_equal(exePath, studio_path)) {
-        std::cerr << "Process image path mismatch\n";
-        return 1;
-    }
-
     if (!TerminateProcess(hProcess.get(), 1)) {
         DWORD err = GetLastError();
         if (GetExitCodeProcess(hProcess.get(), &exitCode) && exitCode != STILL_ACTIVE) {
@@ -791,44 +790,22 @@ static BOOL CALLBACK enum_windows_callback(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
-static int cmd_focus(const std::string& pid_str) {
-    uint32_t parsed_pid = 0;
-    if (!parse_uint32(pid_str, parsed_pid)) {
-        std::cerr << "Invalid PID argument\n";
-        return 1;
-    }
-    DWORD pid = static_cast<DWORD>(parsed_pid);
-
-    SafeHandle hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
-    if (!hProcess) {
-        hProcess.reset(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
-    }
-    if (!hProcess) {
-        std::cerr << "OpenProcess failed for PID " << pid << ": " << GetLastError() << "\n";
-        return 1;
-    }
-
-    DWORD exitCode = 0;
-    if (!GetExitCodeProcess(hProcess.get(), &exitCode) || exitCode != STILL_ACTIVE) {
-        std::cerr << "Roblox Studio process " << pid << " is not running\n";
-        return 1;
-    }
-
-    wchar_t exePath[32768] = { 0 };
-    DWORD size = 32768;
-    if (!QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &size)) {
-        std::cerr << "QueryFullProcessImageNameW failed for PID " << pid << ": " << GetLastError() << "\n";
-        return 1;
-    }
-
-    const wchar_t* filename = wcsrchr(exePath, L'\\');
-    if (!filename) {
-        filename = wcsrchr(exePath, L'/');
-    }
-    filename = filename ? filename + 1 : exePath;
-
-    if (_wcsicmp(filename, L"RobloxStudioBeta.exe") != 0) {
-        std::cerr << "Process " << pid << " is not RobloxStudioBeta.exe\n";
+static int cmd_focus(
+    const std::string& pid_str,
+    const std::string& filetime_str,
+    const std::string& studio_b64
+) {
+    DWORD pid = 0;
+    SafeHandle hProcess;
+    if (!validate_process_identity(
+            pid_str,
+            filetime_str,
+            studio_b64,
+            PROCESS_QUERY_INFORMATION,
+            pid,
+            hProcess,
+            false
+        )) {
         return 1;
     }
 
@@ -907,11 +884,11 @@ int main(int argc, char* argv[]) {
         }
         return cmd_terminate(argv[2], argv[3], argv[4]);
     } else if (cmd == "focus") {
-        if (argc != 3) {
-            std::cerr << "Usage: carbon-studio-helper focus <pid>\n";
+        if (argc != 5) {
+            std::cerr << "Usage: carbon-studio-helper focus <pid> <filetime> <studio_b64>\n";
             return 1;
         }
-        return cmd_focus(argv[2]);
+        return cmd_focus(argv[2], argv[3], argv[4]);
     }
 
     std::cerr << "Unknown command: " << cmd << "\n";

@@ -47,7 +47,7 @@ if ! grep -Fq -- 'Usage: carbon-studio-helper <launch|inject|terminate|focus> [a
 	failure=1
 fi
 
-if ! grep -Fq -- 'Usage: carbon-studio-helper focus <pid>' "$HELPER_SOURCE"; then
+if ! grep -Fq -- 'Usage: carbon-studio-helper focus <pid> <filetime> <studio_b64>' "$HELPER_SOURCE"; then
 	echo "FAIL: Carbon studio helper focus usage is missing" >&2
 	failure=1
 fi
@@ -57,8 +57,8 @@ if ! grep -Fq -- 'cmd_focus' "$HELPER_SOURCE"; then
 	failure=1
 fi
 
-if ! grep -Fq -- 'RobloxStudioBeta.exe' "$HELPER_SOURCE"; then
-	echo "FAIL: Carbon studio helper focus does not validate RobloxStudioBeta.exe process name" >&2
+if ! grep -Fq -- 'paths_equal' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus does not validate studio image path" >&2
 	failure=1
 fi
 

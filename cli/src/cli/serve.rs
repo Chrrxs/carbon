@@ -273,13 +273,23 @@ impl Serve {
 				return Err(error);
 			}
 		};
+		let (helper_path, studio_executable, creation_filetime) = match managed_studio.focus_helper_metadata() {
+			Some(meta) => (
+				Some(meta.helper_path),
+				Some(meta.studio_executable),
+				Some(meta.creation_filetime),
+			),
+			None => (None, None, None),
+		};
 		let session = Session {
 			pid: process::id(),
 			host: Some(SERVE_HOST.to_owned()),
 			port: Some(port),
 			studio_pid: Some(studio_process_id),
 			worktree,
-			helper_path: Some(managed_studio.helper_path().to_path_buf()),
+			helper_path,
+			studio_executable,
+			creation_filetime,
 		};
 		// Serve owns cleanup so it installs the one process-wide signal handler.
 		sessions::add(None, session.clone(), true)?;
