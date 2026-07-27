@@ -273,13 +273,9 @@ impl Serve {
 				return Err(error);
 			}
 		};
-		let (helper_path, studio_executable, creation_filetime) = match managed_studio.focus_helper_metadata() {
-			Some(meta) => (
-				Some(meta.helper_path),
-				Some(meta.studio_executable),
-				Some(meta.creation_filetime),
-			),
-			None => (None, None, None),
+		let (studio_executable, creation_filetime) = match managed_studio.focus_metadata() {
+			Some(meta) => (Some(meta.studio_executable), Some(meta.creation_filetime)),
+			None => (None, None),
 		};
 		let session = Session {
 			pid: process::id(),
@@ -287,7 +283,6 @@ impl Serve {
 			port: Some(port),
 			studio_pid: Some(studio_process_id),
 			worktree,
-			helper_path,
 			studio_executable,
 			creation_filetime,
 		};

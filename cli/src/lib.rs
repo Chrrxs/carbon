@@ -28,6 +28,7 @@ pub mod source;
 mod source_wire;
 pub mod studio;
 pub(crate) mod studio_plugin;
+pub mod studio_windows;
 pub mod util;
 
 /// Global type for snapshot and instance properties

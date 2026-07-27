@@ -47,8 +47,7 @@ enum ManagedStudioLifecycle {
 	},
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FocusHelperMetadata {
-	pub helper_path: PathBuf,
+pub struct FocusMetadata {
 	pub studio_executable: String,
 	pub creation_filetime: u64,
 }
@@ -75,27 +74,23 @@ impl ManagedStudio {
 			ManagedStudioLifecycle::Mcp { .. } => "robloxstudio-mcp",
 		}
 	}
-	pub fn focus_helper_metadata(&self) -> Option<FocusHelperMetadata> {
+	pub fn focus_metadata(&self) -> Option<FocusMetadata> {
 		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		{
 			match &self.lifecycle {
 				ManagedStudioLifecycle::Direct {
-					helper_path,
 					studio_executable,
 					started_at_file_time,
 					..
-				} => Some(FocusHelperMetadata {
-					helper_path: helper_path.clone(),
+				} => Some(FocusMetadata {
 					studio_executable: studio_executable.clone(),
 					creation_filetime: *started_at_file_time,
 				}),
 				ManagedStudioLifecycle::Mcp {
-					helper_path,
 					studio_executable,
 					started_at_file_time: Some(started_at_file_time),
 					..
-				} => Some(FocusHelperMetadata {
-					helper_path: helper_path.clone(),
+				} => Some(FocusMetadata {
 					studio_executable: studio_executable.clone(),
 					creation_filetime: *started_at_file_time,
 				}),
@@ -1841,109 +1836,51 @@ fn terminate_process(
 	Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn powershell_focus_script(process_id: u32) -> String {
-	r#"
-$process = Get-Process -Id __CARBON_STUDIO_PID__ -ErrorAction SilentlyContinue
-if ($null -eq $process) { throw "Managed Roblox Studio process __CARBON_STUDIO_PID__ is not running" }
-if ($process.ProcessName -ne 'RobloxStudioBeta') { throw "Managed process __CARBON_STUDIO_PID__ is not Roblox Studio" }
-$window = $process.MainWindowHandle
-if ($window -eq [IntPtr]::Zero) { throw "Roblox Studio process __CARBON_STUDIO_PID__ has no main window" }
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class CarbonStudioWindow {
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindowAsync(IntPtr window, int command);
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr window);
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr window);
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")]
-    public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
-}
-'@
-if ([CarbonStudioWindow]::IsIconic($window)) {
-    [CarbonStudioWindow]::ShowWindowAsync($window, 9) | Out-Null
-}
-$focused = [CarbonStudioWindow]::SetForegroundWindow($window)
-if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
-    $shell = New-Object -ComObject WScript.Shell
-    $focused = $shell.AppActivate([int]$process.Id)
-}
-if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
-    [CarbonStudioWindow]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    try {
-        [CarbonStudioWindow]::SetForegroundWindow($window) | Out-Null
-    } finally {
-        [CarbonStudioWindow]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
-    }
-}
-if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
-    throw "Windows denied foreground activation for Roblox Studio process __CARBON_STUDIO_PID__"
-}
-"#
-	.replace("__CARBON_STUDIO_PID__", &process_id.to_string())
-}
-
 /// Focus exactly the managed Roblox Studio process identified at launch.
 /// Process-name validation prevents a recycled native PID from targeting an
 /// unrelated application after Studio exits.
-pub fn focus_process(
-	helper_path: Option<&Path>,
-	process_id: u32,
-	creation_filetime: Option<u64>,
-	studio_executable: Option<&str>,
-) -> Result<()> {
-	let metadata = match (helper_path, creation_filetime, studio_executable) {
-		(Some(helper_path), Some(creation_filetime), Some(studio_executable)) => {
-			Some((helper_path, creation_filetime, studio_executable))
-		}
-		(None, None, None) => None,
+pub fn focus_process(process_id: u32, creation_filetime: Option<u64>, studio_executable: Option<&str>) -> Result<()> {
+	let metadata = match (creation_filetime, studio_executable) {
+		(Some(creation_filetime), Some(studio_executable)) => Some((creation_filetime, studio_executable)),
+		(None, None) => None,
 		_ => {
 			anyhow::bail!(
-				"incomplete focus helper metadata: helper_path, creation_filetime, and studio_executable must all be present or all absent"
+				"incomplete focus metadata: creation_filetime and studio_executable must both be present or both absent"
 			);
 		}
 	};
 
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[cfg(target_os = "windows")]
 	{
-		if let Some((helper_path, creation_filetime, studio_executable)) = metadata {
-			let encoded_executable = BASE64_STANDARD.encode(studio_executable.as_bytes());
-			let output = Command::new(helper_path)
-				.args([
-					"focus",
-					&process_id.to_string(),
-					&creation_filetime.to_string(),
-					&encoded_executable,
-				])
-				.stdin(Stdio::null())
-				.stdout(Stdio::piped())
-				.stderr(Stdio::piped())
-				.output()
-				.context("failed to focus the Roblox Studio window")?;
-			anyhow::ensure!(
-				output.status.success(),
-				"Roblox Studio window activation failed: {}",
-				String::from_utf8_lossy(&output.stderr).trim()
-			);
-			return Ok(());
-		}
+		let (creation_filetime, studio_executable) = metadata.context(
+			"incomplete focus metadata: creation_filetime and studio_executable are required for Roblox Studio focus",
+		)?;
+		crate::studio_windows::focus_process(process_id, creation_filetime, studio_executable)
+	}
 
-		#[cfg(target_os = "linux")]
+	#[cfg(target_os = "linux")]
+	{
 		anyhow::ensure!(
 			std::env::var_os("WSL_DISTRO_NAME").is_some(),
 			"Roblox Studio focus is supported on Linux only through WSL"
 		);
-		let script = powershell_focus_script(process_id);
-		let output = powershell_command()?
-			.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+		let (creation_filetime, studio_executable) = metadata.context(
+			"incomplete focus metadata: creation_filetime and studio_executable are required for Roblox Studio focus",
+		)?;
+		let helper_path = crate::rml::helper_path()?;
+		let encoded_executable = BASE64_STANDARD.encode(studio_executable.as_bytes());
+		let output = Command::new(&helper_path)
+			.args([
+				"focus",
+				&process_id.to_string(),
+				&creation_filetime.to_string(),
+				&encoded_executable,
+			])
 			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
 			.output()
-			.context("failed to start the Roblox Studio window activator")?;
+			.context("failed to focus the Roblox Studio window")?;
 		anyhow::ensure!(
 			output.status.success(),
 			"Roblox Studio window activation failed: {}",
@@ -1987,8 +1924,7 @@ pub fn is_running(title: Option<String>) -> Result<bool> {
 	#[cfg(target_os = "macos")]
 	{
 		let output = Command::new("osascript")
-				.args([
-					"-e",
+			.args([
 					"tell app \"System Events\" to get the title of every window of (processes whose background only is false)",
 				])
 				.output()?;
@@ -2197,7 +2133,10 @@ mod tests {
 	use std::{
 		io::{Read, Write},
 		net::TcpListener,
+		sync::Mutex,
 	};
+
+	static FOCUS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 	fn fake_mcp_response(
 		response: impl FnOnce(std::net::TcpStream) + Send + 'static,
@@ -2847,77 +2786,36 @@ mod tests {
 		assert!(script.contains("host\\fxr\\*\\hostfxr.dll"));
 	}
 
-	#[test]
-	fn powershell_focus_is_pinned_to_the_managed_studio_pid() {
-		let script = powershell_focus_script(47_312);
-
-		assert!(script.contains("Get-Process -Id 47312"));
-		assert!(script.contains("$process.ProcessName -ne 'RobloxStudioBeta'"));
-		assert!(script.contains("$process.MainWindowHandle"));
-		assert!(script.contains("SetForegroundWindow($window)"));
-		assert!(script.contains("AppActivate([int]$process.Id)"));
-		assert!(script.contains("GetForegroundWindow()"));
-		assert!(script.contains("if ([CarbonStudioWindow]::IsIconic($window))"));
-		assert!(!script.contains("SetWindowPos"));
-		assert!(script.contains("keybd_event(0x12, 0, 0, [UIntPtr]::Zero)"));
-		assert!(script.contains("keybd_event(0x12, 0, 2, [UIntPtr]::Zero)"));
-		assert!(!script.contains("SwitchToThisWindow"));
-		assert!(script.contains("GetForegroundWindow() -ne $window"));
-		assert!(!script.contains("MainWindowTitle"));
-		assert!(!script.contains("EnumWindows"));
-	}
-
 	#[cfg(target_os = "linux")]
 	#[test]
-	fn direct_launch_verify_identity_protocol_success() {
-		let child = Command::new("sh")
-			.args([
-				"-c",
-				"read line && if [ \"$line\" = \"CARBON_STUDIO_LAUNCH_VERIFY\" ]; then echo \"CARBON_STUDIO_LAUNCH_VERIFIED\"; fi",
-			])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
-			.spawn()
-			.unwrap();
-		let mut launched = DirectLaunch {
-			process_id: 1234,
-			child: Some(child),
-			studio_executable: Some("RobloxStudioBeta.exe".to_string()),
-			started_at_file_time: Some(1000),
-			helper_path: None,
-		};
-		assert!(launched.verify_identity().is_ok());
-	}
-
-	#[cfg(target_os = "linux")]
-	#[test]
-	fn direct_launch_verify_identity_protocol_fails_closed() {
-		let child = Command::new("sh")
-			.args(["-c", "read line && echo \"CARBON_STUDIO_LAUNCH_MISMATCH\""])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
-			.spawn()
-			.unwrap();
-		let mut launched = DirectLaunch {
-			process_id: 1234,
-			child: Some(child),
-			studio_executable: Some("RobloxStudioBeta.exe".to_string()),
-			started_at_file_time: Some(1000),
-			helper_path: None,
-		};
-		let err = launched.verify_identity().unwrap_err();
-		assert!(err.to_string().contains("failed process identity verification"));
-	}
-	#[cfg(target_os = "linux")]
-	#[test]
-	fn focus_process_uses_exact_helper_argv_when_helper_path_present() {
+	fn focus_process_uses_exact_helper_argv_when_helper_materialized() {
+		let _environment = FOCUS_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		let unique = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.unwrap()
 			.as_nanos();
 		let temp_dir = std::env::temp_dir().join(format!("carbon-helper-argv-{unique}"));
-		fs::create_dir_all(&temp_dir).unwrap();
-		let script_path = temp_dir.join("mock_helper.sh");
+		for relative in &[
+			"dwmapi.dll",
+			"RobloxModLoader/roblox_modloader.dll",
+			"carbon-studio-helper.exe",
+			"RobloxModLoader/config.toml",
+			"RobloxModLoader/runtime/RML.Core.dll",
+			"RobloxModLoader/runtime/RML.NativeHost.dll",
+			"RobloxModLoader/runtime/Roblox.dll",
+			"RobloxModLoader/runtime/nethost.dll",
+			"RobloxModLoader/runtime/RML.runtimeconfig.json",
+			"RobloxModLoader/mods/carbon/dotnet/Carbon.RmlBridge.dll",
+		] {
+			let path = temp_dir.join(relative);
+			fs::create_dir_all(path.parent().unwrap()).unwrap();
+			fs::write(&path, b"stub").unwrap();
+		}
+		let marker = serde_json::to_vec(&crate::rml::InstallMarker::current()).unwrap();
+		let marker_path = temp_dir.join("RobloxModLoader/carbon-rml.json");
+		fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+		fs::write(marker_path, marker).unwrap();
+		let script_path = temp_dir.join("carbon-studio-helper.exe");
 		let log_path = temp_dir.join("args.txt");
 		fs::write(
 			&script_path,
@@ -2927,9 +2825,26 @@ mod tests {
 		use std::os::unix::fs::PermissionsExt;
 		fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
+		let old_package = std::env::var_os("CARBON_RML_PACKAGE");
+		let old_wsl = std::env::var_os("WSL_DISTRO_NAME");
+		std::env::set_var("CARBON_RML_PACKAGE", &temp_dir);
+		std::env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+
 		let exe_path = r"C:\Roblox\version\RobloxStudioBeta.exe";
 		let expected_b64 = BASE64_STANDARD.encode(exe_path.as_bytes());
-		let result = focus_process(Some(&script_path), 54321, Some(133700123456), Some(exe_path));
+		let result = focus_process(54321, Some(133700123456), Some(exe_path));
+
+		if let Some(old) = old_package {
+			std::env::set_var("CARBON_RML_PACKAGE", old);
+		} else {
+			std::env::remove_var("CARBON_RML_PACKAGE");
+		}
+		if let Some(old) = old_wsl {
+			std::env::set_var("WSL_DISTRO_NAME", old);
+		} else {
+			std::env::remove_var("WSL_DISTRO_NAME");
+		}
+
 		assert!(result.is_ok());
 		let recorded_args = fs::read_to_string(&log_path).unwrap();
 		assert_eq!(recorded_args.trim(), format!("focus 54321 133700123456 {expected_b64}"));
@@ -2939,13 +2854,33 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn focus_process_surfaces_helper_failures_without_fallback() {
+		let _environment = FOCUS_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		let unique = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.unwrap()
 			.as_nanos();
 		let temp_dir = std::env::temp_dir().join(format!("carbon-helper-fail-{unique}"));
-		fs::create_dir_all(&temp_dir).unwrap();
-		let script_path = temp_dir.join("failing_helper.sh");
+		for relative in &[
+			"dwmapi.dll",
+			"RobloxModLoader/roblox_modloader.dll",
+			"carbon-studio-helper.exe",
+			"RobloxModLoader/config.toml",
+			"RobloxModLoader/runtime/RML.Core.dll",
+			"RobloxModLoader/runtime/RML.NativeHost.dll",
+			"RobloxModLoader/runtime/Roblox.dll",
+			"RobloxModLoader/runtime/nethost.dll",
+			"RobloxModLoader/runtime/RML.runtimeconfig.json",
+			"RobloxModLoader/mods/carbon/dotnet/Carbon.RmlBridge.dll",
+		] {
+			let path = temp_dir.join(relative);
+			fs::create_dir_all(path.parent().unwrap()).unwrap();
+			fs::write(&path, b"stub").unwrap();
+		}
+		let marker = serde_json::to_vec(&crate::rml::InstallMarker::current()).unwrap();
+		let marker_path = temp_dir.join("RobloxModLoader/carbon-rml.json");
+		fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+		fs::write(marker_path, marker).unwrap();
+		let script_path = temp_dir.join("carbon-studio-helper.exe");
 		fs::write(
 			&script_path,
 			"#!/bin/sh\necho \"native focus helper failed\" >&2\nexit 1\n",
@@ -2954,26 +2889,45 @@ mod tests {
 		use std::os::unix::fs::PermissionsExt;
 		fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
+		let old_package = std::env::var_os("CARBON_RML_PACKAGE");
+		let old_wsl = std::env::var_os("WSL_DISTRO_NAME");
+		std::env::set_var("CARBON_RML_PACKAGE", &temp_dir);
+		std::env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+
 		let err = focus_process(
-			Some(&script_path),
 			54321,
 			Some(133700123456),
 			Some(r"C:\Roblox\version\RobloxStudioBeta.exe"),
 		)
 		.unwrap_err();
+
+		if let Some(old) = old_package {
+			std::env::set_var("CARBON_RML_PACKAGE", old);
+		} else {
+			std::env::remove_var("CARBON_RML_PACKAGE");
+		}
+		if let Some(old) = old_wsl {
+			std::env::set_var("WSL_DISTRO_NAME", old);
+		} else {
+			std::env::remove_var("WSL_DISTRO_NAME");
+		}
+
 		assert!(err.to_string().contains("native focus helper failed"));
 		let _ = fs::remove_dir_all(&temp_dir);
 	}
 
 	#[test]
 	fn focus_process_fails_on_partial_metadata() {
-		let path = std::path::Path::new("/bin/true");
-		let err = focus_process(Some(path), 54321, None, None).unwrap_err();
-		assert!(err.to_string().contains("incomplete focus helper metadata"));
+		let err = focus_process(54321, None, None).unwrap_err();
+		assert!(err.to_string().contains("incomplete focus metadata"));
 
-		let err = focus_process(None, 54321, Some(12345), Some("exe")).unwrap_err();
-		assert!(err.to_string().contains("incomplete focus helper metadata"));
+		let err = focus_process(54321, Some(12345), None).unwrap_err();
+		assert!(err.to_string().contains("incomplete focus metadata"));
+
+		let err = focus_process(54321, None, Some("exe")).unwrap_err();
+		assert!(err.to_string().contains("incomplete focus metadata"));
 	}
+
 	#[test]
 	fn managed_studio_focus_metadata_exposure() {
 		let direct = ManagedStudio {
@@ -2990,14 +2944,13 @@ mod tests {
 
 		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		{
-			let meta = direct.focus_helper_metadata().unwrap();
-			assert_eq!(meta.helper_path, PathBuf::from("/path/helper"));
+			let meta = direct.focus_metadata().unwrap();
 			assert_eq!(meta.studio_executable, "Studio.exe");
 			assert_eq!(meta.creation_filetime, 1000000);
 		}
 		#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 		{
-			assert!(direct.focus_helper_metadata().is_none());
+			assert!(direct.focus_metadata().is_none());
 		}
 	}
 }

@@ -790,6 +790,45 @@ static BOOL CALLBACK enum_windows_callback(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
+static bool activate_window(HWND target_hwnd) {
+    SetForegroundWindow(target_hwnd);
+
+    if (GetForegroundWindow() != target_hwnd) {
+        DWORD current_thread = GetCurrentThreadId();
+        DWORD target_thread = GetWindowThreadProcessId(target_hwnd, NULL);
+        HWND foreground_hwnd = GetForegroundWindow();
+        DWORD foreground_thread = foreground_hwnd
+            ? GetWindowThreadProcessId(foreground_hwnd, NULL)
+            : 0;
+
+        bool attached_foreground =
+            foreground_thread != 0 &&
+            foreground_thread != current_thread &&
+            AttachThreadInput(current_thread, foreground_thread, TRUE);
+        bool attached_target =
+            target_thread != 0 &&
+            target_thread != current_thread &&
+            target_thread != foreground_thread &&
+            AttachThreadInput(current_thread, target_thread, TRUE);
+
+        BringWindowToTop(target_hwnd);
+        SetForegroundWindow(target_hwnd);
+        SetFocus(target_hwnd);
+
+        if (attached_target) {
+            AttachThreadInput(current_thread, target_thread, FALSE);
+        }
+        if (attached_foreground) {
+            AttachThreadInput(current_thread, foreground_thread, FALSE);
+        }
+    }
+
+    for (int attempt = 0; attempt < 10 && GetForegroundWindow() != target_hwnd; ++attempt) {
+        Sleep(10);
+    }
+    return GetForegroundWindow() == target_hwnd;
+}
+
 static int cmd_focus(
     const std::string& pid_str,
     const std::string& filetime_str,
@@ -830,30 +869,21 @@ static int cmd_focus(
         });
 
     HWND target_hwnd = ctx.candidates.front().hwnd;
+    HWND previous_hwnd = GetForegroundWindow();
 
     if (IsIconic(target_hwnd)) {
         ShowWindowAsync(target_hwnd, SW_RESTORE);
     }
-    SetForegroundWindow(target_hwnd);
-
-    if (GetForegroundWindow() != target_hwnd) {
-        struct AltKeyGuard {
-            ~AltKeyGuard() {
-                keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
-            }
-        };
-
-        keybd_event(VK_MENU, 0, 0, 0);
-        {
-            AltKeyGuard alt_guard;
-            (void)alt_guard;
-            SetForegroundWindow(target_hwnd);
-        }
-    }
-
-    if (GetForegroundWindow() != target_hwnd) {
+    if (!activate_window(target_hwnd)) {
         std::cerr << "Windows denied foreground activation for Roblox Studio process " << pid << "\n";
         return 1;
+    }
+
+    if (previous_hwnd != NULL && previous_hwnd != target_hwnd && IsWindow(previous_hwnd)) {
+        if (!activate_window(previous_hwnd)) {
+            std::cerr << "Windows denied restoration of the previously focused window\n";
+            return 1;
+        }
     }
 
     return 0;

@@ -539,6 +539,12 @@ pub fn package_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 		BUILD_VERSION
 	)
 }
+pub fn helper_path() -> Result<PathBuf> {
+	let package = package_dir(None)?;
+	let helper = package.join(HELPER_PATH);
+	ensure!(helper.is_file(), "RML helper is missing: {}", helper.display());
+	Ok(fs::canonicalize(&helper).unwrap_or(helper))
+}
 
 fn rml_cache_dir() -> Result<PathBuf> {
 	if let Some(path) = env::var_os(RML_CACHE_DIR_ENV).filter(|path| !path.is_empty()) {
