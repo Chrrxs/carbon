@@ -7,6 +7,7 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use indexmap::IndexMap;
+use path_clean::PathClean;
 use rbx_dom_weak::{
 	types::{Attributes, Content, ContentType, Ref, Variant, VariantType},
 	HashMapExt, Ustr, UstrMap, WeakDom,
@@ -3152,7 +3153,7 @@ impl<'a> Evaluation<'a> {
 		if let Some(relative) = &node.path {
 			let path = resolve_mapped_path(root, relative)?;
 			ensure!(
-				mapped_traversal.path_type(&path)?.is_dir(),
+				mapped_traversal.mapped_path_type(root, &path)?.is_dir(),
 				"engine anchor $path must be a directory: {}",
 				path.display()
 			);
@@ -3233,7 +3234,7 @@ fn evaluate_owned_node(
 	let mut snapshot = if let Some(relative) = &node.path {
 		let path = resolve_mapped_path(project_root, relative)?;
 		let file_type = mapped_traversal
-			.path_type(&path)
+			.mapped_path_type(project_root, &path)
 			.with_context(|| format!("required mapped path is missing: {}", path.display()))?;
 		if file_type.is_dir() {
 			read_directory_instance_tracked(&path, name, generated_data, mapped_traversal)?
@@ -3303,7 +3304,7 @@ fn evaluate_nested_project_node(
 	let mut snapshot = if let Some(relative) = &node.path {
 		let path = resolve_mapped_path(project_root, relative)?;
 		let file_type = mapped_traversal
-			.optional_path_type(&path, node.path_optional)
+			.optional_mapped_path_type(project_root, &path, node.path_optional)
 			.with_context(|| format!("required nested Rojo path is missing: {}", path.display()))?;
 		let Some(file_type) = file_type else {
 			return Ok(None);
@@ -3565,13 +3566,14 @@ fn resolve_mapped_path(root: &Path, relative: &Path) -> Result<PathBuf> {
 	ensure!(!relative.as_os_str().is_empty(), "$path may not be empty");
 	ensure!(!relative.is_absolute(), "$path must be relative to the project file");
 	ensure!(
-		relative
-			.components()
-			.all(|component| matches!(component, Component::Normal(_))),
+		relative.components().all(|component| matches!(
+			component,
+			Component::CurDir | Component::ParentDir | Component::Normal(_)
+		)),
 		"$path contains unsafe components: {}",
 		relative.display()
 	);
-	Ok(root.join(relative))
+	Ok(root.join(relative).clean())
 }
 
 #[derive(Default)]
@@ -3580,6 +3582,23 @@ struct MappedTraversal {
 }
 
 impl MappedTraversal {
+	fn record_external_root(&mut self, root: &Path, path: &Path, file_type: fs::FileType) -> Result<()> {
+		let root = fs::canonicalize(root.resolve()?)
+			.with_context(|| format!("failed to resolve mapped project root {}", root.display()))?;
+		let path =
+			fs::canonicalize(path).with_context(|| format!("failed to resolve mapped path {}", path.display()))?;
+		if path.starts_with(root) {
+			return Ok(());
+		}
+		let watch_root = if file_type.is_dir() {
+			path
+		} else {
+			path.parent().context("mapped path has no parent directory")?.to_owned()
+		};
+		self.watch_roots.insert(watch_root);
+		Ok(())
+	}
+
 	fn file_type(&mut self, path: &Path, lexical_type: fs::FileType) -> Result<fs::FileType> {
 		if !lexical_type.is_symlink() {
 			return Ok(lexical_type);
@@ -3606,6 +3625,12 @@ impl MappedTraversal {
 		self.file_type(path, lexical.file_type())
 	}
 
+	fn mapped_path_type(&mut self, root: &Path, path: &Path) -> Result<fs::FileType> {
+		let file_type = self.path_type(path)?;
+		self.record_external_root(root, path, file_type)?;
+		Ok(file_type)
+	}
+
 	fn optional_path_type(&mut self, path: &Path, optional: bool) -> Result<Option<fs::FileType>> {
 		let lexical = match fs::symlink_metadata(path) {
 			Ok(lexical) => lexical,
@@ -3615,6 +3640,14 @@ impl MappedTraversal {
 			}
 		};
 		Ok(Some(self.file_type(path, lexical.file_type())?))
+	}
+
+	fn optional_mapped_path_type(&mut self, root: &Path, path: &Path, optional: bool) -> Result<Option<fs::FileType>> {
+		let Some(file_type) = self.optional_path_type(path, optional)? else {
+			return Ok(None);
+		};
+		self.record_external_root(root, path, file_type)?;
+		Ok(Some(file_type))
 	}
 }
 
@@ -5353,6 +5386,57 @@ mod tests {
 			fs::read(second_output).unwrap(),
 			"byte-identical projects in separate worktrees must build byte-identical places"
 		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn parent_relative_mappings_materialize_and_watch_external_source() {
+		let root = temp("parent-relative-mapping");
+		let place = root.join("place");
+		let shared = root.join("shared");
+		fs::create_dir_all(&shared).unwrap();
+		fs::write(shared.join("Example.luau"), "return true\n").unwrap();
+		let project_path = place.join("game.carbon.json");
+		initialize(&project_path, "Game".to_owned()).unwrap();
+		write_json(
+			&project_path,
+			&serde_json::json!({
+				"name": "Game",
+				"tree": {
+					"$className": "DataModel",
+					"ReplicatedStorage": {
+						"Shared": { "$path": "../shared" }
+					}
+				}
+			}),
+		)
+		.unwrap();
+
+		let materialized = materialize(&project_path).unwrap();
+		assert_eq!(
+			materialized.mapped_watch_roots,
+			vec![fs::canonicalize(&shared).unwrap()]
+		);
+		let shared = materialized
+			.snapshot
+			.children
+			.iter()
+			.find(|child| child.name == "ReplicatedStorage")
+			.unwrap()
+			.children
+			.iter()
+			.find(|child| child.name == "Shared")
+			.unwrap();
+		assert_eq!(
+			shared
+				.children
+				.iter()
+				.map(|child| (child.name.as_str(), child.class.as_str()))
+				.collect::<Vec<_>>(),
+			vec![("Example", "ModuleScript")]
+		);
+
+		fs::remove_dir_all(materialized.directory).unwrap();
 		fs::remove_dir_all(root).unwrap();
 	}
 

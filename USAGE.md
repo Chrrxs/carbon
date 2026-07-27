@@ -21,6 +21,10 @@ worktrees or clones. To author an intentionally empty `Folder`, place an empty
 JSON object in its `meta.json`; `carbon migrate` writes this marker
 automatically for empty extracted Folders.
 
+`$path` values are relative to the project file. They may use `.` and `..`, so
+places in sibling directories can map the same shared source directory.
+Absolute paths remain unsupported.
+
 ## Commands
 
 ```sh
