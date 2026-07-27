@@ -279,6 +279,7 @@ impl Serve {
 			port: Some(port),
 			studio_pid: Some(studio_process_id),
 			worktree,
+			helper_path: Some(managed_studio.helper_path().to_path_buf()),
 		};
 		// Serve owns cleanup so it installs the one process-wide signal handler.
 		sessions::add(None, session.clone(), true)?;

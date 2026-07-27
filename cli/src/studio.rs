@@ -69,6 +69,13 @@ impl ManagedStudio {
 			ManagedStudioLifecycle::Mcp { .. } => "robloxstudio-mcp",
 		}
 	}
+	pub fn helper_path(&self) -> &Path {
+		match &self.lifecycle {
+			ManagedStudioLifecycle::Direct { helper_path, .. } | ManagedStudioLifecycle::Mcp { helper_path, .. } => {
+				helper_path
+			}
+		}
+	}
 
 	/// Release the shared plugin version once this Studio process has proved it
 	/// loaded the plugin by subscribing to its unique serve endpoint.
@@ -1845,7 +1852,23 @@ if ([CarbonStudioWindow]::GetForegroundWindow() -ne $window) {
 /// Focus exactly the managed Roblox Studio process identified at launch.
 /// Process-name validation prevents a recycled native PID from targeting an
 /// unrelated application after Studio exits.
-pub fn focus_process(process_id: u32) -> Result<()> {
+pub fn focus_process(helper_path: Option<&Path>, process_id: u32) -> Result<()> {
+	if let Some(helper_path) = helper_path {
+		let output = Command::new(helper_path)
+			.args(["focus", &process_id.to_string()])
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.output()
+			.context("failed to focus the Roblox Studio window")?;
+		anyhow::ensure!(
+			output.status.success(),
+			"Roblox Studio window activation failed: {}",
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
+		return Ok(());
+	}
+
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
 		#[cfg(target_os = "linux")]
@@ -2819,5 +2842,53 @@ mod tests {
 		};
 		let err = launched.verify_identity().unwrap_err();
 		assert!(err.to_string().contains("failed process identity verification"));
+	}
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn focus_process_uses_exact_helper_argv_when_helper_path_present() {
+		let unique = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let temp_dir = std::env::temp_dir().join(format!("carbon-helper-argv-{unique}"));
+		fs::create_dir_all(&temp_dir).unwrap();
+		let script_path = temp_dir.join("mock_helper.sh");
+		let log_path = temp_dir.join("args.txt");
+		fs::write(
+			&script_path,
+			format!("#!/bin/sh\necho \"$@\" > {}\nexit 0\n", log_path.display()),
+		)
+		.unwrap();
+		use std::os::unix::fs::PermissionsExt;
+		fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+		let result = focus_process(Some(&script_path), 54321);
+		assert!(result.is_ok());
+		let recorded_args = fs::read_to_string(&log_path).unwrap();
+		assert_eq!(recorded_args.trim(), "focus 54321");
+		let _ = fs::remove_dir_all(&temp_dir);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn focus_process_surfaces_helper_failures_without_fallback() {
+		let unique = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let temp_dir = std::env::temp_dir().join(format!("carbon-helper-fail-{unique}"));
+		fs::create_dir_all(&temp_dir).unwrap();
+		let script_path = temp_dir.join("failing_helper.sh");
+		fs::write(
+			&script_path,
+			"#!/bin/sh\necho \"native focus helper failed\" >&2\nexit 1\n",
+		)
+		.unwrap();
+		use std::os::unix::fs::PermissionsExt;
+		fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+		let err = focus_process(Some(&script_path), 54321).unwrap_err();
+		assert!(err.to_string().contains("native focus helper failed"));
+		let _ = fs::remove_dir_all(&temp_dir);
 	}
 }

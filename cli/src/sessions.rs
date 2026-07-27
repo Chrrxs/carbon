@@ -21,6 +21,8 @@ pub struct Session {
 	pub studio_pid: Option<u32>,
 	#[serde(default)]
 	pub worktree: Option<PathBuf>,
+	#[serde(default)]
+	pub helper_path: Option<PathBuf>,
 }
 
 impl Session {
@@ -357,6 +359,7 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(20),
 			worktree: Some(PathBuf::from("/tmp/direct-worktree")),
+			helper_path: None,
 		};
 		assert_eq!(register_in(&directory, None, session.clone()).unwrap(), "0");
 
@@ -393,6 +396,7 @@ mod tests {
 							port: Some(8100 + index as u16),
 							studio_pid: Some(20_000 + index as u32),
 							worktree: None,
+							helper_path: None,
 						},
 					)
 					.unwrap()
@@ -418,6 +422,7 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(10),
 			worktree: Some(PathBuf::from("/tmp/first")),
+			helper_path: None,
 		};
 		let second = Session {
 			pid: 2,
@@ -425,6 +430,7 @@ mod tests {
 			port: Some(8001),
 			studio_pid: Some(11),
 			worktree: Some(PathBuf::from("/tmp/second")),
+			helper_path: None,
 		};
 		let sessions = Sessions {
 			last_session: "first".to_owned(),
@@ -449,6 +455,7 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(20),
 			worktree: Some(PathBuf::from("/tmp/old")),
+			helper_path: None,
 		};
 		register_in(&directory, Some("0".to_owned()), old.clone()).unwrap();
 		let snapshot = HashMap::from([("0".to_owned(), old)]);
@@ -458,6 +465,7 @@ mod tests {
 			port: Some(8001),
 			studio_pid: Some(21),
 			worktree: Some(PathBuf::from("/tmp/replacement")),
+			helper_path: None,
 		};
 		register_in(&directory, Some("0".to_owned()), replacement.clone()).unwrap();
 
@@ -483,6 +491,22 @@ port = 8000
 
 		assert_eq!(session.studio_pid, None);
 		assert_eq!(session.worktree, None);
+		assert_eq!(session.helper_path, None);
+	}
+
+	#[test]
+	fn session_persistence_roundtrips_helper_path() {
+		let session = Session {
+			pid: 42,
+			host: Some("127.0.0.1".to_owned()),
+			port: Some(8000),
+			studio_pid: Some(100),
+			worktree: Some(PathBuf::from("/tmp/carbon-persistence")),
+			helper_path: Some(PathBuf::from("C:\\Carbon\\carbon-studio-helper.exe")),
+		};
+		let serialized = toml::to_string(&session).unwrap();
+		let deserialized: Session = toml::from_str(&serialized).unwrap();
+		assert_eq!(deserialized, session);
 	}
 
 	#[test]
@@ -493,6 +517,7 @@ port = 8000
 			port: Some(8000),
 			studio_pid: Some(101),
 			worktree: Some(PathBuf::from("/tmp/carbon-first")),
+			helper_path: None,
 		};
 		let second = Session {
 			pid: 2,
@@ -500,6 +525,7 @@ port = 8000
 			port: Some(8001),
 			studio_pid: Some(102),
 			worktree: Some(PathBuf::from("/tmp/carbon-second")),
+			helper_path: None,
 		};
 		let sessions = Sessions {
 			last_session: "first".to_owned(),
@@ -523,6 +549,7 @@ port = 8000
 			port: Some(8000),
 			studio_pid: Some(101),
 			worktree: Some(PathBuf::from("/tmp/carbon-duplicate")),
+			helper_path: None,
 		};
 		let sessions = Sessions {
 			last_session: "first".to_owned(),

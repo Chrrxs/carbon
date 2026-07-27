@@ -40,6 +40,38 @@ if ! grep -Fq -- '(Join-Path $stage "carbon-studio-helper.exe")' "$BUILD_SCRIPT"
 	failure=1
 fi
 
+HELPER_SOURCE="${SCRIPT_DIR}/carbon-studio-helper.cpp"
+
+if ! grep -Fq -- 'Usage: carbon-studio-helper <launch|inject|terminate|focus> [args...]' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper usage does not mention focus command" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Usage: carbon-studio-helper focus <pid>' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus usage is missing" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'cmd_focus' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper does not implement cmd_focus" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'RobloxStudioBeta.exe' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus does not validate RobloxStudioBeta.exe process name" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'keybd_event(VK_MENU' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus does not handle synthetic Alt input retry" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'GetForegroundWindow' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus does not verify GetForegroundWindow" >&2
+	failure=1
+fi
+
 if ((failure != 0)); then
 	exit "$failure"
 fi

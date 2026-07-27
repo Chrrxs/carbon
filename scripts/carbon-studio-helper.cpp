@@ -732,10 +732,157 @@ static int cmd_terminate(
     }
     return 0;
 }
+struct FocusWindowCandidate {
+    HWND hwnd;
+    LONG area;
+};
+
+struct FocusEnumContext {
+    DWORD target_pid;
+    bool allow_tool_window;
+    std::vector<FocusWindowCandidate> candidates;
+};
+
+static BOOL CALLBACK enum_windows_callback(HWND hwnd, LPARAM lParam) {
+    FocusEnumContext* ctx = reinterpret_cast<FocusEnumContext*>(lParam);
+    if (!ctx) return FALSE;
+
+    DWORD window_pid = 0;
+    GetWindowThreadProcessId(hwnd, &window_pid);
+    if (window_pid != ctx->target_pid) {
+        return TRUE;
+    }
+
+    if (!IsWindowVisible(hwnd)) {
+        return TRUE;
+    }
+
+    if (GetWindow(hwnd, GW_OWNER) != NULL) {
+        return TRUE;
+    }
+
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if ((style & WS_CHILD) != 0) {
+        return TRUE;
+    }
+
+    if (!ctx->allow_tool_window) {
+        LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ((ex_style & WS_EX_TOOLWINDOW) != 0) {
+            return TRUE;
+        }
+    }
+
+    RECT r = { 0, 0, 0, 0 };
+    LONG area = 0;
+    if (GetWindowRect(hwnd, &r)) {
+        LONG width = r.right - r.left;
+        LONG height = r.bottom - r.top;
+        if (width > 0 && height > 0) {
+            area = width * height;
+        }
+    }
+
+    FocusWindowCandidate candidate;
+    candidate.hwnd = hwnd;
+    candidate.area = area;
+    ctx->candidates.push_back(candidate);
+
+    return TRUE;
+}
+
+static int cmd_focus(const std::string& pid_str) {
+    uint32_t parsed_pid = 0;
+    if (!parse_uint32(pid_str, parsed_pid)) {
+        std::cerr << "Invalid PID argument\n";
+        return 1;
+    }
+    DWORD pid = static_cast<DWORD>(parsed_pid);
+
+    SafeHandle hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+    if (!hProcess) {
+        hProcess.reset(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    }
+    if (!hProcess) {
+        std::cerr << "OpenProcess failed for PID " << pid << ": " << GetLastError() << "\n";
+        return 1;
+    }
+
+    DWORD exitCode = 0;
+    if (!GetExitCodeProcess(hProcess.get(), &exitCode) || exitCode != STILL_ACTIVE) {
+        std::cerr << "Roblox Studio process " << pid << " is not running\n";
+        return 1;
+    }
+
+    wchar_t exePath[32768] = { 0 };
+    DWORD size = 32768;
+    if (!QueryFullProcessImageNameW(hProcess.get(), 0, exePath, &size)) {
+        std::cerr << "QueryFullProcessImageNameW failed for PID " << pid << ": " << GetLastError() << "\n";
+        return 1;
+    }
+
+    const wchar_t* filename = wcsrchr(exePath, L'\\');
+    if (!filename) {
+        filename = wcsrchr(exePath, L'/');
+    }
+    filename = filename ? filename + 1 : exePath;
+
+    if (_wcsicmp(filename, L"RobloxStudioBeta.exe") != 0) {
+        std::cerr << "Process " << pid << " is not RobloxStudioBeta.exe\n";
+        return 1;
+    }
+
+    FocusEnumContext ctx;
+    ctx.target_pid = pid;
+    ctx.allow_tool_window = false;
+    EnumWindows(enum_windows_callback, reinterpret_cast<LPARAM>(&ctx));
+
+    if (ctx.candidates.empty()) {
+        ctx.allow_tool_window = true;
+        EnumWindows(enum_windows_callback, reinterpret_cast<LPARAM>(&ctx));
+    }
+
+    if (ctx.candidates.empty()) {
+        std::cerr << "Roblox Studio process " << pid << " has no main window\n";
+        return 1;
+    }
+
+    std::stable_sort(ctx.candidates.begin(), ctx.candidates.end(),
+        [](const FocusWindowCandidate& a, const FocusWindowCandidate& b) {
+            return a.area > b.area;
+        });
+
+    HWND target_hwnd = ctx.candidates.front().hwnd;
+
+    ShowWindowAsync(target_hwnd, SW_RESTORE);
+    SetForegroundWindow(target_hwnd);
+
+    if (GetForegroundWindow() != target_hwnd) {
+        struct AltKeyGuard {
+            ~AltKeyGuard() {
+                keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+            }
+        };
+
+        keybd_event(VK_MENU, 0, 0, 0);
+        {
+            AltKeyGuard alt_guard;
+            (void)alt_guard;
+            SetForegroundWindow(target_hwnd);
+        }
+    }
+
+    if (GetForegroundWindow() != target_hwnd) {
+        std::cerr << "Windows denied foreground activation for Roblox Studio process " << pid << "\n";
+        return 1;
+    }
+
+    return 0;
+}
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: carbon-studio-helper <launch|inject|terminate> [args...]\n";
+        std::cerr << "Usage: carbon-studio-helper <launch|inject|terminate|focus> [args...]\n";
         return 1;
     }
 
@@ -759,6 +906,12 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return cmd_terminate(argv[2], argv[3], argv[4]);
+    } else if (cmd == "focus") {
+        if (argc != 3) {
+            std::cerr << "Usage: carbon-studio-helper focus <pid>\n";
+            return 1;
+        }
+        return cmd_focus(argv[2]);
     }
 
     std::cerr << "Unknown command: " << cmd << "\n";
