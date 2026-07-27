@@ -125,14 +125,24 @@ grep -Fq 'carbon-studio-helper.cpp' "${REPO}/scripts/build-rml.ps1" ||
 grep -Fq '(Join-Path $stage "carbon-studio-helper.exe")' "${REPO}/scripts/build-rml.ps1" ||
 	fail "RML packaging must require carbon-studio-helper.exe"
 
-grep -Fq '## Platform support' "${REPO}/README.md" ||
-	fail "README.md must state platform support"
-grep -Fq '## Who Carbon is for' "${REPO}/README.md" ||
-	fail "README.md must identify its intended users"
-grep -Fq '## Carbon vs. Rojo' "${REPO}/README.md" ||
-	fail "README.md must explain when to choose Carbon over Rojo"
-grep -Fq 'instance-aware source control' "${REPO}/README.md" ||
-	fail "README.md must identify semantic instance merges as Carbon's advantage"
+grep -Fq '## System requirements' "${REPO}/README.md" ||
+	fail "README.md must state system requirements"
+grep -Fq '## Select Carbon or Rojo' "${REPO}/README.md" ||
+	fail "README.md must explain when to select Carbon or Rojo"
+grep -Fq 'stable instance identities' "${REPO}/README.md" ||
+	fail "README.md must identify stable instance merges as a Carbon advantage"
+grep -Fq '## Architectural differences from Rojo' "${REPO}/README.md" ||
+	fail "README.md must identify the architectural differences from Rojo"
+grep -Fq '### Use narrow mappings' "${REPO}/README.md" ||
+	fail "README.md must recommend narrow mappings"
+grep -Fq 'cannot retain a new Studio-owned instance in that service.' "${REPO}/README.md" ||
+	fail "README.md must explain the full-service mapping limitation"
+grep -Fq '### Do not mix source domains below a mapping' "${REPO}/README.md" ||
+	fail "README.md must prohibit mixed source domains below a mapping"
+grep -Fq 'Carbon permits these classes below a mapping:' "${REPO}/README.md" ||
+	fail "README.md must list the supported mapped classes"
+grep -Fq '$ignoreUnknownInstances' "${REPO}/README.md" ||
+	fail "README.md must identify unsupported Rojo project behavior"
 grep -Fxq 'rokit add Chrrxs/carbon' "${REPO}/README.md" ||
 	fail "README.md must install Carbon through Rokit's latest-release resolution"
 if grep -Fq 'rokit add Chrrxs/carbon@' "${REPO}/README.md"; then
@@ -140,8 +150,15 @@ if grep -Fq 'rokit add Chrrxs/carbon@' "${REPO}/README.md"; then
 fi
 grep -Fq '[Usage and project format](USAGE.md)' "${REPO}/README.md" ||
 	fail "README.md must move detailed usage into USAGE.md"
-[[ "$(wc -l < "${REPO}/README.md")" -le 100 ]] ||
-	fail "README.md must remain at most 100 lines"
+[[ "$(wc -l < "${REPO}/README.md")" -le 300 ]] ||
+	fail "README.md must remain at most 300 lines"
+if grep -Fq ';' "${REPO}/README.md"; then
+	fail "README.md must not use semicolons"
+fi
+if grep -Eiq "\\b(can't|doesn't|don't|isn't|won't|it's|you're|we're|they're|hasn't|haven't|didn't)\\b" \
+	"${REPO}/README.md"; then
+	fail "README.md must not use contractions"
+fi
 grep -Fq '[Contributing](CONTRIBUTING.md)' "${REPO}/README.md" ||
 	fail "README.md must link to CONTRIBUTING.md"
 grep -Fq '[Security policy](SECURITY.md)' "${REPO}/README.md" ||

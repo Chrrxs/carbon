@@ -1,51 +1,84 @@
 # Carbon
 
-Carbon is a hybrid source workflow for whole Roblox places. You choose which
-Folder and script subtrees are owned by local files; everything else remains
-authored in Studio and is captured as a deterministic, mergeable artifact.
+Carbon puts complete Roblox places in source control without forcing every
+instance into the filesystem.
 
-Mapped source synchronizes live in one direction. Studio-owned state changes
-only when you explicitly capture it, so ownership never depends on which copy
-changed last.
+Local files own selected Folder and script subtrees. Studio owns everything
+else. Carbon captures Studio-owned state in a deterministic artifact and uses
+stable instance identities to merge independent changes.
+
+Mapped source syncs from the filesystem to Studio. Run a capture to save
+Studio-owned changes.
 
 > [!IMPORTANT]
-> Carbon is pre-1.0. Releases support Roblox Studio on x86_64 Windows both
-> natively and through WSL2, and project formats may still change before 1.0.
+> Carbon is pre-1.0. It supports Roblox Studio on x86_64 Windows, either
+> natively or through WSL2. The project format can change before 1.0.
 
-## Who Carbon is for
+## Source ownership
 
-Carbon is for Roblox developers and teams who want external editors and Git for
-code without reconstructing every model, UI, or authored object as filesystem
-source. It is especially useful for existing, Studio-heavy places that need
-repeatable builds, whole-place versioning, and meaningful Git merges.
+- **Mapped source:** Local files own the mapped instance and every descendant.
+- **Studio-owned state:** Studio owns every instance outside a mapping.
 
-Carbon is not the simplest choice for a filesystem-only project, a reusable
-package, or a workflow where Studio should automatically overwrite local code.
+Each instance has one source domain. Carbon removes Studio-only changes below
+a mapping during source reconciliation.
 
-## Carbon vs. Rojo
+## Select Carbon or Rojo
 
-Carbon's main advantage is instance-aware source control for the complete
-place. Its artifact gives instances stable identities, so Carbon can merge
-independent renames, reparents, property edits, additions, and deletions by
-their meaning instead of treating the place as an opaque binary file.
+Use Carbon when local source and Studio-authored content must coexist in one
+place, and the complete place must support semantic Git merges.
 
-| Tool | Best fit |
-| --- | --- |
-| [Carbon](https://github.com/Chrrxs/carbon) | Selected trees belong to the filesystem, the rest belongs to Studio, and instance changes across the complete place must merge semantically. |
-| [Rojo](https://github.com/rojo-rbx/rojo) | The filesystem is the primary source of truth and you want the established Rojo ecosystem. |
+Use [Rojo](https://github.com/rojo-rbx/rojo) when the filesystem is the primary
+source of truth or you need the full Rojo project format and ecosystem.
 
-Choose Carbon over Rojo when you need an explicit filesystem/Studio ownership
-split and semantic conflict handling for Studio-authored instances. When two
-branches edit the same instance field incompatibly, Carbon reports a structured
-conflict with instance context and resolves it through an explicit plan.
+## Architectural differences from Rojo
 
-## Platform support
+Carbon uses a Rojo-shaped project tree, but its ownership model is stricter.
+
+### Use narrow mappings
+
+A `$path` owns its root and every descendant. A mapping on an engine service
+owns all contents of that service. Carbon cannot retain a new Studio-owned
+instance in that service.
+
+Map only the folders and scripts that the filesystem must own. Unmapped
+siblings can remain Studio-owned.
+
+### Do not mix source domains below a mapping
+
+Create mapped instances in local source. Create Studio-owned instances under
+Studio-owned parents. Removing a mapping does not transfer its old subtree to
+Studio-owned state.
+
+The project root must be a `DataModel` and cannot have `$path`. Its direct
+children must be Roblox services. Mappings can be engine anchors, direct
+children of services, or supported containers below `StarterPlayer`. Carbon
+cannot route a mapping through an arbitrary Studio-owned instance.
+
+Carbon project nodes support `$className`, `$path`, `$id`, `$properties`, and
+`$attributes`. Carbon rejects other special fields, including Rojo
+`$ignoreUnknownInstances` behavior.
+
+Carbon permits these classes below a mapping:
+
+- `Folder`
+- `Script`
+- `LocalScript`
+- `ModuleScript`
+
+Mapped directories can contain scripts, child directories, and one optional
+`meta.json`. Carbon does not load `.rbxl` or `.rbxm` files below mappings.
+
+Studio-owned instances can refer to mapped instances. Mapped instances cannot
+refer to Studio-owned instances.
+
+See [Usage and project format](USAGE.md) for the full mapping and capture rules.
+
+## System requirements
 
 - Windows 10 or 11 on an x86_64 machine
-- Roblox Studio installed on Windows
-- Native Windows or WSL2 for the Carbon CLI
-- [Rokit](https://github.com/rojo-rbx/rokit) installed in the same environment
-  as the Carbon CLI
+- Roblox Studio on Windows
+- Carbon CLI on native Windows or WSL2
+- [Rokit](https://github.com/rojo-rbx/rokit) in the CLI environment
 
 ## Install
 
@@ -53,30 +86,25 @@ conflict with instance context and resolves it through an explicit plan.
 rokit add Chrrxs/carbon
 ```
 
-The executable contains its matching RML runtime and Studio plugin. Carbon
-installs or updates both automatically when `serve` or `studio` starts.
-Rokit selects the native Windows x86_64 build in Windows and the Linux x86_64
-build in WSL2.
+The executable includes its matching RML runtime and Studio plugin. Carbon
+installs or updates them when `serve` or `studio` starts.
 
-## Start a project
+## Start
 
 ```sh
 # Convert an existing place.
 carbon migrate existing.rbxl --output game.carbon.json
 
-# Or create a new project.
+# Or create a project.
 carbon init --output game.carbon.json --name Game
 
-# Start live mapped-source sync and Studio.
+# Start live sync and Studio.
 carbon serve game.carbon.json
 
-# Focus the Studio managed for this Git worktree.
-carbon focus --worktree .
-
-# Save Studio-owned state using the instance ID printed by `serve`.
+# Save Studio-owned state with the instance ID from serve.
 carbon capture 'anon:550e8400-e29b-41d4-a716-446655440000'
 
-# Produce a place file.
+# Build a place file.
 carbon build game.carbon.json --output game.rbxl
 ```
 
