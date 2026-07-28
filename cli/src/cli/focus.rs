@@ -24,10 +24,15 @@ pub struct Focus {
 	/// Any path inside the Git worktree served by the Studio instance.
 	#[arg(long, value_name = "PATH")]
 	worktree: Option<PathBuf>,
+
+	/// Restore the previously foreground window after activating Studio.
+	#[arg(long)]
+	restore: bool,
 }
 
 impl Focus {
 	pub fn main(self) -> Result<()> {
+		let restore = self.restore;
 		let (session, target) = match (self.instance_id, self.port, self.worktree) {
 			(Some(instance_id), None, None) => {
 				let session = sessions::get(Some(instance_id.clone()), None, None)?
@@ -60,9 +65,30 @@ impl Focus {
 			studio_pid,
 			session.creation_filetime,
 			session.studio_executable.as_deref(),
+			restore,
 		)
 		.with_context(|| format!("failed to focus the Studio process registered for {target}"))?;
-		crate::carbon_info!("Activated Roblox Studio PID {studio_pid} for {target} and restored the previous window");
+		if restore {
+			crate::carbon_info!(
+				"Activated Roblox Studio PID {studio_pid} for {target} and restored the previous window"
+			);
+		} else {
+			crate::carbon_info!("Focused Roblox Studio PID {studio_pid} for {target}");
+		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn restoring_the_previous_window_is_opt_in() {
+		let focused = Focus::try_parse_from(["focus", "session-id"]).unwrap();
+		assert!(!focused.restore);
+
+		let restored = Focus::try_parse_from(["focus", "--restore", "session-id"]).unwrap();
+		assert!(restored.restore);
 	}
 }

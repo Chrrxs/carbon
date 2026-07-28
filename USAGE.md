@@ -44,6 +44,7 @@ carbon serve game.carbon.json
 carbon focus --worktree .
 carbon focus 'anon:550e8400-e29b-41d4-a716-446655440000'
 carbon focus --port 8000
+carbon focus --worktree . --restore
 
 # Capture Studio-owned state using the instance ID printed by `serve`.
 carbon capture 'anon:550e8400-e29b-41d4-a716-446655440000'
@@ -62,12 +63,15 @@ disposable place and printed during startup, so managed sessions from separate
 Git worktrees can build, launch, synchronize, capture, and stop concurrently.
 Each endpoint accepts one Studio client.
 
-`carbon focus` activates the exact native Studio process launched for the
-selected serve session. A worktree target may be the repository root or any
-path inside it. Carbon never falls back to window-title matching; if more than
-one session is registered for the same worktree, select it by instance ID or
-port instead. Serve sessions started by an older Carbon version must be
-restarted once so their Studio process and worktree identity are registered.
+`carbon focus` leaves the exact native Studio process launched for the selected
+serve session in the foreground. If Studio owns an active modal dialog, Carbon
+focuses that dialog instead of the disabled main window. Pass `--restore` to
+verify Studio activation and then return to the previously foreground window.
+A worktree target may be the repository root or any path inside it. Carbon never
+falls back to window-title matching; if more than one session is registered for
+the same worktree, select it by instance ID or port instead. Serve sessions
+started by an older Carbon version must be restarted once so their Studio
+process and worktree identity are registered.
 
 When `robloxstudio-mcp` owns the Studio lifecycle, the connected message prints
 the instance ID reported by `manage_instance`; pass that ID to `carbon capture`

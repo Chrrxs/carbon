@@ -790,6 +790,24 @@ static BOOL CALLBACK enum_windows_callback(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
+static HWND focus_target(HWND root_hwnd, DWORD process_id) {
+    HWND target_hwnd = root_hwnd;
+    for (int depth = 0; depth < 16; ++depth) {
+        HWND popup_hwnd = GetLastActivePopup(target_hwnd);
+        if (popup_hwnd == NULL || popup_hwnd == target_hwnd || !IsWindowVisible(popup_hwnd)) {
+            break;
+        }
+
+        DWORD popup_pid = 0;
+        GetWindowThreadProcessId(popup_hwnd, &popup_pid);
+        if (popup_pid != process_id) {
+            break;
+        }
+        target_hwnd = popup_hwnd;
+    }
+    return target_hwnd;
+}
+
 static bool activate_window(HWND target_hwnd) {
     SetForegroundWindow(target_hwnd);
 
@@ -832,8 +850,15 @@ static bool activate_window(HWND target_hwnd) {
 static int cmd_focus(
     const std::string& pid_str,
     const std::string& filetime_str,
-    const std::string& studio_b64
+    const std::string& studio_b64,
+    const std::string& restore_str
 ) {
+    if (restore_str != "0" && restore_str != "1") {
+        std::cerr << "Invalid restore flag (must be 0 or 1)\n";
+        return 1;
+    }
+    bool restore_previous = (restore_str == "1");
+
     DWORD pid = 0;
     SafeHandle hProcess;
     if (!validate_process_identity(
@@ -868,8 +893,9 @@ static int cmd_focus(
             return a.area > b.area;
         });
 
-    HWND target_hwnd = ctx.candidates.front().hwnd;
-    HWND previous_hwnd = GetForegroundWindow();
+    HWND root_hwnd = ctx.candidates.front().hwnd;
+    HWND target_hwnd = focus_target(root_hwnd, pid);
+    HWND previous_hwnd = restore_previous ? GetForegroundWindow() : NULL;
 
     if (IsIconic(target_hwnd)) {
         ShowWindowAsync(target_hwnd, SW_RESTORE);
@@ -879,7 +905,7 @@ static int cmd_focus(
         return 1;
     }
 
-    if (previous_hwnd != NULL && previous_hwnd != target_hwnd && IsWindow(previous_hwnd)) {
+    if (restore_previous && previous_hwnd != NULL && previous_hwnd != target_hwnd && IsWindow(previous_hwnd)) {
         if (!activate_window(previous_hwnd)) {
             std::cerr << "Windows denied restoration of the previously focused window\n";
             return 1;
@@ -916,11 +942,11 @@ int main(int argc, char* argv[]) {
         }
         return cmd_terminate(argv[2], argv[3], argv[4]);
     } else if (cmd == "focus") {
-        if (argc != 5) {
-            std::cerr << "Usage: carbon-studio-helper focus <pid> <filetime> <studio_b64>\n";
+        if (argc != 6) {
+            std::cerr << "Usage: carbon-studio-helper focus <pid> <filetime> <studio_b64> <restore_0_or_1>\n";
             return 1;
         }
-        return cmd_focus(argv[2], argv[3], argv[4]);
+        return cmd_focus(argv[2], argv[3], argv[4], argv[5]);
     }
 
     std::cerr << "Unknown command: " << cmd << "\n";

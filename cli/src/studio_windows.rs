@@ -13,9 +13,9 @@ use windows_sys::Win32::{
 	UI::{
 		Input::KeyboardAndMouse::SetFocus,
 		WindowsAndMessaging::{
-			BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-			GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindowAsync,
-			GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE, WS_CHILD, WS_EX_TOOLWINDOW,
+			BringWindowToTop, EnumWindows, GetForegroundWindow, GetLastActivePopup, GetWindow, GetWindowLongPtrW,
+			GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow,
+			ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE, WS_CHILD, WS_EX_TOOLWINDOW,
 		},
 	},
 };
@@ -253,6 +253,27 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, l_param: LPARAM) -> 
 }
 
 #[cfg(target_os = "windows")]
+fn focus_target(root_hwnd: HWND, process_id: u32) -> HWND {
+	let mut target_hwnd = root_hwnd;
+	for _ in 0..16 {
+		let popup_hwnd = unsafe { GetLastActivePopup(target_hwnd) };
+		if popup_hwnd.is_null() || popup_hwnd == target_hwnd || unsafe { IsWindowVisible(popup_hwnd) } == 0 {
+			break;
+		}
+
+		let mut popup_pid = 0u32;
+		unsafe {
+			GetWindowThreadProcessId(popup_hwnd, &mut popup_pid);
+		}
+		if popup_pid != process_id {
+			break;
+		}
+		target_hwnd = popup_hwnd;
+	}
+	target_hwnd
+}
+
+#[cfg(target_os = "windows")]
 fn activate_window(target_hwnd: HWND) -> bool {
 	unsafe {
 		SetForegroundWindow(target_hwnd);
@@ -297,7 +318,12 @@ fn activate_window(target_hwnd: HWND) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub fn focus_process(process_id: u32, creation_filetime: u64, studio_executable: &str) -> Result<()> {
+pub fn focus_process(
+	process_id: u32,
+	creation_filetime: u64,
+	studio_executable: &str,
+	restore_previous: bool,
+) -> Result<()> {
 	let _h_process = validate_process_identity(process_id, creation_filetime, studio_executable)?;
 
 	let mut ctx = FocusEnumContext {
@@ -323,8 +349,13 @@ pub fn focus_process(process_id: u32, creation_filetime: u64, studio_executable:
 
 	ctx.candidates.sort_by(|a, b| b.area.cmp(&a.area));
 
-	let target_hwnd = ctx.candidates[0].hwnd;
-	let previous_hwnd = unsafe { GetForegroundWindow() };
+	let root_hwnd = ctx.candidates[0].hwnd;
+	let target_hwnd = focus_target(root_hwnd, process_id);
+	let previous_hwnd = if restore_previous {
+		unsafe { GetForegroundWindow() }
+	} else {
+		std::ptr::null_mut()
+	};
 
 	unsafe {
 		if IsIconic(target_hwnd) != 0 {
@@ -338,7 +369,8 @@ pub fn focus_process(process_id: u32, creation_filetime: u64, studio_executable:
 		);
 	}
 
-	if !previous_hwnd.is_null()
+	if restore_previous
+		&& !previous_hwnd.is_null()
 		&& previous_hwnd != target_hwnd
 		&& unsafe { IsWindow(previous_hwnd) } != 0
 		&& !activate_window(previous_hwnd)
@@ -350,6 +382,11 @@ pub fn focus_process(process_id: u32, creation_filetime: u64, studio_executable:
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn focus_process(_process_id: u32, _creation_filetime: u64, _studio_executable: &str) -> Result<()> {
+pub fn focus_process(
+	_process_id: u32,
+	_creation_filetime: u64,
+	_studio_executable: &str,
+	_restore_previous: bool,
+) -> Result<()> {
 	anyhow::bail!("studio_windows::focus_process is only supported on Windows")
 }

@@ -1836,10 +1836,56 @@ fn terminate_process(
 	Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn inline_osascript(script: &str) -> Command {
+	let mut command = Command::new("osascript");
+	command.args(["-e", script]);
+	command
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_focus_process_script(process_id: u32, restore_previous: bool) -> String {
+	let capture_previous = if restore_previous {
+		"set previousProcess to first process whose frontmost is true\n\tset previousProcessId to unix id of previousProcess"
+	} else {
+		""
+	};
+	let restore_previous = if restore_previous {
+		format!(
+			r#"if previousProcessId is not {process_id} then
+		tell previousProcess
+			set frontmost to true
+			if (count of windows) > 0 then perform action "AXRaise" of window 1
+		end tell
+	end if"#
+		)
+	} else {
+		String::new()
+	};
+	format!(
+		r#"tell application "System Events"
+	{capture_previous}
+	set matches to every process whose unix id is {process_id} and name is "RobloxStudio"
+	if (count of matches) is not 1 then error "Managed Roblox Studio process {process_id} is not running"
+	tell item 1 of matches
+		set frontmost to true
+		perform action "AXRaise" of window 1
+	end tell
+	{restore_previous}
+end tell"#
+	)
+}
+
 /// Focus exactly the managed Roblox Studio process identified at launch.
 /// Process-name validation prevents a recycled native PID from targeting an
-/// unrelated application after Studio exits.
-pub fn focus_process(process_id: u32, creation_filetime: Option<u64>, studio_executable: Option<&str>) -> Result<()> {
+/// unrelated application after Studio exits. The focused Studio window remains
+/// in the foreground unless `restore_previous` is requested.
+pub fn focus_process(
+	process_id: u32,
+	creation_filetime: Option<u64>,
+	studio_executable: Option<&str>,
+	restore_previous: bool,
+) -> Result<()> {
 	let metadata = match (creation_filetime, studio_executable) {
 		(Some(creation_filetime), Some(studio_executable)) => Some((creation_filetime, studio_executable)),
 		(None, None) => None,
@@ -1855,7 +1901,7 @@ pub fn focus_process(process_id: u32, creation_filetime: Option<u64>, studio_exe
 		let (creation_filetime, studio_executable) = metadata.context(
 			"incomplete focus metadata: creation_filetime and studio_executable are required for Roblox Studio focus",
 		)?;
-		crate::studio_windows::focus_process(process_id, creation_filetime, studio_executable)
+		crate::studio_windows::focus_process(process_id, creation_filetime, studio_executable, restore_previous)
 	}
 
 	#[cfg(target_os = "linux")]
@@ -1875,6 +1921,7 @@ pub fn focus_process(process_id: u32, creation_filetime: Option<u64>, studio_exe
 				&process_id.to_string(),
 				&creation_filetime.to_string(),
 				&encoded_executable,
+				if restore_previous { "1" } else { "0" },
 			])
 			.stdin(Stdio::null())
 			.stdout(Stdio::piped())
@@ -1892,17 +1939,8 @@ pub fn focus_process(process_id: u32, creation_filetime: Option<u64>, studio_exe
 	#[cfg(target_os = "macos")]
 	{
 		let _ = metadata;
-		let script = format!(
-			r#"tell application "System Events"
-	set matches to every process whose unix id is {process_id} and name is "RobloxStudio"
-	if (count of matches) is not 1 then error "Managed Roblox Studio process {process_id} is not running"
-	tell item 1 of matches
-		set frontmost to true
-		perform action "AXRaise" of window 1
-	end tell
-end tell"#
-		);
-		let output = Command::new("osascript").args(["-e", script.as_str()]).output()?;
+		let script = macos_focus_process_script(process_id, restore_previous);
+		let output = inline_osascript(&script).output()?;
 		anyhow::ensure!(
 			output.status.success(),
 			"Roblox Studio window activation failed: {}",
@@ -1923,11 +1961,15 @@ end tell"#
 pub fn is_running(title: Option<String>) -> Result<bool> {
 	#[cfg(target_os = "macos")]
 	{
-		let output = Command::new("osascript")
-			.args([
-					"tell app \"System Events\" to get the title of every window of (processes whose background only is false)",
-				])
-				.output()?;
+		let output = inline_osascript(
+			"tell app \"System Events\" to get the title of every window of (processes whose background only is false)",
+		)
+		.output()?;
+		anyhow::ensure!(
+			output.status.success(),
+			"failed to inspect Roblox Studio windows: {}",
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
 
 		let windows = String::from_utf8(output.stdout)?;
 
@@ -1973,10 +2015,8 @@ pub fn focus(title: Option<String>) -> Result<()> {
 	#[cfg(target_os = "macos")]
 	{
 		if let Some(title) = title {
-			Command::new("osascript")
-				.args([
-					"-e",
-					r#"tell application "System Events"
+			inline_osascript(
+				r#"tell application "System Events"
 						repeat with theProcess in processes whose name is "RobloxStudio"
 								tell theProcess
 									set windowList to windows whose name contains "Carbon - Roblox Studio"
@@ -1988,20 +2028,18 @@ pub fn focus(title: Option<String>) -> Result<()> {
 								end tell
 						end repeat
 					end tell"#,
-				])
-				.output()?;
+			)
+			.output()?;
 		} else {
-			Command::new("osascript")
-				.args([
-					"-e",
-					r#"tell application "System Events"
+			inline_osascript(
+				r#"tell application "System Events"
 						tell process "RobloxStudio"
 							set frontmost to true
 							perform action "AXRaise" of window 1
 						end tell
 					end tell"#,
-				])
-				.output()?;
+			)
+			.output()?;
 		}
 
 		Ok(())
@@ -2819,7 +2857,7 @@ mod tests {
 		let log_path = temp_dir.join("args.txt");
 		fs::write(
 			&script_path,
-			format!("#!/bin/sh\necho \"$@\" > {}\nexit 0\n", log_path.display()),
+			format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log_path.display()),
 		)
 		.unwrap();
 		use std::os::unix::fs::PermissionsExt;
@@ -2832,7 +2870,8 @@ mod tests {
 
 		let exe_path = r"C:\Roblox\version\RobloxStudioBeta.exe";
 		let expected_b64 = BASE64_STANDARD.encode(exe_path.as_bytes());
-		let result = focus_process(54321, Some(133700123456), Some(exe_path));
+		let default_result = focus_process(54321, Some(133700123456), Some(exe_path), false);
+		let restore_result = focus_process(54321, Some(133700123456), Some(exe_path), true);
 
 		if let Some(old) = old_package {
 			std::env::set_var("CARBON_RML_PACKAGE", old);
@@ -2845,9 +2884,13 @@ mod tests {
 			std::env::remove_var("WSL_DISTRO_NAME");
 		}
 
-		assert!(result.is_ok());
+		assert!(default_result.is_ok());
+		assert!(restore_result.is_ok());
 		let recorded_args = fs::read_to_string(&log_path).unwrap();
-		assert_eq!(recorded_args.trim(), format!("focus 54321 133700123456 {expected_b64}"));
+		assert_eq!(
+			recorded_args.trim(),
+			format!("focus 54321 133700123456 {expected_b64} 0\nfocus 54321 133700123456 {expected_b64} 1")
+		);
 		let _ = fs::remove_dir_all(&temp_dir);
 	}
 
@@ -2898,6 +2941,7 @@ mod tests {
 			54321,
 			Some(133700123456),
 			Some(r"C:\Roblox\version\RobloxStudioBeta.exe"),
+			false,
 		)
 		.unwrap_err();
 
@@ -2918,14 +2962,31 @@ mod tests {
 
 	#[test]
 	fn focus_process_fails_on_partial_metadata() {
-		let err = focus_process(54321, None, None).unwrap_err();
+		let err = focus_process(54321, None, None, false).unwrap_err();
 		assert!(err.to_string().contains("incomplete focus metadata"));
 
-		let err = focus_process(54321, Some(12345), None).unwrap_err();
+		let err = focus_process(54321, Some(12345), None, false).unwrap_err();
 		assert!(err.to_string().contains("incomplete focus metadata"));
 
-		let err = focus_process(54321, None, Some("exe")).unwrap_err();
+		let err = focus_process(54321, None, Some("exe"), false).unwrap_err();
 		assert!(err.to_string().contains("incomplete focus metadata"));
+	}
+
+	#[test]
+	fn inline_osascript_marks_the_following_argument_as_source() {
+		let command = inline_osascript("return 1");
+		let args = command.get_args().collect::<Vec<_>>();
+		assert_eq!(args, [std::ffi::OsStr::new("-e"), std::ffi::OsStr::new("return 1")]);
+	}
+
+	#[test]
+	fn macos_focus_script_restoration_is_opt_in() {
+		let focused = macos_focus_process_script(54321, false);
+		assert!(!focused.contains("previousProcess"));
+
+		let restored = macos_focus_process_script(54321, true);
+		assert!(restored.contains("set previousProcess to first process whose frontmost is true"));
+		assert!(restored.contains("if previousProcessId is not 54321 then"));
 	}
 
 	#[test]

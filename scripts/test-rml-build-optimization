@@ -47,7 +47,7 @@ if ! grep -Fq -- 'Usage: carbon-studio-helper <launch|inject|terminate|focus> [a
 	failure=1
 fi
 
-if ! grep -Fq -- 'Usage: carbon-studio-helper focus <pid> <filetime> <studio_b64>' "$HELPER_SOURCE"; then
+if ! grep -Fq -- 'Usage: carbon-studio-helper focus <pid> <filetime> <studio_b64> <restore_0_or_1>' "$HELPER_SOURCE"; then
 	echo "FAIL: Carbon studio helper focus usage is missing" >&2
 	failure=1
 fi
@@ -69,6 +69,16 @@ fi
 
 if ! grep -Fq -- 'GetForegroundWindow' "$HELPER_SOURCE"; then
 	echo "FAIL: Carbon studio helper focus does not verify GetForegroundWindow" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'GetLastActivePopup' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus does not activate an owned modal window" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'restore_str != "0" && restore_str != "1"' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper focus does not validate the restore flag" >&2
 	failure=1
 fi
 
