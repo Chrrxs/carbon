@@ -1836,14 +1836,14 @@ fn terminate_process(
 	Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn inline_osascript(script: &str) -> Command {
 	let mut command = Command::new("osascript");
 	command.args(["-e", script]);
 	command
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn macos_focus_process_script(process_id: u32, restore_previous: bool) -> String {
 	let capture_previous = if restore_previous {
 		"set previousProcess to first process whose frontmost is true\n\tset previousProcessId to unix id of previousProcess"

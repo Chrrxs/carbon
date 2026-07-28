@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mode="$1"
+project="$2"
+backup="$3"
+temporary="${project}.qualification-reload.$$"
+case "$mode" in
+  trigger)
+    cp -- "$project" "$backup"
+    cp -- "$project" "$temporary"
+    printf '\n' >> "$temporary"
+    mv -- "$temporary" "$project"
+    printf 'manifest reload triggered atomically\n'
+    ;;
+  restore)
+    if [[ ! -f "$backup" ]]; then
+      printf 'manifest restore skipped; no backup was created\n'
+      exit 0
+    fi
+    cp -- "$backup" "$temporary"
+    mv -- "$temporary" "$project"
+    rm -f -- "$backup"
+    printf 'manifest restored atomically\n'
+    ;;
+  *)
+    printf 'usage: %s trigger|restore PROJECT BACKUP\n' "$0" >&2
+    exit 2
+    ;;
+esac

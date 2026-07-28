@@ -32,5 +32,5 @@ for _, expected in required do
 	)
 end
 
-assert(table.concat(database.Version, ".") == "0.731.0.7310942", "bundled reflection version is stale")
+assert(table.concat(database.Version, ".") == "0.732.0.7321040", "bundled reflection version is stale")
 print("PASS: bundled reflection contains the current Studio serialized surface")

@@ -1,6 +1,7 @@
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use colored::Colorize;
+use parking_lot::Mutex;
 use std::{
 	fs, io,
 	net::TcpListener,
@@ -153,6 +154,32 @@ fn capture_before_shutdown(core: &Arc<Core>) -> Result<()> {
 	Ok(())
 }
 
+fn prepare_served_core(
+	project_path: &Path,
+	project_name: &str,
+	worktree_id: &str,
+	session_token: &str,
+	control_sender: &server::ServeControlSender,
+) -> Result<(Arc<Core>, PathBuf)> {
+	let materialized = project::materialize(project_path).context("failed to materialize served project topology")?;
+	let policy = project::live_policy(project_path, &materialized);
+	let composite_directory = materialized.directory.clone();
+	let core = Arc::new(Core::new_project_with_worktree_and_control(
+		project_path,
+		&materialized,
+		(
+			project_name.to_owned(),
+			worktree_id.to_owned(),
+			session_token.to_owned(),
+		),
+		Some(control_sender.clone()),
+	)?);
+	core.register_ephemeral_path(composite_directory.clone());
+	drop(materialized);
+	project::persist_studio_domain(&policy).context("failed to prune mapping barriers before serve startup")?;
+	Ok((core, composite_directory))
+}
+
 fn connected_instance_id(
 	lifecycle_instance_id: Option<String>,
 	subscribed_instance_id: Option<String>,
@@ -230,49 +257,23 @@ impl Serve {
 			managed_studio.owner()
 		);
 
-		// A cached launch place is ready before Carbon needs the full in-memory
-		// hierarchy. Materialize while Studio starts so repeated serves do not put
-		// a 300k-instance traversal on the launch-critical path.
-		let materialized = match project::materialize(&project_path) {
-			Ok(materialized) => materialized,
+		let (control_sender, control_receiver) = server::serve_control_channel();
+		let (mut core, mut composite_directory) = match prepare_served_core(
+			&project_path,
+			&inspection.name,
+			&worktree_id,
+			&session_token,
+			&control_sender,
+		) {
+			Ok(generation) => generation,
 			Err(error) => {
-				if let Err(stop_error) = managed_studio.stop() {
-					crate::carbon_error!(
-						"failed to stop {}-managed Studio PID {}: {stop_error:#}",
-						managed_studio.owner(),
-						managed_studio.process_id()
-					);
-				}
-				let _ = fs::remove_file(&build_path);
-				return Err(error).context("failed to materialize served project topology");
-			}
-		};
-		let policy = project::live_policy(&project_path, &materialized);
-		let composite_directory = materialized.directory.clone();
-
-		let core = match (|| -> Result<Arc<Core>> {
-			let core = Arc::new(Core::new_project_with_worktree(
-				&project_path,
-				&materialized,
-				(inspection.name.clone(), worktree_id, session_token),
-			)?);
-			core.register_ephemeral_path(build_path.clone());
-			if let Some(token) = std::env::var_os("CARBON_QUALIFICATION_EXPORT_TOKEN") {
-				core.enable_qualification_export(build_path.clone(), token.to_string_lossy().into_owned())?;
-			}
-			core.register_ephemeral_path(composite_directory.clone());
-			// Core retains only its managed projection, so release the composed
-			// snapshot before Studio connects or a native capture begins.
-			drop(materialized);
-			project::persist_studio_domain(&policy).context("failed to prune mapping barriers before serve startup")?;
-			Ok(core)
-		})() {
-			Ok(core) => core,
-			Err(error) => {
-				clean(&build_path, &composite_directory, None, Some(&managed_studio));
+				clean(&build_path, Path::new(""), None, Some(&managed_studio));
 				return Err(error);
 			}
 		};
+		if let Some(token) = std::env::var_os("CARBON_QUALIFICATION_EXPORT_TOKEN") {
+			core.enable_qualification_export(build_path.clone(), token.to_string_lossy().into_owned())?;
+		}
 		let (studio_executable, creation_filetime) = match managed_studio.focus_metadata() {
 			Some(meta) => (Some(meta.studio_executable), Some(meta.creation_filetime)),
 			None => (None, None),
@@ -286,26 +287,19 @@ impl Serve {
 			studio_executable,
 			creation_filetime,
 		};
-		// Serve owns cleanup so it installs the one process-wide signal handler.
 		sessions::add(None, session.clone(), true)?;
-		let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
 		let end_signal_received = Arc::new(AtomicBool::new(false));
 		let handler_end_signal_received = Arc::clone(&end_signal_received);
+		let handler_control = control_sender.clone();
 		let force_build = build_path.clone();
-		let force_composite = composite_directory.clone();
 		let force_session = session.clone();
 		let force_studio = managed_studio.clone();
 		ctrlc::set_handler(move || {
 			if handler_end_signal_received.swap(true, Ordering::AcqRel) {
-				clean(
-					&force_build,
-					&force_composite,
-					Some(&force_session),
-					Some(&force_studio),
-				);
+				clean(&force_build, Path::new(""), Some(&force_session), Some(&force_studio));
 				process::exit(130);
 			}
-			let _ = shutdown_sender.try_send(());
+			let _ = handler_control.try_send(server::ServeControl::Shutdown);
 		})?;
 
 		let ready_endpoint = endpoint.clone();
@@ -332,16 +326,6 @@ impl Serve {
 					}
 					if let Err(error) = sessions::replace_id(&ready_session, instance_id.clone()) {
 						crate::carbon_error!("failed to register Studio instance ID {instance_id}: {error:#}");
-						crate::carbon_info!(
-							"Studio connected. Serving {} instances and {} properties on {}, project: {} (Studio PID {}, lifecycle: {})",
-							report.instances,
-							report.properties,
-							ready_endpoint.bold(),
-							ready_project_path.to_string().bold(),
-							studio_process_id,
-							ready_studio.owner()
-						);
-						return;
 					}
 					crate::carbon_info!(
 						"Studio connected. Serving {} instances and {} properties on {}, instance ID: {}, project: {} (Studio PID {}, lifecycle: {})",
@@ -363,23 +347,10 @@ impl Serve {
 					studio_process_id,
 					ready_studio.owner()
 				),
-				Err(error) => {
-					if worker_stopping.load(Ordering::Acquire) {
-						return;
-					}
-					crate::carbon_error!(
-						"Studio connected, but its managed instance ID could not be resolved: {error:#}"
-					);
-					crate::carbon_info!(
-						"Studio connected. Serving {} instances and {} properties on {}, project: {} (Studio PID {}, lifecycle: {})",
-						report.instances,
-						report.properties,
-						ready_endpoint.bold(),
-						ready_project_path.to_string().bold(),
-						studio_process_id,
-						ready_studio.owner()
-					);
-				}
+				Err(error) if !worker_stopping.load(Ordering::Acquire) => crate::carbon_error!(
+					"Studio connected, but its managed instance ID could not be resolved: {error:#}"
+				),
+				Err(_) => {}
 			}
 		});
 		let subscribed_studio = managed_studio.clone();
@@ -387,23 +358,115 @@ impl Serve {
 			subscribed_studio.finish_startup();
 			let _ = ready_sender.try_send(route.map(|route| route.instance_id.clone()));
 		});
-		let shutdown_core = Arc::clone(&core);
-		let result =
-			Server::new(core, SERVE_HOST, port).start_with_listener_until(listener, shutdown_receiver, move || {
-				if let Err(error) = capture_before_shutdown(&shutdown_core) {
-					crate::carbon_error!("automatic Capture Manifest before shutdown failed: {error:#}");
-				}
-			});
+
+		let result = loop {
+			let prepared = Arc::new(Mutex::new(None));
+			let prepared_result = Arc::clone(&prepared);
+			let active_core = Arc::clone(&core);
+			let reload_project = project_path.clone();
+			let reload_name = inspection.name.clone();
+			let reload_worktree = worktree_id.clone();
+			let reload_session = session_token.clone();
+			let reload_control = control_sender.clone();
+			let callback_build = build_path.clone();
+			let active_server = Server::new(Arc::clone(&core), SERVE_HOST, port);
+			let reload_stop_requested = active_server.external_stop_signal();
+			let server_result = active_server.start_with_listener_control(
+				listener.try_clone().context("failed to clone the serve listener")?,
+				control_receiver.clone(),
+				move |control| match control {
+					server::ServeControl::Shutdown => {
+						if let Err(error) = capture_before_shutdown(&active_core) {
+							crate::carbon_error!("automatic Capture Manifest before shutdown failed: {error:#}");
+						}
+						true
+					}
+					server::ServeControl::Reload => {
+						if reload_stop_requested.load(Ordering::Acquire) {
+							return true;
+						}
+						crate::carbon_info!("Project manifest changed; capturing Studio before synchronization reload");
+						if let Err(error) = active_core.capture_before_shutdown() {
+							crate::carbon_error!("Capture Manifest before synchronization reload failed: {error:#}");
+							reload_control.fail_reload();
+							return false;
+						}
+						let (next_core, next_composite) =
+							match prepare_served_core(
+								&reload_project,
+								&reload_name,
+								&reload_worktree,
+								&reload_session,
+								&reload_control,
+							) {
+								Ok(generation) => generation,
+								Err(error) => {
+									crate::carbon_error!("Could not prepare synchronization reload; retaining active generation: {error:#}");
+									reload_control.fail_reload();
+									return false;
+								}
+							};
+						if let Some(token) = std::env::var_os("CARBON_QUALIFICATION_EXPORT_TOKEN") {
+							if let Err(error) = next_core.enable_qualification_export(
+								callback_build.clone(),
+								token.to_string_lossy().into_owned(),
+							) {
+								crate::carbon_error!(
+									"Could not prepare qualification export for synchronization reload: {error:#}"
+								);
+								reload_control.fail_reload();
+								return false;
+							}
+						}
+						if reload_stop_requested.load(Ordering::Acquire) {
+							return true;
+						}
+						let transition_id = uuid::Uuid::new_v4().simple().to_string();
+						let reload_listener = match active_core.queue().single_listener_id() {
+							Ok(listener) => listener,
+							Err(error) => {
+								crate::carbon_error!("Could not announce managed synchronization reload: {error:#}");
+								reload_control.fail_reload();
+								return false;
+							}
+						};
+						if let Err(error) = active_core.queue().push(
+							server::Message::ManagedReload(server::ManagedReload {
+								transition_id,
+								worktree_id: reload_worktree.clone(),
+								session_token: reload_session.clone(),
+							}),
+							Some(reload_listener),
+						) {
+							crate::carbon_error!("Could not announce managed synchronization reload: {error:#}");
+							reload_control.fail_reload();
+							return false;
+						}
+						*prepared_result.lock() = Some((next_core, next_composite));
+						reload_control.acknowledge_reload();
+						true
+					}
+				},
+			);
+			if active_server.external_stop_requested() {
+				prepared.lock().take();
+				break server_result;
+			}
+			if let Some((next_core, next_composite)) = prepared.lock().take() {
+				core = next_core;
+				composite_directory = next_composite;
+				crate::carbon_info!("Synchronization reloaded in process on {}", endpoint.bold());
+				continue;
+			}
+			break server_result;
+		};
 		readiness_stopping.store(true, Ordering::Release);
 		let _ = readiness_worker.join();
 		clean(&build_path, &composite_directory, Some(&session), Some(&managed_studio));
 		if end_signal_received.load(Ordering::Acquire) {
 			process::exit(130);
 		}
-		match result {
-			Ok(()) => Ok(()),
-			Err(error) => Err(error).context("serve endpoint failed"),
-		}
+		result.context("serve endpoint failed")
 	}
 }
 

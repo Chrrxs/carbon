@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::{
 	io::Result,
 	net::TcpListener,
-	sync::{mpsc::Receiver, Arc, OnceLock},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		mpsc::Receiver,
+		Arc, OnceLock,
+	},
 	time::Duration,
 };
 
@@ -28,12 +32,105 @@ mod stop;
 mod subscribe;
 mod unsubscribe;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeControl {
+	Shutdown,
+	Reload,
+}
+
+#[derive(Clone)]
+pub struct ServeControlSender {
+	sender: crossbeam_channel::Sender<ServeControl>,
+	reload_pending: Arc<AtomicBool>,
+	reload_again: Arc<AtomicBool>,
+	reload_failed: Arc<AtomicBool>,
+}
+
+impl ServeControlSender {
+	pub fn try_send(
+		&self,
+		control: ServeControl,
+	) -> std::result::Result<(), crossbeam_channel::TrySendError<ServeControl>> {
+		if control == ServeControl::Reload && self.reload_pending.swap(true, Ordering::AcqRel) {
+			self.reload_again.store(true, Ordering::Release);
+			return Ok(());
+		}
+		match self.sender.try_send(control) {
+			Ok(()) => Ok(()),
+			Err(error) => {
+				if control == ServeControl::Reload {
+					self.reload_pending.store(false, Ordering::Release);
+				}
+				Err(error)
+			}
+		}
+	}
+
+	pub fn send(&self, control: ServeControl) -> std::result::Result<(), crossbeam_channel::SendError<ServeControl>> {
+		if control == ServeControl::Reload && self.reload_pending.swap(true, Ordering::AcqRel) {
+			self.reload_again.store(true, Ordering::Release);
+			return Ok(());
+		}
+		match self.sender.send(control) {
+			Ok(()) => Ok(()),
+			Err(error) => {
+				if control == ServeControl::Reload {
+					self.reload_pending.store(false, Ordering::Release);
+				}
+				Err(error)
+			}
+		}
+	}
+
+	pub fn fail_reload(&self) {
+		self.reload_pending.store(false, Ordering::Release);
+		self.reload_failed.store(true, Ordering::Release);
+		if self.reload_again.swap(false, Ordering::AcqRel) {
+			self.retry_failed_reload();
+			return;
+		}
+		let retry = self.clone();
+		std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(100));
+			retry.retry_failed_reload();
+		});
+	}
+
+	pub fn retry_failed_reload(&self) {
+		if self.reload_failed.swap(false, Ordering::AcqRel) {
+			let _ = self.try_send(ServeControl::Reload);
+		}
+	}
+
+	pub fn acknowledge_reload(&self) {
+		self.reload_failed.store(false, Ordering::Release);
+		self.reload_pending.store(false, Ordering::Release);
+		if self.reload_again.swap(false, Ordering::AcqRel) {
+			let _ = self.try_send(ServeControl::Reload);
+		}
+	}
+}
+
+pub fn serve_control_channel() -> (ServeControlSender, crossbeam_channel::Receiver<ServeControl>) {
+	let (sender, receiver) = crossbeam_channel::unbounded();
+	(
+		ServeControlSender {
+			sender,
+			reload_pending: Arc::new(AtomicBool::new(false)),
+			reload_again: Arc::new(AtomicBool::new(false)),
+			reload_failed: Arc::new(AtomicBool::new(false)),
+		},
+		receiver,
+	)
+}
+
 #[derive(Debug, Clone, Serialize, FromOne)]
 pub enum Message {
 	SyncChanges(SyncChanges),
 	RestartRequired(RestartRequired),
 	ExecuteCode(ExecuteCode),
 	Disconnect(Disconnect),
+	ManagedReload(ManagedReload),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +154,13 @@ pub struct ExecuteCode {
 pub struct Disconnect {
 	pub message: String,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedReload {
+	pub transition_id: String,
+	pub worktree_id: String,
+	pub session_token: String,
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -68,9 +172,11 @@ pub struct Server {
 	core: Arc<Core>,
 	host: String,
 	port: u16,
+	external_stop_requested: Arc<AtomicBool>,
 }
 
 pub(crate) type StopHandle = Arc<OnceLock<ServerHandle>>;
+pub(crate) type StopRequested = Arc<AtomicBool>;
 
 impl Server {
 	pub fn new(core: Arc<Core>, host: &str, port: u16) -> Self {
@@ -78,7 +184,15 @@ impl Server {
 			core,
 			host: host.to_owned(),
 			port,
+			external_stop_requested: Arc::new(AtomicBool::new(false)),
 		}
+	}
+
+	pub fn external_stop_requested(&self) -> bool {
+		self.external_stop_requested.load(Ordering::Acquire)
+	}
+	pub(crate) fn external_stop_signal(&self) -> Arc<AtomicBool> {
+		Arc::clone(&self.external_stop_requested)
 	}
 
 	#[actix_web::main]
@@ -88,8 +202,36 @@ impl Server {
 	}
 
 	#[actix_web::main]
+	pub async fn start_control<F>(
+		&self,
+		control_receiver: crossbeam_channel::Receiver<ServeControl>,
+		control_callback: F,
+	) -> Result<()>
+	where
+		F: FnMut(ServeControl) -> bool + Send + 'static,
+	{
+		let listener = TcpListener::bind((self.host.clone(), self.port))?;
+		self.run_with_listener_control(listener, control_receiver, control_callback)
+			.await
+	}
+
+	#[actix_web::main]
 	pub async fn start_with_listener(&self, listener: TcpListener) -> Result<()> {
 		self.run(listener).await
+	}
+
+	#[actix_web::main]
+	pub async fn start_with_listener_control<F>(
+		&self,
+		listener: TcpListener,
+		control_receiver: crossbeam_channel::Receiver<ServeControl>,
+		control_callback: F,
+	) -> Result<()>
+	where
+		F: FnMut(ServeControl) -> bool + Send + 'static,
+	{
+		self.run_with_listener_control(listener, control_receiver, control_callback)
+			.await
 	}
 
 	#[actix_web::main]
@@ -102,22 +244,70 @@ impl Server {
 	where
 		F: FnOnce() + Send + 'static,
 	{
-		let server = self.http_server(listener)?;
-		let handle = server.handle();
+		let (control_sender, control_receiver) = serve_control_channel();
+		let shutdown = Arc::new(std::sync::Mutex::new(Some(shutdown)));
+
 		actix_web::rt::spawn(async move {
 			loop {
 				match shutdown_signal.try_recv() {
-					Ok(()) => break,
-					Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+					Ok(()) => {
+						let _ = control_sender.send(ServeControl::Shutdown);
+						break;
+					}
+					Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
 					Err(std::sync::mpsc::TryRecvError::Empty) => {
 						actix_web::rt::time::sleep(Duration::from_millis(25)).await;
 					}
 				}
 			}
-			let _ = actix_web::rt::task::spawn_blocking(shutdown).await;
-			// Keep the endpoint and owning Studio process alive until the blocking
-			// shutdown operation (such as automatic capture) has settled.
-			handle.stop(false).await;
+		});
+
+		self.run_with_listener_control(listener, control_receiver, move |control| match control {
+			ServeControl::Shutdown | ServeControl::Reload => {
+				if let Ok(mut lock) = shutdown.lock() {
+					if let Some(f) = lock.take() {
+						f();
+					}
+				}
+				true
+			}
+		})
+		.await
+	}
+
+	async fn run_with_listener_control<F>(
+		&self,
+		listener: TcpListener,
+		control_receiver: crossbeam_channel::Receiver<ServeControl>,
+		control_callback: F,
+	) -> Result<()>
+	where
+		F: FnMut(ServeControl) -> bool + Send + 'static,
+	{
+		let server = self.http_server(listener)?;
+		let handle = server.handle();
+		let control_callback = Arc::new(std::sync::Mutex::new(control_callback));
+		actix_web::rt::spawn(async move {
+			loop {
+				match control_receiver.try_recv() {
+					Ok(control) => {
+						let callback = Arc::clone(&control_callback);
+						let should_stop = actix_web::rt::task::spawn_blocking(move || {
+							callback.lock().unwrap_or_else(|error| error.into_inner())(control)
+						})
+						.await
+						.unwrap_or(true);
+						if should_stop {
+							handle.stop(false).await;
+							break;
+						}
+					}
+					Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+					Err(crossbeam_channel::TryRecvError::Empty) => {
+						actix_web::rt::time::sleep(Duration::from_millis(25)).await;
+					}
+				}
+			}
 		});
 		server.await
 	}
@@ -130,6 +320,7 @@ impl Server {
 		let core = self.core.clone();
 		let stop_handle: StopHandle = Arc::new(OnceLock::new());
 		let app_stop_handle = stop_handle.clone();
+		let stop_requested = Arc::clone(&self.external_stop_requested);
 
 		let server = HttpServer::new(move || {
 			let mut msgpack_config = MsgPackConfig::default();
@@ -138,6 +329,7 @@ impl Server {
 			App::new()
 				.app_data(Data::new(core.clone()))
 				.app_data(Data::new(app_stop_handle.clone()))
+				.app_data(Data::new(stop_requested.clone()))
 				.app_data(msgpack_config)
 				.service(details::main)
 				.service(reflection::main)
@@ -209,4 +401,122 @@ pub fn get_free_port(host: &str, port: u16) -> u16 {
 
 pub fn format_address(host: &str, port: u16) -> String {
 	format!("http://{host}:{port}")
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+	fn test_core() -> Arc<Core> {
+		let temp_dir = std::env::temp_dir().join(format!("carbon-test-server-{}", uuid::Uuid::new_v4()));
+		let _ = std::fs::create_dir_all(&temp_dir);
+		let manifest = temp_dir.join("carbon.json");
+		let snapshot = crate::core::snapshot::Snapshot::new().with_name("Fixture");
+		let _ = crate::artifact_store::extract_snapshot(snapshot, "Fixture".to_owned(), &manifest);
+		Arc::new(Core::new_artifact(&manifest).unwrap())
+	}
+
+	#[test]
+	fn managed_reload_serialization_is_camel_case() {
+		let reload = ManagedReload {
+			transition_id: "tx-123".into(),
+			worktree_id: "wt-456".into(),
+			session_token: "tok-789".into(),
+		};
+		let json = serde_json::to_value(&reload).unwrap();
+		assert_eq!(json["transitionId"], "tx-123");
+		assert_eq!(json["worktreeId"], "wt-456");
+		assert_eq!(json["sessionToken"], "tok-789");
+
+		let message = Message::ManagedReload(reload);
+		let msg_json = serde_json::to_value(&message).unwrap();
+		assert_eq!(msg_json["ManagedReload"]["transitionId"], "tx-123");
+		assert_eq!(msg_json["ManagedReload"]["worktreeId"], "wt-456");
+		assert_eq!(msg_json["ManagedReload"]["sessionToken"], "tok-789");
+	}
+
+	#[test]
+	fn serve_control_latches_reload_behind_shutdown_and_replays_inflight_change() {
+		let (sender, receiver) = serve_control_channel();
+		sender.send(ServeControl::Shutdown).unwrap();
+		sender.try_send(ServeControl::Reload).unwrap();
+		sender.try_send(ServeControl::Reload).unwrap();
+
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Shutdown);
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+		assert!(receiver.try_recv().is_err());
+
+		sender.acknowledge_reload();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+		sender.acknowledge_reload();
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[test]
+	fn failed_reload_retries_on_the_next_duplicate_event() {
+		let (sender, receiver) = serve_control_channel();
+		sender.try_send(ServeControl::Reload).unwrap();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+
+		sender.fail_reload();
+		assert!(receiver.try_recv().is_err());
+		sender.retry_failed_reload();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+
+		sender.acknowledge_reload();
+		sender.retry_failed_reload();
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[test]
+	fn server_control_reload_callback_false_keeps_server_live_and_true_stops() {
+		let core = test_core();
+		let port = get_free_port("127.0.0.1", 20000);
+		let server = Server::new(core, "127.0.0.1", port);
+		let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+		let (control_sender, control_receiver) = serve_control_channel();
+		let call_count = Arc::new(AtomicUsize::new(0));
+		let call_count_cb = call_count.clone();
+		let callback_sender = control_sender.clone();
+		let handle = std::thread::spawn(move || {
+			server.start_with_listener_control(listener, control_receiver, move |control| {
+				let count = call_count_cb.fetch_add(1, Ordering::SeqCst);
+				match control {
+					ServeControl::Reload if count == 0 => {
+						callback_sender.fail_reload();
+						false
+					}
+					ServeControl::Reload => {
+						callback_sender.acknowledge_reload();
+						true
+					}
+					ServeControl::Shutdown => true,
+				}
+			})
+		});
+		std::thread::sleep(Duration::from_millis(50));
+		control_sender.send(ServeControl::Reload).unwrap();
+		assert!(handle.join().unwrap().is_ok());
+		assert_eq!(call_count.load(Ordering::SeqCst), 2);
+	}
+
+	#[test]
+	fn server_control_shutdown_signal_stops_server() {
+		let core = test_core();
+		let port = get_free_port("127.0.0.1", 21000);
+		let server = Server::new(core, "127.0.0.1", port);
+		let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+		let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
+		let shutdown_called = Arc::new(AtomicBool::new(false));
+		let shutdown_called_cb = shutdown_called.clone();
+		let handle = std::thread::spawn(move || {
+			server.start_with_listener_until(listener, shutdown_receiver, move || {
+				shutdown_called_cb.store(true, Ordering::SeqCst);
+			})
+		});
+		std::thread::sleep(Duration::from_millis(50));
+		shutdown_sender.send(()).unwrap();
+		assert!(handle.join().unwrap().is_ok());
+		assert!(shutdown_called.load(Ordering::SeqCst));
+	}
 }

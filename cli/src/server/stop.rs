@@ -1,9 +1,15 @@
 use actix_web::{post, web::Data, HttpResponse, Responder};
 use anyhow::Result;
 use log::{error, info, trace};
-use std::{sync::Arc, time::Duration};
+use std::{
+	sync::{atomic::Ordering, Arc},
+	time::Duration,
+};
 
-use crate::{core::Core, server::StopHandle};
+use crate::{
+	core::Core,
+	server::{StopHandle, StopRequested},
+};
 
 fn settle_stop<Capture>(capture: Capture) -> Result<String>
 where
@@ -13,11 +19,16 @@ where
 }
 
 #[post("/stop")]
-async fn main(core: Data<Arc<Core>>, stop_handle: Data<StopHandle>) -> impl Responder {
+async fn main(
+	core: Data<Arc<Core>>,
+	stop_handle: Data<StopHandle>,
+	stop_requested: Data<StopRequested>,
+) -> impl Responder {
 	trace!("Received request: stop");
 	let Some(stop_handle) = stop_handle.get().cloned() else {
 		return HttpResponse::InternalServerError().body("Carbon server stop handle is unavailable");
 	};
+	stop_requested.store(true, Ordering::Release);
 
 	info!("Carbon stop requested; capturing the connected Studio place before shutdown");
 	let shutdown_core = Arc::clone(core.get_ref());

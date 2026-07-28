@@ -475,6 +475,13 @@ function App:connect()
 			return
 		end
 
+		if err.kind == "ManagedReload" then
+			self:disconnect()
+			task.wait(RECONNECT_INTERVAL)
+			self:connect()
+			return
+		end
+
 		if hardRestartRequired then
 			task.defer(function()
 				error(`[Carbon] {message}`, 0)

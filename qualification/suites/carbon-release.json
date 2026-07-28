@@ -25,6 +25,7 @@
     "procedural_generator_partial_fixture": "${artifact_dir}/procedural-generator-partial-fixture",
     "procedural_generator_corrected_fixture": "${artifact_dir}/procedural-generator-corrected-fixture",
     "foreground_watch_ready": "${artifact_dir}/foreground-watch.ready",
+    "manifest_reload_backup": "${artifact_dir}/manifest-reload-backup.json",
     "foreground_watch_done": "${artifact_dir}/foreground-watch.done"
   },
   "requirements": {
@@ -289,13 +290,47 @@
           "max_duration_ms": 2000
         },
         {
-          "name": "optimized-changed-capture",
+          "name": "trigger-in-process-manifest-reload",
+          "kind": "command",
+          "program": "${repo}/qualification/scripts/trigger-manifest-reload",
+          "args": ["trigger", "${project}", "${manifest_reload_backup}"],
+          "cwd": "${repo}",
+          "timeout_seconds": 30,
+          "stdout_contains": ["manifest reload triggered atomically"]
+        },
+        {
+          "name": "managed-reload-preserves-studio-process",
+          "kind": "mcp",
+          "tool": "manage_instance",
+          "arguments": {"action": "status", "instance_id": "${studio_instance}"},
+          "timeout_seconds": 120,
+          "poll_interval_ms": 100,
+          "checks": [
+            {"pointer": "/pid", "op": "equals", "value": "${studio_pid}"},
+            {"pointer": "/process_running", "op": "equals", "value": true},
+            {"pointer": "/state", "op": "equals", "value": "connected"}
+          ]
+        },
+        {
+          "name": "managed-reload-preserves-pending-studio-change",
+          "kind": "mcp",
+          "tool": "execute_luau",
+          "arguments": {
+            "instance_id": "${studio_instance}",
+            "target": "edit",
+            "code": "local parent = game:GetService('Workspace'):FindFirstChild('CarbonManifestScriptParent'); assert(parent and parent:IsA('Part'), 'capture parent missing after managed reload'); assert(parent:GetAttribute('CarbonManifestRevision') == 2, 'pending Studio attribute was lost during managed reload'); assert(parent.Size == Vector3.new(7, 3, 5), 'pending Studio property was lost during managed reload'); assert(parent:FindFirstChild('CarbonManifestDeletedOnMutation') == nil, 'pending Studio deletion was lost during managed reload'); return true"
+          },
+          "timeout_seconds": 30,
+          "max_duration_ms": 2000
+        },
+        {
+          "name": "post-reload-capture-is-fixed-point",
           "kind": "command",
           "program": "${carbon}",
           "args": ["capture", "--port", "${port}", "--color", "never"],
           "cwd": "${repo}",
           "timeout_seconds": 300,
-          "stderr_contains": ["full rebuild"]
+          "stderr_contains": ["exact no-op"]
         },
         {
           "name": "snapshot-optimized-changed-capture",
@@ -1046,6 +1081,15 @@
         }
       ],
       "cleanup": [
+        {
+          "name": "restore-qualified-manifest",
+          "kind": "command",
+          "program": "${repo}/qualification/scripts/trigger-manifest-reload",
+          "args": ["restore", "${project}", "${manifest_reload_backup}"],
+          "cwd": "${repo}",
+          "timeout_seconds": 30,
+          "stdout_contains": ["manifest restore"]
+        },
         {
           "name": "stop-residual-foreground-event-watch",
           "kind": "terminate_process",

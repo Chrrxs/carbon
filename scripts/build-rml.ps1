@@ -279,7 +279,15 @@ if (-not (Test-Path -LiteralPath $dotnet -PathType Leaf)) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Write-Host "[fresh-rml] Downloading pinned .NET SDK $dotnetSdkVersion"
     Invoke-WebRequest -UseBasicParsing -Uri $dotnetSdkUrl -OutFile $dotnetSdkArchive
-    $actualDotnetSdkSha512 = (Get-FileHash -LiteralPath $dotnetSdkArchive -Algorithm SHA512).Hash.ToLowerInvariant()
+    $sha512 = [Security.Cryptography.SHA512]::Create()
+    $archiveStream = [IO.File]::OpenRead($dotnetSdkArchive)
+    try {
+        $actualDotnetSdkSha512 = ([BitConverter]::ToString($sha512.ComputeHash($archiveStream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $archiveStream.Dispose()
+        $sha512.Dispose()
+    }
     if ($actualDotnetSdkSha512 -ne $dotnetSdkSha512) {
         throw "pinned .NET SDK archive hash mismatch: expected $dotnetSdkSha512, got $actualDotnetSdkSha512"
     }

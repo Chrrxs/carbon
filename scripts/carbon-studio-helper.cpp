@@ -675,15 +675,22 @@ static int cmd_inject(
 
     std::cout << "CARBON_RML_INJECTOR_STARTED" << std::endl;
 
-    DWORD waitResult = WaitForSingleObject(hThread.get(), 30000);
-    bool finished = (waitResult == WAIT_OBJECT_0);
-
-    if (finished) {
+    // LoadLibrary may remain inside the loader's initialization while RML waits
+    // for Studio's resumed engine thread. The bridge attestation performed by
+    // Carbon is the authoritative readiness gate; this wait is only an
+    // opportunity to reclaim the remote path allocation on the fast path.
+    DWORD waitResult = WaitForSingleObject(hThread.get(), 1000);
+    if (waitResult == WAIT_OBJECT_0) {
         VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
         return 0;
     }
+    if (waitResult == WAIT_TIMEOUT) {
+        // The remote thread still owns remoteMem. Keep it allocated until the
+        // Studio process exits rather than freeing memory beneath LoadLibrary.
+        return 0;
+    }
 
-    std::cerr << "WaitForSingleObject failed or timed out: " << waitResult << "\n";
+    std::cerr << "WaitForSingleObject failed: " << GetLastError() << "\n";
     return 1;
 }
 

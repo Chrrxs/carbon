@@ -465,24 +465,33 @@ fn claim_capture_cancel(phase: &AtomicU8) -> Result<()> {
 
 impl Core {
 	pub fn new_artifact(manifest_path: &Path) -> Result<Self> {
-		Self::new_artifact_with_contract(manifest_path, None, None, None, None)
+		Self::new_artifact_with_contract(manifest_path, None, None, None, None, None)
 	}
 
 	pub fn new_artifact_with_worktree(
 		manifest_path: &Path,
 		worktree: Option<(String, String, String)>,
 	) -> Result<Self> {
-		Self::new_artifact_with_contract(manifest_path, worktree, None, None, None)
+		Self::new_artifact_with_contract(manifest_path, worktree, None, None, None, None)
 	}
 
 	pub fn new_artifact_with_live_session(manifest_path: &Path, session_token: String) -> Result<Self> {
-		Self::new_artifact_with_contract(manifest_path, None, Some(session_token), None, None)
+		Self::new_artifact_with_contract(manifest_path, None, Some(session_token), None, None, None)
 	}
 
 	pub fn new_project_with_worktree(
 		project_path: &Path,
 		materialized: &project::MaterializedProject,
 		worktree: (String, String, String),
+	) -> Result<Self> {
+		Self::new_project_with_worktree_and_control(project_path, materialized, worktree, None)
+	}
+
+	pub fn new_project_with_worktree_and_control(
+		project_path: &Path,
+		materialized: &project::MaterializedProject,
+		worktree: (String, String, String),
+		control_tx: impl Into<Option<crate::server::ServeControlSender>>,
 	) -> Result<Self> {
 		let manifest_identity_bootstrap = manifest_identity_bootstrap_contract(
 			&materialized.snapshot,
@@ -495,6 +504,7 @@ impl Core {
 			None,
 			Some(project::live_policy(project_path, materialized)),
 			Some(manifest_identity_bootstrap),
+			control_tx.into(),
 		)
 	}
 
@@ -504,6 +514,7 @@ impl Core {
 		live_session_token: Option<String>,
 		live_policy: Option<project::LivePolicy>,
 		manifest_identity_bootstrap: Option<ManifestIdentityBootstrapContract>,
+		control_tx: Option<crate::server::ServeControlSender>,
 	) -> Result<Self> {
 		let loaded = match live_policy.as_ref() {
 			Some(policy) => {
@@ -568,6 +579,7 @@ impl Core {
 					source_reader.clone(),
 					managed_hierarchy.clone(),
 					restart_required.clone(),
+					control_tx,
 				)
 			})
 			.transpose()?;
@@ -1794,20 +1806,7 @@ impl Core {
 	}
 
 	pub(crate) fn requires_hard_restart(&self) -> bool {
-		if self.restart_required.load(Ordering::Acquire) {
-			return true;
-		}
-		let Some(policy) = &self.live_policy else {
-			return false;
-		};
-		let policy = policy.read().unwrap();
-		let changed = std::fs::read(&policy.project_path)
-			.map(|document| document != policy.project_document)
-			.unwrap_or(true);
-		if changed {
-			self.restart_required.store(true, Ordering::Release);
-		}
-		changed
+		self.restart_required.load(Ordering::Acquire)
 	}
 
 	pub(crate) fn managed_hierarchy_contract(&self) -> Result<ManagedHierarchyContract> {
@@ -2422,6 +2421,79 @@ fn project_watch_roots(project_root: &Path, mapped_watch_roots: &[PathBuf]) -> V
 	roots
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReloadSignalKey {
+	Manifest(blake3::Hash),
+	WatchRoots(blake3::Hash),
+}
+
+#[derive(Debug, Default)]
+struct ReloadSignalState {
+	last_signaled: Option<ReloadSignalKey>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestReadResult {
+	Unchanged,
+	ValidChanged { hash: blake3::Hash },
+	InvalidJson(String),
+}
+
+impl ReloadSignalState {
+	fn new() -> Self {
+		Self::default()
+	}
+
+	fn check_manifest(&self, project_path: &Path, frozen_document: &[u8]) -> ManifestReadResult {
+		let mut bytes = match std::fs::read(project_path) {
+			Ok(b) => b,
+			Err(err) => return ManifestReadResult::InvalidJson(err.to_string()),
+		};
+		if bytes == frozen_document {
+			return ManifestReadResult::Unchanged;
+		}
+		if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+			std::thread::sleep(Duration::from_millis(50));
+			if let Ok(retry_bytes) = std::fs::read(project_path) {
+				bytes = retry_bytes;
+			}
+			if bytes == frozen_document {
+				return ManifestReadResult::Unchanged;
+			}
+			if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+				return ManifestReadResult::InvalidJson("invalid or truncated JSON".to_string());
+			}
+		}
+		let hash = blake3::hash(&bytes);
+		ManifestReadResult::ValidChanged { hash }
+	}
+
+	fn should_signal_manifest(&mut self, hash: blake3::Hash) -> bool {
+		let key = ReloadSignalKey::Manifest(hash);
+		if self.last_signaled.as_ref() == Some(&key) {
+			false
+		} else {
+			self.last_signaled = Some(key);
+			true
+		}
+	}
+
+	fn should_signal_watch_roots(&mut self, watch_roots: &[PathBuf]) -> bool {
+		let mut hasher = blake3::Hasher::new();
+		for root in watch_roots {
+			hasher.update(root.to_string_lossy().as_bytes());
+			hasher.update(b"\0");
+		}
+		let key = ReloadSignalKey::WatchRoots(hasher.finalize());
+		if self.last_signaled.as_ref() == Some(&key) {
+			false
+		} else {
+			self.last_signaled = Some(key);
+			true
+		}
+	}
+}
+
 #[allow(clippy::too_many_arguments)]
 fn watch_project_source(
 	policy: Arc<RwLock<project::LivePolicy>>,
@@ -2432,6 +2504,7 @@ fn watch_project_source(
 	source_reader: Arc<artifact_store::SourceReader>,
 	managed_hierarchy: Arc<RwLock<ManagedHierarchyState>>,
 	restart_required: Arc<AtomicBool>,
+	control_tx: Option<crate::server::ServeControlSender>,
 ) -> Result<RecommendedWatcher> {
 	let (project_path, mapped_watch_roots) = {
 		let policy = policy.read().unwrap();
@@ -2476,22 +2549,44 @@ fn watch_project_source(
 		}
 	})?;
 	Builder::new().name("carbon-project-watcher".into()).spawn(move || {
-		while event_receiver.recv().is_ok() {
+		let mut reload_state = ReloadSignalState::new();
+		loop {
+			let observed_event = match event_receiver.recv_timeout(Duration::from_millis(500)) {
+				Ok(()) => true,
+				Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+				Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+			};
 			let _state = project_state_lock.lock().unwrap();
-			let project_changed = std::fs::read(&project_path)
-				.map(|current| current != frozen_project_document)
-				.unwrap_or(true);
-			if project_changed {
-				restart_required.store(true, Ordering::Release);
-				let message = "game.carbon.json changed while serve is running; hard restart required. This serve session will not accept further synchronization.";
-				log::error!("{message}");
-				let _ = queue.push(
-					crate::server::Message::RestartRequired(crate::server::RestartRequired {
-						message: message.to_owned(),
-					}),
-					None,
-				);
-				return;
+			match reload_state.check_manifest(&project_path, &frozen_project_document) {
+				ManifestReadResult::InvalidJson(error) => {
+					log::warn!(
+						"Project document {} changed on disk but is invalid or malformed JSON; retaining previous generation: {}",
+						project_path.display(),
+						error
+					);
+					continue;
+				}
+				ManifestReadResult::ValidChanged { hash } => {
+					if reload_state.should_signal_manifest(hash) {
+						log::info!(
+							"Project document {} changed stably on disk; signaling recoverable reload",
+							project_path.display()
+						);
+						if let Some(control_tx) = &control_tx {
+							let _ = control_tx.send(crate::server::ServeControl::Reload);
+						}
+					} else {
+						log::debug!("Coalesced duplicate manifest reload signal for {}", project_path.display());
+						if let Some(control_tx) = &control_tx {
+							control_tx.retry_failed_reload();
+						}
+					}
+					continue;
+				}
+				ManifestReadResult::Unchanged => {}
+			}
+			if !observed_event {
+				continue;
 			}
 			let previous_snapshot = project_snapshot.read().unwrap().clone();
 			let previous_mapped_refs = policy.read().unwrap().mapped_refs.clone();
@@ -2522,16 +2617,18 @@ fn watch_project_source(
 				}
 			};
 			if candidate.watch_roots != policy.read().unwrap().mapped_watch_roots {
-				restart_required.store(true, Ordering::Release);
-				let message = "mapped Pesde symlink targets changed while serve is running; hard restart required so Carbon can replace its external source watches.";
-				log::error!("{message}");
-				let _ = queue.push(
-					crate::server::Message::RestartRequired(crate::server::RestartRequired {
-						message: message.to_owned(),
-					}),
-					None,
-				);
-				return;
+				if reload_state.should_signal_watch_roots(&candidate.watch_roots) {
+					log::info!("Mapped watch roots changed; signaling recoverable reload");
+					if let Some(control_tx) = &control_tx {
+						let _ = control_tx.send(crate::server::ServeControl::Reload);
+					}
+				} else {
+					log::debug!("Coalesced duplicate watch roots reload signal");
+					if let Some(control_tx) = &control_tx {
+						control_tx.retry_failed_reload();
+					}
+				}
+				continue;
 			}
 			let changes = match project::diff_snapshots(&previous_snapshot, &candidate.snapshot) {
 				Ok(changes) => changes,
@@ -3789,5 +3886,56 @@ mod source_watcher_tests {
 		assert!(!encoded.windows(16).any(|window| window == accessory_weld_bytes));
 		assert!(encoded.windows(16).any(|window| window == accessory_constraint_bytes));
 		assert!(encoded.windows(16).any(|window| window == authored_bytes));
+	}
+	#[test]
+	fn reload_signal_state_signals_valid_manifest_changes_and_coalesces_duplicates() {
+		let mut state = ReloadSignalState::new();
+		let doc1 = b"{\"name\":\"Game1\"}";
+		let doc2 = b"{\"name\":\"Game2\"}";
+		let hash1 = blake3::hash(doc1);
+		let hash2 = blake3::hash(doc2);
+
+		assert!(state.should_signal_manifest(hash1));
+		assert!(!state.should_signal_manifest(hash1));
+
+		assert!(state.should_signal_manifest(hash2));
+		assert!(!state.should_signal_manifest(hash2));
+	}
+
+	#[test]
+	fn reload_signal_state_ignores_malformed_json_without_signaling() {
+		let temp = tempfile::tempdir().unwrap();
+		let manifest_path = temp.path().join("game.carbon.json");
+		let frozen = b"{\"name\":\"Game\"}";
+
+		let state = ReloadSignalState::new();
+		std::fs::write(&manifest_path, b"{\"name\":\"Game\"}").unwrap();
+		assert_eq!(
+			state.check_manifest(&manifest_path, frozen),
+			ManifestReadResult::Unchanged
+		);
+
+		std::fs::write(&manifest_path, b"{\"name\":").unwrap();
+		assert!(matches!(
+			state.check_manifest(&manifest_path, frozen),
+			ManifestReadResult::InvalidJson(_)
+		));
+
+		std::fs::write(&manifest_path, b"{\"name\":\"Updated\"}").unwrap();
+		let res = state.check_manifest(&manifest_path, frozen);
+		assert!(matches!(res, ManifestReadResult::ValidChanged { .. }));
+	}
+
+	#[test]
+	fn reload_signal_state_signals_watch_roots_and_coalesces_duplicates() {
+		let mut state = ReloadSignalState::new();
+		let roots1 = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+		let roots2 = vec![PathBuf::from("/a"), PathBuf::from("/c")];
+
+		assert!(state.should_signal_watch_roots(&roots1));
+		assert!(!state.should_signal_watch_roots(&roots1));
+
+		assert!(state.should_signal_watch_roots(&roots2));
+		assert!(!state.should_signal_watch_roots(&roots2));
 	}
 }
