@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rbx_binary::{DecodeSink, Deserializer, InstanceSource};
 use rbx_dom_weak::{
-	types::{CFrame, ContentType, Enum, Ref, Variant},
+	types::{CFrame, ContentType, Ref, Variant},
 	Ustr, UstrMap,
 };
 use rbx_reflection::ClassTag;
@@ -1646,12 +1646,12 @@ mod tests {
 		assert!(is_default_hydrated_service_property(
 			"StarterGui",
 			"ClipsDescendantsSupportsRotation",
-			&Variant::Enum(Enum::from_u32(0)),
+			&Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0)),
 		));
 		assert!(!is_default_hydrated_service_property(
 			"StarterGui",
 			"ClipsDescendantsSupportsRotation",
-			&Variant::Enum(Enum::from_u32(1)),
+			&Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
 		));
 		assert!(!is_default_hydrated_service_property(
 			"Folder",
