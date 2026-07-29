@@ -27,6 +27,7 @@ path = "src/lib.rs"
 rbx_binary = { version = "2.0.1", path = "crates/rbx_binary" }
 rbx_dom_weak = "4.1.0"
 rbx_reflection = "7.0.0"
+rbx_reflection_database = "3.0.0"
 
 config-derive = { version = "*", path = "crates/config-derive" }
 profiling = { version = "*", path = "crates/profiling/profiling" }

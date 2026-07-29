@@ -1015,6 +1015,8 @@ fn build_database_from_api(dump: ApiDump, version: [u32; 4]) -> ReflectionDataba
 		}
 	}
 
+	seed_bundled_default_properties(&mut database);
+
 	unsupported_properties.sort();
 	if !unsupported_properties.is_empty() {
 		log::debug!(
@@ -1027,6 +1029,51 @@ fn build_database_from_api(dump: ApiDump, version: [u32; 4]) -> ReflectionDataba
 	apply_carbon_reflection_policy(&mut database);
 
 	database
+}
+
+fn seed_bundled_default_properties(database: &mut ReflectionDatabase<'static>) {
+	// Studio's FullAPI dump defines the current schema but omits engine defaults.
+	// Retain only bundled defaults whose live property type still agrees, and
+	// never overwrite a default that the live dump supplied explicitly.
+	let bundled = rbx_reflection_database::get_bundled();
+	let compatible_defaults = database
+		.classes
+		.keys()
+		.filter_map(|class_name| {
+			let bundled_class = bundled.classes.get(class_name)?;
+			let defaults = bundled_class
+				.default_properties
+				.iter()
+				.filter(|(property_name, value)| {
+					find_property_type(database, class_name, property_name)
+						.is_some_and(|data_type| data_type == value.ty())
+				})
+				.map(|(property_name, value)| (*property_name, value.clone()))
+				.collect::<Vec<_>>();
+			Some((*class_name, defaults))
+		})
+		.collect::<Vec<_>>();
+
+	for (class_name, defaults) in compatible_defaults {
+		let class = database.classes.get_mut(class_name).expect("live class disappeared");
+		for (property_name, value) in defaults {
+			class.default_properties.entry(property_name).or_insert(value);
+		}
+	}
+}
+
+fn find_property_type(
+	database: &ReflectionDatabase<'static>,
+	mut class_name: &'static str,
+	property_name: &str,
+) -> Option<rbx_dom_weak::types::VariantType> {
+	loop {
+		let class = database.classes.get(class_name)?;
+		if let Some(property) = class.properties.get(property_name) {
+			return Some(property.data_type.ty());
+		}
+		class_name = class.superclass?;
+	}
 }
 
 fn read_api_dump(path: &std::path::Path) -> Result<(String, ApiDump)> {

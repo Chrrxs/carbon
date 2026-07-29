@@ -102,6 +102,7 @@ printf '%s\n' \
 chmod +x "${quality_repo}/scripts/update-reflection"
 printf '%s\n' \
 	'#!/usr/bin/env bash' \
+	'printf "cargo %s\n" "$*" >> "${CARBON_TOOL_LOG}"' \
 	'if [[ "$*" == "audit --version" ]]; then echo "cargo-audit 0.22.2"; fi' \
 	'exit 0' \
 	> "${quality_tools}/cargo"
@@ -135,6 +136,12 @@ expect_failure \
 	"${quality_repo}/scripts/change" qualify
 grep -q 'production-readiness failed' "${root}/quality.out" ||
 	die "stubbed qualification did not reach production readiness"
+grep -Fq 'test --locked -p rbx_binary --no-run' "$quality_log" ||
+	die "qualification did not compile the standalone rbx_binary tests"
+grep -Fq 'test --locked -p rbx_binary --doc' "$quality_log" ||
+	die "qualification did not run the standalone rbx_binary doctests"
+grep -Fq 'test --locked -p rbx_binary tests::serializer' "$quality_log" ||
+	die "qualification did not run the available standalone rbx_binary serializer suite"
 
 write_receipt() {
 	local repo="$1"

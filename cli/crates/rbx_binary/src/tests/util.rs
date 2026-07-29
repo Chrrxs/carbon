@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use rbx_dom_weak::DomViewer;
 
-use crate::{from_reader, text_deserializer::DecodedModel, to_writer};
+use crate::{from_reader_with_database, text_deserializer::DecodedModel, to_writer_with_database};
 
 /// Run a basic gauntlet of tests to verify that the serializer and deserializer
 /// can handle this model correctly.
@@ -22,7 +22,8 @@ pub fn run_model_base_suite(model_path: impl AsRef<Path>) {
 
 	// Decode the test file and snapshot a stable version of the resulting tree.
 	// This should properly test the deserializer.
-	let decoded = from_reader(contents.as_slice()).unwrap();
+	let database = rbx_reflection_database::get_bundled();
+	let decoded = from_reader_with_database(contents.as_slice(), database).unwrap();
 	let decoded_viewed = DomViewer::new().view_children(&decoded);
 	insta::assert_yaml_snapshot!(format!("{}__decoded", model_stem), decoded_viewed);
 
@@ -30,7 +31,7 @@ pub fn run_model_base_suite(model_path: impl AsRef<Path>) {
 	let decoded_root = decoded.root();
 	let top_level_ids = decoded_root.children();
 	let mut encoded = Vec::new();
-	to_writer(&mut encoded, &decoded, top_level_ids).unwrap();
+	to_writer_with_database(&mut encoded, &decoded, top_level_ids, database).unwrap();
 
 	// ...but we can snapshot the text representation of what we encoded! In an
 	// ideal world, this would be very similar or the same as the text
@@ -45,5 +46,5 @@ pub fn run_model_base_suite(model_path: impl AsRef<Path>) {
 	// We don't make any assertions about the result right now, as our format
 	// support is still lacking. In the future, we should assert that this is
 	// the same as the original decoding of the test file.
-	from_reader(encoded.as_slice()).unwrap();
+	from_reader_with_database(encoded.as_slice(), database).unwrap();
 }

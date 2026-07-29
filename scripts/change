@@ -103,6 +103,12 @@ run_rust_advisories() {
 	cargo audit --deny unsound --deny yanked
 }
 
+run_rbx_binary_tests() {
+	cargo test --locked -p rbx_binary --no-run
+	cargo test --locked -p rbx_binary --doc
+	cargo test --locked -p rbx_binary tests::serializer
+}
+
 phase_results='[]'
 phase_evidence=""
 run_phase() {
@@ -178,6 +184,7 @@ qualify_tree() {
 	run_phase rust-clippy cargo clippy --locked --all-targets -- -D warnings
 	run_phase rust-advisories run_rust_advisories
 	run_phase rust-tests cargo test --locked --all-targets
+	run_phase rbx-binary-tests run_rbx_binary_tests
 	run_phase workflow-tests run_workflow_tests
 	run_phase studio-plugin-quality run_studio_plugin_quality
 	run_phase production-readiness "${SCRIPT_DIR}/lib/qualify-tree" --artifacts "${evidence}/runtime"

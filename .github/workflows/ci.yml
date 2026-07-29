@@ -30,6 +30,11 @@ jobs:
         run: cargo audit --deny unsound --deny yanked
       - name: Test Rust
         run: cargo test --locked --all-targets --verbose
+      - name: Test standalone rbx_binary boundary
+        run: |
+          cargo test --locked -p rbx_binary --no-run
+          cargo test --locked -p rbx_binary --doc
+          cargo test --locked -p rbx_binary tests::serializer
       - name: Validate release suite
         run: cargo run --locked --bin carbon-qualify -- validate qualification/suites/carbon-release.json
       - name: Test repository workflows

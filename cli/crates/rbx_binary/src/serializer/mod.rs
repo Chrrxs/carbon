@@ -106,11 +106,13 @@ impl InstanceSource for WeakDom {
 ///
 /// use rbx_binary::Serializer;
 /// use rbx_dom_weak::{InstanceBuilder, WeakDom};
+/// use rbx_reflection::ReflectionDatabase;
 ///
 /// let dom = WeakDom::new(InstanceBuilder::new("Folder"));
+/// let database = ReflectionDatabase::new();
 ///
 /// let output = BufWriter::new(File::create("PlainFolder.rbxm")?);
-/// let serializer = Serializer::new();
+/// let serializer = Serializer::new(&database);
 /// serializer.serialize(output, &dom, &[dom.root_ref()])?;
 ///
 /// # Ok::<(), Box<dyn std::error::Error>>(())

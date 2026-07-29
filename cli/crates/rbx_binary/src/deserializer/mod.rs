@@ -207,10 +207,12 @@ impl InstanceSource for DecodedArena {
 /// use std::io::BufReader;
 ///
 /// use rbx_binary::Deserializer;
+/// use rbx_reflection::ReflectionDatabase;
 ///
 /// let input = BufReader::new(File::open("File.rbxm")?);
 ///
-/// let deserializer = Deserializer::new();
+/// let database = ReflectionDatabase::new();
+/// let deserializer = Deserializer::new(&database);
 /// let dom = deserializer.deserialize(input)?;
 ///
 /// // rbx_binary always returns a DOM with a DataModel at the top level.

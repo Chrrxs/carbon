@@ -57,6 +57,25 @@ public sealed class CaptureLeaseTests
     }
 
     [Theory]
+    [InlineData("ModuleScript", "Capabilities")]
+    [InlineData("Script", "LinkedSource")]
+    [InlineData("LocalScript", "Sandboxed")]
+    [InlineData("ModuleScript", "SourceAssetId")]
+    public void ScriptNormalizationPropertiesRequireMatchingSerializedBaseline(
+        string className,
+        string propertyName)
+    {
+        Assert.False(CarbonBridgeMod.CanSuppressScriptPropertyObservation(
+            className,
+            propertyName,
+            matchesSerializedBaseline: false));
+        Assert.True(CarbonBridgeMod.CanSuppressScriptPropertyObservation(
+            className,
+            propertyName,
+            matchesSerializedBaseline: true));
+    }
+
+    [Theory]
     [InlineData("Workspace", "Workspace", "PredictiveStreamingMode", new byte[] { 0, 0, 0, 0 }, true)]
     [InlineData("Workspace", "Workspace", "PredictiveStreamingMode", new byte[] { 1, 0, 0, 0 }, false)]
     [InlineData("Workspace", "Workspace", "StreamingEnabled", new byte[] { 0, 0, 0, 0 }, false)]

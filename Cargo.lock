@@ -547,6 +547,7 @@ dependencies = [
  "rbx_binary",
  "rbx_dom_weak",
  "rbx_reflection",
+ "rbx_reflection_database",
  "reqwest",
  "rmp-serde",
  "roblox_install",
@@ -986,13 +987,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys 0.5.0",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b1d1d91c932ef41c0f2663aa8b0ca0342d444d842c06914aa0a7e352d0bada6"
 dependencies = [
  "libc",
- "redox_users",
+ "redox_users 0.4.5",
  "winapi",
 ]
 
@@ -1004,8 +1014,20 @@ checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users",
+ "redox_users 0.4.5",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users 0.5.2",
+ "windows-sys 0.61.1",
 ]
 
 [[package]]
@@ -2462,6 +2484,7 @@ dependencies = [
  "rayon",
  "rbx_dom_weak",
  "rbx_reflection",
+ "rbx_reflection_database",
  "serde",
  "thiserror 1.0.69",
  "zstd",
@@ -2488,6 +2511,19 @@ dependencies = [
  "rbx_types",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rbx_reflection_database"
+version = "3.0.0+roblox-728"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f5dd357c4c95d43e12283b9065b8b7b41788219db7a0f3a77a6e111f51522e6"
+dependencies = [
+ "dirs 6.0.0",
+ "log",
+ "rbx_reflection",
+ "rmp-serde",
+ "serde",
 ]
 
 [[package]]
@@ -2523,6 +2559,17 @@ dependencies = [
  "getrandom 0.2.15",
  "libredox",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "redox_users"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
+dependencies = [
+ "getrandom 0.2.15",
+ "libredox",
+ "thiserror 2.0.12",
 ]
 
 [[package]]
@@ -2641,7 +2688,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743bb8c693a387f1ae8d2026d82d8b0c175cc4777b97c1f7b12fdb3be595bb13"
 dependencies = [
- "dirs",
+ "dirs 2.0.2",
  "thiserror 1.0.69",
  "winreg",
 ]

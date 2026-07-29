@@ -85,6 +85,9 @@ version = "0.4.0"
 version = "1.14.1"
 features = ["yaml"]
 
+[dev-dependencies.rbx_reflection_database]
+version = "3.0.0"
+
 [dev-dependencies.serde]
 version = "1.0.137"
 features = ["derive"]

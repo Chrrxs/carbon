@@ -6,6 +6,7 @@ CHANGE_REQUIRED_PHASES=(
 	rust-clippy
 	rust-advisories
 	rust-tests
+	rbx-binary-tests
 	workflow-tests
 	studio-plugin-quality
 	production-readiness

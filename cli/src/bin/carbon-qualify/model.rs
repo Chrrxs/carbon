@@ -776,9 +776,15 @@ mod tests {
 			.expect("procedural model creation step has no Luau body");
 		assert!(
 			creation_code.contains(
-				"assert(model:WaitForGenerationAsync(), name .. ' parameter generation failed: ' .. model.GenerationError)"
+				"assert(model:ForceGeneration(), name .. ' parameter generation did not start'); assert(model:WaitForGenerationAsync(), name .. ' parameter generation failed: ' .. model.GenerationError)"
 			),
-			"every procedural model must await the dirty state created by parameter changes"
+			"every procedural model must explicitly start and await parameter generation"
+		);
+		assert!(
+			creation_code.contains(
+				"assert(model:ForceGeneration(), name .. ' attribute generation did not start'); assert(model:WaitForGenerationAsync(), name .. ' attribute generation failed: ' .. model.GenerationError)"
+			),
+			"every procedural model must explicitly start and await attribute generation"
 		);
 		assert!(
 			!creation_code.contains("task.wait"),

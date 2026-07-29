@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, io::Write};
+use std::{
+	collections::BTreeMap,
+	io::{Read, Write},
+};
 
 use rbx_dom_weak::{
 	types::{
@@ -7,18 +10,31 @@ use rbx_dom_weak::{
 	},
 	InstanceBuilder, Ustr, WeakDom,
 };
-use rbx_reflection::{DataType, PropertyDescriptor, PropertyKind, PropertySerialization, ReflectionDatabase};
+use rbx_reflection::{
+	ClassDescriptor, DataType, PropertyDescriptor, PropertyKind, PropertySerialization, ReflectionDatabase,
+};
 
 use crate::{
 	chunk::{Chunk, ChunkBuilder},
 	core::RbxReadExt,
-	from_reader,
 	serializer::CompressionType,
 	text_deserializer::{DecodedChunk, DecodedModel},
-	to_writer, Deserializer, Serializer,
+	DecodeError, Deserializer, EncodeError, Serializer,
 };
 
 const BINARY_HEADER_LEN: usize = 32;
+
+fn test_reflection_database() -> &'static ReflectionDatabase<'static> {
+	rbx_reflection_database::get_bundled()
+}
+
+fn to_writer<W: Write>(writer: W, dom: &WeakDom, refs: &[Ref]) -> Result<(), EncodeError> {
+	crate::to_writer_with_database(writer, dom, refs, test_reflection_database())
+}
+
+fn from_reader<R: Read>(reader: R) -> Result<WeakDom, DecodeError> {
+	crate::from_reader_with_database(reader, test_reflection_database())
+}
 
 fn rewrite_chunks(buffer: &[u8], mut rewrite: impl FnMut(&mut [u8; 4], &mut Vec<u8>)) -> Vec<u8> {
 	let mut input = &buffer[BINARY_HEADER_LEN..];
@@ -75,12 +91,12 @@ fn metadata_is_decoded_and_serialized_canonically() {
 		("AuthoringTool".to_owned(), "Carbon regression".to_owned()),
 	]);
 	let mut buffer = Vec::new();
-	Serializer::new()
+	Serializer::new(test_reflection_database())
 		.metadata(metadata.clone())
 		.serialize(&mut buffer, &tree, &[tree.root_ref()])
 		.expect("failed to encode metadata");
 
-	let structure = Deserializer::new()
+	let structure = Deserializer::new(test_reflection_database())
 		.deserialize_structure(buffer.as_slice())
 		.expect("failed to decode metadata");
 	assert_eq!(structure.metadata(), &metadata);
@@ -122,12 +138,12 @@ fn parallel_property_encoding_is_byte_identical_to_serial_encoding() {
 	})));
 	let roots = tree.root().children();
 	let mut serial = Vec::new();
-	let serial_report = Serializer::new()
+	let serial_report = Serializer::new(test_reflection_database())
 		.property_workers(1)
 		.serialize_source_with_report(&mut serial, &tree, roots)
 		.unwrap();
 	let mut parallel = Vec::new();
-	let parallel_report = Serializer::new()
+	let parallel_report = Serializer::new(test_reflection_database())
 		.property_workers(4)
 		.serialize_source_with_report(&mut parallel, &tree, roots)
 		.unwrap();
@@ -332,7 +348,7 @@ fn unknown_property() {
 
 	let decoded = DecodedModel::from_reader(buffer.as_slice());
 	insta::assert_yaml_snapshot!(decoded);
-	Deserializer::new()
+	Deserializer::new(test_reflection_database())
 		.strict(true)
 		.deserialize(buffer.as_slice())
 		.expect("strict decoding should retain representable unknown properties");
@@ -360,22 +376,19 @@ fn strict_capture_can_skip_a_known_save_only_property() {
 	let non_serializing = reflection_with_non_serializing_probe(false);
 	let tree = WeakDom::new(InstanceBuilder::new("Folder").with_property("SaveOnlyProbe", Ref::none()));
 	let mut buffer = Vec::new();
-	Serializer::new()
-		.reflection_database(&serializing)
+	Serializer::new(&serializing)
 		.serialize(&mut buffer, &tree, &[tree.root_ref()])
 		.unwrap();
 
-	let error = Deserializer::new()
+	let error = Deserializer::new(&non_serializing)
 		.strict(true)
-		.reflection_database(&non_serializing)
 		.deserialize(buffer.as_slice())
 		.unwrap_err();
 	assert!(error.to_string().contains("marks this property as non-serializing"));
 
-	let decoded = Deserializer::new()
+	let decoded = Deserializer::new(&non_serializing)
 		.strict(true)
 		.skip_known_non_serializing_properties(true)
-		.reflection_database(&non_serializing)
 		.deserialize(buffer.as_slice())
 		.unwrap();
 	assert!(!decoded.root().properties.contains_key(&Ustr::from("SaveOnlyProbe")));
@@ -390,7 +403,7 @@ fn strict_decoder_rejects_unknown_property_type() {
 		data[type_offset] = 0xfe;
 	});
 
-	let error = Deserializer::new()
+	let error = Deserializer::new(test_reflection_database())
 		.strict(true)
 		.deserialize(corrupted.as_slice())
 		.unwrap_err();
@@ -406,15 +419,15 @@ fn strict_decoder_rejects_property_chunks_without_a_type_byte() {
 		data.truncate(type_offset);
 	});
 
-	Deserializer::new()
+	Deserializer::new(test_reflection_database())
 		.deserialize(corrupted.as_slice())
 		.expect("compatibility decoding should retain its missing-type behavior");
-	let error = Deserializer::new()
+	let error = Deserializer::new(test_reflection_database())
 		.strict(true)
 		.deserialize(corrupted.as_slice())
 		.unwrap_err();
 	assert!(error.to_string().contains("no property type byte"));
-	let structure_error = Deserializer::new()
+	let structure_error = Deserializer::new(test_reflection_database())
 		.strict(true)
 		.deserialize_structure(corrupted.as_slice())
 		.err()
@@ -437,8 +450,10 @@ fn strict_decoder_rejects_unknown_chunks_that_compatibility_ignores() {
 	});
 	assert!(injected);
 
-	Deserializer::new().deserialize(with_unknown.as_slice()).unwrap();
-	let error = Deserializer::new()
+	Deserializer::new(test_reflection_database())
+		.deserialize(with_unknown.as_slice())
+		.unwrap();
+	let error = Deserializer::new(test_reflection_database())
 		.strict(true)
 		.deserialize(with_unknown.as_slice())
 		.unwrap_err();

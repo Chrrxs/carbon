@@ -72,6 +72,13 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         (className is "Script" or "LocalScript" or "ModuleScript")
         && (propertyName is "Capabilities" or "LinkedSource" or "Sandboxed" or "SourceAssetId");
 
+    internal static bool CanSuppressScriptPropertyObservation(
+        string className,
+        string propertyName,
+        bool matchesSerializedBaseline) =>
+        matchesSerializedBaseline
+        && IsEngineOwnedScriptNormalizationProperty(className, propertyName);
+
     internal static bool IsEngineOwnedWorkspaceNormalizationProperty(
         string className,
         string instanceName,
@@ -1275,7 +1282,16 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         {
             TryCacheStudioIdentity(instance);
         }
-        if (IsLaunchBaselineEcho(instance, propertyName))
+        var matchesSerializedBaseline = IsLaunchBaselineEcho(instance, propertyName);
+        var isScriptNormalizationProperty = IsEngineOwnedScriptNormalizationProperty(
+            instance.ClassName,
+            propertyName);
+        if (isScriptNormalizationProperty
+            ? CanSuppressScriptPropertyObservation(
+                instance.ClassName,
+                propertyName,
+                matchesSerializedBaseline)
+            : matchesSerializedBaseline)
         {
             return;
         }
@@ -2061,11 +2077,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             var excludedEditCameraHandle = unchecked((nuint)Volatile.Read(
                 ref _excludedEditCameraHandle));
             if (excludedEditCameraHandle != 0 && handle == excludedEditCameraHandle)
-            {
-                return false;
-            }
-
-            if (IsEngineOwnedScriptNormalizationProperty(instance.ClassName, propertyName))
             {
                 return false;
             }
