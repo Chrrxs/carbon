@@ -161,6 +161,29 @@ impl ManifestCaptureStatus {
 const SHUTDOWN_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MANIFEST_CAPTURE_MAX_ATTEMPTS: usize = 3;
 const MANIFEST_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(50);
+const PROJECT_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PROJECT_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn wait_for_project_synchronization<T, Check, Wait, Expired>(
+	mut check: Check,
+	mut wait: Wait,
+	mut expired: Expired,
+) -> Result<T>
+where
+	Check: FnMut() -> Result<T>,
+	Wait: FnMut(Duration),
+	Expired: FnMut() -> bool,
+{
+	loop {
+		match check() {
+			Ok(value) => return Ok(value),
+			Err(error) if error.downcast_ref::<project::ProjectSynchronizationPending>().is_some() && !expired() => {
+				wait(PROJECT_SYNC_POLL_INTERVAL);
+			}
+			Err(error) => return Err(error),
+		}
+	}
+}
 
 pub(crate) fn wait_for_shutdown_capture<Begin, Poll, Wait>(
 	begin: Begin,
@@ -319,6 +342,40 @@ mod manifest_capture_retry_tests {
 		.unwrap_err();
 		assert!(error.to_string().contains("stopped before a native snapshot retry"));
 		assert_eq!(attempts, 1);
+	}
+
+	#[test]
+	fn pending_project_realization_waits_for_synchronization() {
+		let mut checks = 0;
+		let mut waits = 0;
+		let result = wait_for_project_synchronization(
+			|| {
+				checks += 1;
+				if checks < 3 {
+					return Err(project::ProjectSynchronizationPending.into());
+				}
+				Ok("synchronized")
+			},
+			|_| waits += 1,
+			|| false,
+		)
+		.unwrap();
+		assert_eq!(result, "synchronized");
+		assert_eq!(checks, 3);
+		assert_eq!(waits, 2);
+	}
+
+	#[test]
+	fn pending_project_realization_wait_is_bounded() {
+		let waits = std::cell::Cell::new(0);
+		let error = wait_for_project_synchronization::<(), _, _, _>(
+			|| Err(project::ProjectSynchronizationPending.into()),
+			|_| waits.set(waits.get() + 1),
+			|| waits.get() >= 1,
+		)
+		.unwrap_err();
+		assert!(error.downcast_ref::<project::ProjectSynchronizationPending>().is_some());
+		assert_eq!(waits.get(), 1);
 	}
 }
 
@@ -856,10 +913,15 @@ impl Core {
 		let manifest_identities_authoritative = capabilities.manifest_identities_authoritative;
 		let contract = self.managed_hierarchy_contract()?;
 		let source_generation = self.source_generation();
-		let project_realization_generation = {
-			let _project_state = self.project_state_lock.as_ref().map(|lock| lock.lock().unwrap());
-			self.exact_project_realization_generation()?
-		};
+		let project_sync_started = Instant::now();
+		let project_realization_generation = wait_for_project_synchronization(
+			|| {
+				let _project_state = self.project_state_lock.as_ref().map(|lock| lock.lock().unwrap());
+				self.exact_project_realization_generation()
+			},
+			thread::sleep,
+			|| project_sync_started.elapsed() >= PROJECT_SYNC_WAIT_TIMEOUT,
+		)?;
 		// `/v1/roots` is a point-in-time set and Studio may lazily create a
 		// persistent service between that handshake and native serialization.
 		// Send the complete pinned reflection schema; RML still fails closed if a
@@ -2502,6 +2564,41 @@ impl ReloadSignalState {
 			true
 		}
 	}
+
+	fn signal_manifest_result(
+		&mut self,
+		result: ManifestReadResult,
+		project_path: &Path,
+		control_tx: Option<&crate::server::ServeControlSender>,
+	) {
+		match result {
+			ManifestReadResult::InvalidJson(error) => log::warn!(
+				"Project document {} changed on disk but is invalid or malformed JSON; retaining previous generation: {}",
+				project_path.display(),
+				error
+			),
+			ManifestReadResult::ValidChanged { hash } => {
+				if self.should_signal_manifest(hash) {
+					log::info!(
+						"Project document {} changed stably on disk; signaling recoverable reload",
+						project_path.display()
+					);
+					if let Some(control_tx) = control_tx {
+						let _ = control_tx.send(crate::server::ServeControl::Reload);
+					}
+				} else {
+					log::debug!(
+						"Coalesced duplicate manifest reload signal for {}",
+						project_path.display()
+					);
+					if let Some(control_tx) = control_tx {
+						control_tx.retry_failed_reload();
+					}
+				}
+			}
+			ManifestReadResult::Unchanged => {}
+		}
+	}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2560,42 +2657,18 @@ fn watch_project_source(
 	})?;
 	Builder::new().name("carbon-project-watcher".into()).spawn(move || {
 		let mut reload_state = ReloadSignalState::new();
+		let mut source_sync_pending = false;
 		loop {
 			let observed_event = match event_receiver.recv_timeout(Duration::from_millis(500)) {
 				Ok(()) => true,
 				Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
 				Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
 			};
+			source_sync_pending |= observed_event;
 			let _state = project_state_lock.lock().unwrap();
-			match reload_state.check_manifest(&project_path, &frozen_project_document) {
-				ManifestReadResult::InvalidJson(error) => {
-					log::warn!(
-						"Project document {} changed on disk but is invalid or malformed JSON; retaining previous generation: {}",
-						project_path.display(),
-						error
-					);
-					continue;
-				}
-				ManifestReadResult::ValidChanged { hash } => {
-					if reload_state.should_signal_manifest(hash) {
-						log::info!(
-							"Project document {} changed stably on disk; signaling recoverable reload",
-							project_path.display()
-						);
-						if let Some(control_tx) = &control_tx {
-							let _ = control_tx.send(crate::server::ServeControl::Reload);
-						}
-					} else {
-						log::debug!("Coalesced duplicate manifest reload signal for {}", project_path.display());
-						if let Some(control_tx) = &control_tx {
-							control_tx.retry_failed_reload();
-						}
-					}
-					continue;
-				}
-				ManifestReadResult::Unchanged => {}
-			}
-			if !observed_event {
+			let manifest_result = reload_state.check_manifest(&project_path, &frozen_project_document);
+			if !source_sync_pending {
+				reload_state.signal_manifest_result(manifest_result, &project_path, control_tx.as_ref());
 				continue;
 			}
 			let previous_snapshot = project_snapshot.read().unwrap().clone();
@@ -2649,6 +2722,8 @@ fn watch_project_source(
 				}
 			};
 			if changes.is_empty() {
+				source_sync_pending = false;
+				reload_state.signal_manifest_result(manifest_result, &project_path, control_tx.as_ref());
 				continue;
 			}
 			log::debug!(
@@ -2729,6 +2804,8 @@ fn watch_project_source(
 					continue;
 				}
 			}
+			source_sync_pending = false;
+			reload_state.signal_manifest_result(manifest_result, &project_path, control_tx.as_ref());
 		}
 	})?;
 	for root in watch_roots {

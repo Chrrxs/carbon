@@ -66,6 +66,23 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         && string.Equals(ownerClass, "Workspace", StringComparison.Ordinal)
         && string.Equals(property, "CurrentCamera", StringComparison.Ordinal);
 
+    internal static bool IsEngineOwnedScriptNormalizationProperty(
+        string className,
+        string propertyName) =>
+        (className is "Script" or "LocalScript" or "ModuleScript")
+        && (propertyName is "Capabilities" or "LinkedSource" or "Sandboxed" or "SourceAssetId");
+
+    internal static bool IsEngineOwnedWorkspaceNormalizationProperty(
+        string className,
+        string instanceName,
+        string propertyName,
+        ReadOnlySpan<byte> value) =>
+        string.Equals(className, "Workspace", StringComparison.Ordinal)
+        && string.Equals(instanceName, "Workspace", StringComparison.Ordinal)
+        && string.Equals(propertyName, "PredictiveStreamingMode", StringComparison.Ordinal)
+        && value.Length == sizeof(uint)
+        && value.IndexOfAnyExcept((byte)0) < 0;
+
     internal static ObservationRetentionPlan PlanObservationRetention(
         bool isPersistentAuthoredMutation,
         bool isMapped,
@@ -2048,6 +2065,11 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 return false;
             }
 
+            if (IsEngineOwnedScriptNormalizationProperty(instance.ClassName, propertyName))
+            {
+                return false;
+            }
+
             if (string.Equals(instance.ClassName, "Workspace", StringComparison.Ordinal)
                 && string.Equals(propertyName, "CurrentCamera", StringComparison.Ordinal))
             {
@@ -2147,6 +2169,25 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             {
                 matches = ManifestIdentityAttributeCodec.MatchesIgnoringTransportMcpPlaceId(
                     transportBaseline.Value,
+                    value);
+            }
+            if (!matches
+                && IsEngineOwnedWorkspaceNormalizationProperty(
+                    instance.ClassName,
+                    instance.Name,
+                    propertyName,
+                    value))
+            {
+                matches = true;
+            }
+            if (!matches
+                && string.Equals(instance.ClassName, "ReplicatedStorage", StringComparison.Ordinal)
+                && string.Equals(instance.Name, "ReplicatedStorage", StringComparison.Ordinal)
+                && string.Equals(propertyName, "Attributes", StringComparison.Ordinal)
+                && baseline.TryGetValue(serializedName, out var emitterBaseline))
+            {
+                matches = ManifestIdentityAttributeCodec.MatchesIgnoringEmitterVersion(
+                    emitterBaseline.Value,
                     value);
             }
             return matches;

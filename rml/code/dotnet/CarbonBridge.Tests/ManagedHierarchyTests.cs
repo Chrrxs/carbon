@@ -1022,10 +1022,13 @@ public sealed class ManagedHierarchyTests
             new ManagedRuntimeNode("nested-stats", "workspace", "Stats", "Stats"),
             new ManagedRuntimeNode("renamed-stats", "game", "Stats", "Other"),
             new ManagedRuntimeNode("wrong-case-stats", "game", "stats", "Stats"),
+            new ManagedRuntimeNode("test-service", "game", "TestService", "TestService"),
+            new ManagedRuntimeNode("nested-test-service", "workspace", "TestService", "TestService"),
+            new ManagedRuntimeNode("renamed-test-service", "game", "TestService", "Other"),
         };
 
         Assert.Equal(
-            [runtime[1], runtime[5], runtime[8], runtime[9], runtime[12]],
+            [runtime[1], runtime[5], runtime[8], runtime[9], runtime[12], runtime[16]],
             ManagedHierarchy.RuntimeOnlyRoots(runtime, "game"));
     }
 

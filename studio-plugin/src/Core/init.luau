@@ -164,10 +164,12 @@ function Core:run(): Promise.Promise
 			return reject(Error.new(Error.ManifestIdentityUnsupported))
 		end
 
-		if trustedBuiltPlace and privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then
-			local identityBootstrap = self.client:bootstrapManifestIdentities():expect()
-			if identityBootstrap.authoritative ~= true then
-				return reject(Error.new(Error.ManifestIdentityRejected))
+		if trustedBuiltPlace then
+			if privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then
+				local identityBootstrap = self.client:bootstrapManifestIdentities():expect()
+				if identityBootstrap.authoritative ~= true then
+					return reject(Error.new(Error.ManifestIdentityRejected))
+				end
 			end
 			Log.trace("Binding generation-matched mapped source identities without hierarchy verification..")
 			local report = self.reconciler:prime(self.client, self.project)
@@ -377,6 +379,8 @@ function Core:__startSyncLoop()
 					and data.transitionId ~= ""
 					and type(data.projectName) == "string"
 					and data.projectName ~= ""
+					and type(data.sourceGeneration) == "string"
+					and data.sourceGeneration ~= ""
 					and type(data.worktreeId) == "string"
 					and type(data.sessionToken) == "string"
 					and self.expectedWorktree ~= nil
@@ -386,11 +390,11 @@ function Core:__startSyncLoop()
 					and data.sessionToken == self.expectedWorktree.sessionToken
 
 				if valid then
-					-- The replacement generation intentionally has a different source
-					-- generation. Preserve the managed identity contract, but force the
-					-- ordinary untrusted capture and full reconciliation path.
+					-- The old generation was captured before the transition. Trust
+					-- the authenticated replacement generation so reconnect does not
+					-- race a redundant pre-reconciliation capture against source sync.
 					self.expectedWorktree.name = data.projectName
-					self.expectedWorktree.sourceGeneration = nil
+					self.expectedWorktree.sourceGeneration = data.sourceGeneration
 					self.status = Core.Status.Disconnecting
 					return reject(Error.new(Error.ManagedReload, data.transitionId))
 				else

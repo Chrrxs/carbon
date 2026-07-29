@@ -186,6 +186,13 @@ fn capture_before_shutdown(core: &Arc<Core>) -> Result<()> {
 	Ok(())
 }
 
+fn persist_served_studio_domain(project_path: &Path, cleanup_paths: &ServeCleanupPaths) -> Result<()> {
+	let materialized = project::materialize(project_path).context("failed to materialize served project topology")?;
+	cleanup_paths.register_composite(materialized.directory.clone());
+	let policy = project::live_policy(project_path, &materialized);
+	project::persist_studio_domain(&policy).context("failed to prune mapping barriers before serve startup")
+}
+
 fn prepare_served_core(
 	project_path: &Path,
 	worktree_id: &str,
@@ -195,7 +202,6 @@ fn prepare_served_core(
 ) -> Result<Arc<Core>> {
 	let materialized = project::materialize(project_path).context("failed to materialize served project topology")?;
 	let project_name = materialized.name.clone();
-	let policy = project::live_policy(project_path, &materialized);
 	let composite_directory = materialized.directory.clone();
 	cleanup_paths.register_composite(composite_directory.clone());
 	let core = Arc::new(Core::new_project_with_worktree_and_control(
@@ -204,9 +210,7 @@ fn prepare_served_core(
 		(project_name, worktree_id.to_owned(), session_token.to_owned()),
 		Some(control_sender.clone()),
 	)?);
-	core.register_ephemeral_path(composite_directory.clone());
-	drop(materialized);
-	project::persist_studio_domain(&policy).context("failed to prune mapping barriers before serve startup")?;
+	core.register_ephemeral_path(composite_directory);
 	Ok(core)
 }
 
@@ -261,8 +265,10 @@ impl Serve {
 			identity_exclusions: Default::default(),
 		};
 
-		crate::carbon_info!("Building managed place from {}", project_path.to_string().bold());
 		let build_path = temporary_build_path()?;
+		let cleanup_paths = ServeCleanupPaths::new(build_path.clone(), PathBuf::new());
+		persist_served_studio_domain(&project_path, &cleanup_paths)?;
+		crate::carbon_info!("Building managed place from {}", project_path.to_string().bold());
 		let report = match build_managed_place(&project_path, &build_path, &contract) {
 			Ok(report) => report,
 			Err(error) => {
@@ -288,7 +294,6 @@ impl Serve {
 		);
 
 		let (control_sender, control_receiver) = server::serve_control_channel();
-		let cleanup_paths = ServeCleanupPaths::new(build_path.clone(), PathBuf::new());
 		let mut core = match prepare_served_core(
 			&project_path,
 			&worktree_id,
@@ -422,6 +427,13 @@ impl Serve {
 							reload_control.fail_reload(true);
 							return false;
 						}
+						if let Err(error) = persist_served_studio_domain(&reload_project, &reload_cleanup_paths) {
+							crate::carbon_error!(
+								"Could not persist Studio state before synchronization reload; retaining active generation: {error:#}"
+							);
+							reload_control.fail_reload(false);
+							return false;
+						}
 						let next_core =
 							match prepare_served_core(
 								&reload_project,
@@ -465,6 +477,7 @@ impl Serve {
 							server::Message::ManagedReload(server::ManagedReload {
 								transition_id,
 								project_name: next_core.name().to_owned(),
+								source_generation: next_core.source_generation(),
 								worktree_id: reload_worktree.clone(),
 								session_token: reload_session.clone(),
 							}),

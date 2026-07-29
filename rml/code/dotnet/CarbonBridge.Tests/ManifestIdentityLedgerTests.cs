@@ -152,6 +152,40 @@ public sealed class ManifestIdentityLedgerTests
     }
 
     [Fact]
+    public void EmitterVersionIsIgnoredOnlyWhenEveryAuthoredAttributeIsUnchanged()
+    {
+        var baseline = SerializeAttributes(
+        [
+            new("Canonical", 0x02, StringValue("keep")),
+        ]);
+        var normalized = SerializeAttributes(
+        [
+            new("Canonical", 0x02, StringValue("keep")),
+            new("Emitter2D_Version", 0x06, BitConverter.GetBytes(1.26)),
+        ]);
+        var authoredChange = SerializeAttributes(
+        [
+            new("Canonical", 0x02, StringValue("changed")),
+            new("Emitter2D_Version", 0x06, BitConverter.GetBytes(1.26)),
+        ]);
+        var wrongVersion = SerializeAttributes(
+        [
+            new("Canonical", 0x02, StringValue("keep")),
+            new("Emitter2D_Version", 0x06, BitConverter.GetBytes(1.27)),
+        ]);
+
+        Assert.True(ManifestIdentityAttributeCodec.MatchesIgnoringEmitterVersion(
+            baseline,
+            normalized));
+        Assert.False(ManifestIdentityAttributeCodec.MatchesIgnoringEmitterVersion(
+            baseline,
+            authoredChange));
+        Assert.False(ManifestIdentityAttributeCodec.MatchesIgnoringEmitterVersion(
+            baseline,
+            wrongVersion));
+    }
+
+    [Fact]
     public void PackedIdentityRoundTripsWireBytes()
     {
         var identity = ManifestIdentity.Parse("00112233445566778899aabbccddeeff");

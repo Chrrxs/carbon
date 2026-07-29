@@ -16,6 +16,7 @@ internal static class ManifestIdentityAttributeCodec
 
     private static readonly byte[] AttributeNameUtf8 = Encoding.UTF8.GetBytes(AttributeName);
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly byte[] EmitterVersionValue = BitConverter.GetBytes(1.26);
 
     public static string? Decode(
         ReadOnlySpan<byte> serialized,
@@ -50,6 +51,38 @@ internal static class ManifestIdentityAttributeCodec
             }
             baselineAttributes.Remove("__MCPPlaceId");
             if (baselineAttributes.Count != liveAttributes.Count)
+            {
+                return false;
+            }
+            foreach (var (name, expected) in baselineAttributes)
+            {
+                if (!liveAttributes.TryGetValue(name, out var current)
+                    || expected.TypeId != current.TypeId
+                    || !expected.Value.AsSpan().SequenceEqual(current.Value))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool MatchesIgnoringEmitterVersion(
+        ReadOnlySpan<byte> baseline,
+        ReadOnlySpan<byte> live)
+    {
+        try
+        {
+            var baselineAttributes = ParseWireAttributes(baseline);
+            var liveAttributes = ParseWireAttributes(live);
+            if (!liveAttributes.Remove("Emitter2D_Version", out var version)
+                || version.TypeId != 0x06
+                || !version.Value.AsSpan().SequenceEqual(EmitterVersionValue)
+                || baselineAttributes.Count != liveAttributes.Count)
             {
                 return false;
             }

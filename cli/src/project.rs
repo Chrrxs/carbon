@@ -2605,6 +2605,30 @@ fn is_capture_identity_only_property(property: &str) -> bool {
 	matches!(property, "Name" | "Parent" | "HistoryId" | "UniqueId")
 }
 
+fn projected_realization_changes_pending(changes: &Changes, mapped_refs: &HashSet<Ref>) -> bool {
+	if !changes.additions.is_empty() || !changes.removals.is_empty() {
+		return true;
+	}
+	changes.updates.iter().any(|update| {
+		!mapped_refs.contains(&update.id)
+			|| update.parent.is_some()
+			|| update.name.is_some()
+			|| update.raw_name.is_some()
+			|| update.class.is_some()
+			|| update
+				.properties
+				.as_ref()
+				.is_some_and(|properties| !properties.is_empty())
+			|| update.removed_properties.is_empty()
+			|| update.removed_properties.iter().any(|property| {
+				!matches!(
+					property.as_str(),
+					"Capabilities" | "LinkedSource" | "Sandboxed" | "SourceAssetId"
+				)
+			})
+	})
+}
+
 /// Re-evaluate frozen filesystem mappings against the small hierarchy retained
 /// by a hybrid serve session. The projected baseline contains the engine route
 /// anchors and the previous mapped realization, but none of the potentially
@@ -2651,6 +2675,19 @@ pub(crate) fn reevaluate_projected_frozen_tracked(
 	))
 }
 
+#[derive(Debug)]
+pub(crate) struct ProjectSynchronizationPending;
+
+impl std::fmt::Display for ProjectSynchronizationPending {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str(
+			"filesystem mapping realization has pending changes; wait for project synchronization before Capture Manifest",
+		)
+	}
+}
+
+impl std::error::Error for ProjectSynchronizationPending {}
+
 pub(crate) fn exact_projected_realization_generation(
 	project_path: &Path,
 	frozen_project_document: &[u8],
@@ -2659,10 +2696,10 @@ pub(crate) fn exact_projected_realization_generation(
 ) -> Result<String> {
 	let (candidate, routes) =
 		reevaluate_projected_frozen(project_path, frozen_project_document, previous_projected, mapped_refs)?;
-	ensure!(
-		diff_snapshots(previous_projected, &candidate)?.is_empty(),
-		"filesystem mapping realization has pending changes; wait for project synchronization before Capture Manifest"
-	);
+	let changes = diff_snapshots(previous_projected, &candidate)?;
+	if projected_realization_changes_pending(&changes, mapped_refs) {
+		return Err(ProjectSynchronizationPending.into());
+	}
 	projected_realization_generation(candidate, routes)
 }
 
@@ -6656,6 +6693,33 @@ mod tests {
 			Some(UstrMap::from_iter([(Ustr::from("Archivable"), Variant::Bool(false),)]))
 		);
 		assert!(update.removed_properties.is_empty());
+	}
+
+	#[test]
+	fn projected_realization_ignores_engine_owned_state_removed_from_mapped_scripts() {
+		let id = Ref::new();
+		let old = Snapshot::new()
+			.with_id(id)
+			.with_name("Script")
+			.with_class("ModuleScript")
+			.with_properties(UstrMap::from_iter([
+				(Ustr::from("Capabilities"), Variant::String("engine".to_owned())),
+				(Ustr::from("LinkedSource"), Variant::String("asset".to_owned())),
+				(Ustr::from("Sandboxed"), Variant::Bool(true)),
+				(Ustr::from("SourceAssetId"), Variant::Int64(42)),
+			]));
+		let new = Snapshot::new()
+			.with_id(id)
+			.with_name("Script")
+			.with_class("ModuleScript");
+		let mut changes = diff_snapshots(&old, &new).unwrap();
+
+		assert_eq!(changes.updates.len(), 1);
+		assert!(!projected_realization_changes_pending(&changes, &HashSet::from([id])));
+		assert!(projected_realization_changes_pending(&changes, &HashSet::new()));
+
+		changes.updates[0].removed_properties.push(Ustr::from("Archivable"));
+		assert!(projected_realization_changes_pending(&changes, &HashSet::from([id])));
 	}
 
 	#[test]

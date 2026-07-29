@@ -151,8 +151,11 @@ internal static class ManagedHierarchy
             && string.Equals(name, "VisualizationModeService", StringComparison.Ordinal))
         || (string.Equals(className, "StudioSdkService", StringComparison.Ordinal)
             && string.Equals(name, "StudioSdkService", StringComparison.Ordinal))
+        || (string.Equals(className, "TestService", StringComparison.Ordinal)
+            && string.Equals(name, "TestService", StringComparison.Ordinal))
         || (string.Equals(className, "Stats", StringComparison.Ordinal)
             && string.Equals(name, "Stats", StringComparison.Ordinal));
+
 
     internal static string RuntimeIdentity(nuint handle) => $"native:{handle:x}";
 

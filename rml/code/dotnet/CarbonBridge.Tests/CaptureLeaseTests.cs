@@ -38,6 +38,45 @@ public sealed class CaptureLeaseTests
             "Workspace", "CurrentCamera", editCamera, 0));
     }
 
+    [Theory]
+    [InlineData("ModuleScript", "Capabilities", true)]
+    [InlineData("Script", "LinkedSource", true)]
+    [InlineData("LocalScript", "Sandboxed", true)]
+    [InlineData("ModuleScript", "SourceAssetId", true)]
+    [InlineData("Folder", "SourceAssetId", false)]
+    [InlineData("ModuleScript", "Source", false)]
+    [InlineData("ModuleScript", "Archivable", false)]
+    public void OnlyEngineOwnedScriptNormalizationPropertiesAreFiltered(
+        string className,
+        string propertyName,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CarbonBridgeMod.IsEngineOwnedScriptNormalizationProperty(className, propertyName));
+    }
+
+    [Theory]
+    [InlineData("Workspace", "Workspace", "PredictiveStreamingMode", new byte[] { 0, 0, 0, 0 }, true)]
+    [InlineData("Workspace", "Workspace", "PredictiveStreamingMode", new byte[] { 1, 0, 0, 0 }, false)]
+    [InlineData("Workspace", "Workspace", "StreamingEnabled", new byte[] { 0, 0, 0, 0 }, false)]
+    [InlineData("Folder", "Workspace", "PredictiveStreamingMode", new byte[] { 0, 0, 0, 0 }, false)]
+    public void OnlyTheDefaultWorkspacePredictiveStreamingNormalizationIsFiltered(
+        string className,
+        string instanceName,
+        string propertyName,
+        byte[] value,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CarbonBridgeMod.IsEngineOwnedWorkspaceNormalizationProperty(
+                className,
+                instanceName,
+                propertyName,
+                value));
+    }
+
     [Fact]
     public void MappedReferenceResolutionSkipsNilKnownAndDuplicateTargets()
     {

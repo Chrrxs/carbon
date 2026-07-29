@@ -188,6 +188,7 @@ pub struct Disconnect {
 pub struct ManagedReload {
 	pub transition_id: String,
 	pub project_name: String,
+	pub source_generation: String,
 	pub worktree_id: String,
 	pub session_token: String,
 }
@@ -451,12 +452,14 @@ mod tests {
 		let reload = ManagedReload {
 			transition_id: "tx-123".into(),
 			project_name: "RenamedGame".into(),
+			source_generation: "gen-234".into(),
 			worktree_id: "wt-456".into(),
 			session_token: "tok-789".into(),
 		};
 		let json = serde_json::to_value(&reload).unwrap();
 		assert_eq!(json["transitionId"], "tx-123");
 		assert_eq!(json["projectName"], "RenamedGame");
+		assert_eq!(json["sourceGeneration"], "gen-234");
 		assert_eq!(json["worktreeId"], "wt-456");
 		assert_eq!(json["sessionToken"], "tok-789");
 
@@ -464,6 +467,7 @@ mod tests {
 		let msg_json = serde_json::to_value(&message).unwrap();
 		assert_eq!(msg_json["ManagedReload"]["transitionId"], "tx-123");
 		assert_eq!(msg_json["ManagedReload"]["projectName"], "RenamedGame");
+		assert_eq!(msg_json["ManagedReload"]["sourceGeneration"], "gen-234");
 		assert_eq!(msg_json["ManagedReload"]["worktreeId"], "wt-456");
 		assert_eq!(msg_json["ManagedReload"]["sessionToken"], "tok-789");
 	}

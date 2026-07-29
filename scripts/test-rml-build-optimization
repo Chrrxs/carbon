@@ -47,9 +47,9 @@ if ! grep -Fq -- 'Usage: carbon-studio-helper <launch|inject|terminate|focus> [a
 	failure=1
 fi
 
-if ! grep -Fq -- 'GetExitCodeThread' "$HELPER_SOURCE" ||
+if ! grep -Fq -- 'process_has_module(pid, loader_path, modulesInspected)' "$HELPER_SOURCE" ||
 	! grep -Fq -- 'LoadLibraryW returned null for the Carbon RML loader' "$HELPER_SOURCE"; then
-	echo "FAIL: Carbon studio helper does not reject a failed remote LoadLibraryW call" >&2
+	echo "FAIL: Carbon studio helper does not verify a zero remote LoadLibraryW result against loaded modules" >&2
 	failure=1
 fi
 

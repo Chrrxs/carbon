@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rbx_binary::{DecodeSink, Deserializer, InstanceSource};
 use rbx_dom_weak::{
-	types::{ContentType, Ref, Variant},
+	types::{CFrame, ContentType, Enum, Ref, Variant},
 	Ustr, UstrMap,
 };
 use rbx_reflection::ClassTag;
@@ -472,8 +472,10 @@ fn is_braced_uuid(value: &str) -> bool {
 
 fn is_forward_instance_default(name: &str, value: &Variant) -> bool {
 	match (name, value) {
-		("SourceAssetId", Variant::Int64(-1)) | ("Sandboxed", Variant::Bool(false)) => true,
+		("SourceAssetId", Variant::Int64(-1)) | ("Sandboxed" | "Disabled", Variant::Bool(false)) => true,
 		("Capabilities", Variant::SecurityCapabilities(value)) => value.bits() == 0,
+		("LinkedSource", Variant::ContentId(value)) => value.as_str().is_empty(),
+		("RunContext", Variant::Enum(value)) => value.to_u32() == 0,
 		("Tags", Variant::Tags(value)) => value.is_empty(),
 		("Attributes", Variant::Attributes(value)) => value.is_empty(),
 		_ => false,
@@ -964,12 +966,42 @@ fn is_engine_default_service_shell(
 			if is_default_hydrated_lighting_property(node.class.as_str(), name.as_str(), value) {
 				return true;
 			}
+			if is_default_hydrated_service_property(node.class.as_str(), name.as_str(), value) {
+				return true;
+			}
 			let Some(default) = database.find_default_property(descriptor, name.as_str()) else {
 				return matches!(value, Variant::Ref(target) if target.is_none());
 			};
 			canonical_value(value, structure, true, Some(node), None)
 				== canonical_value(default, structure, true, Some(node), None)
 		})
+}
+
+fn is_default_hydrated_service_property(class: &str, property: &str, value: &Variant) -> bool {
+	match (class, property, value) {
+		("AssetService", "AllowInsertFreeAssets", Variant::Bool(false))
+		| ("Debris", "MaxItems", Variant::Int32(1000))
+		| ("Players", "BanningEnabled" | "CharacterAutoLoads", Variant::Bool(true))
+		| ("Players", "UseStrafingAnimations", Variant::Bool(false))
+		| ("Players", "PreferredPlayers", Variant::Int32(0))
+		| ("Players", "MaxPlayers", Variant::Int32(12))
+		| ("Players", "RespawnTime", Variant::Float32(5.0))
+		| ("StarterGui", "ResetPlayerGuiOnSpawn" | "ShowDevelopmentGui", Variant::Bool(true)) => true,
+		("PlayerEmulatorService", "SerializedEmulatedPolicyInfo", Variant::BinaryString(value)) => {
+			let bytes: &[u8] = value.as_ref();
+			bytes.is_empty()
+		}
+		("ServiceVisibilityService", "VisibleServices" | "HiddenServices", Variant::BinaryString(value)) => {
+			let bytes: &[u8] = value.as_ref();
+			bytes == [0, 0, 0, 0]
+		}
+		("SoundService", "ListenerCFrame", Variant::CFrame(value)) => value == &CFrame::identity(),
+		("StarterGui", "RtlTextSupport", Variant::Enum(value)) => value.to_u32() == 0,
+		("StarterGui", "ClipsDescendantsSupportsRotation", Variant::Enum(value)) => value.to_u32() == 0,
+		("StarterGui", "ScreenOrientation", Variant::Enum(value)) => value.to_u32() == 2,
+		("StarterGui", "VirtualCursorMode", Variant::Enum(value)) => value.to_u32() == 0,
+		_ => false,
+	}
 }
 
 fn is_default_hydrated_lighting_property(class: &str, property: &str, value: &Variant) -> bool {
@@ -1323,6 +1355,25 @@ fn engine_serialization_equivalent(
 	if matches!(node.class.as_str(), "Script" | "LocalScript" | "ModuleScript") && property == "ScriptGuid" {
 		return true;
 	}
+	if matches!(node.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
+		let serialized_default = match (left_value, right_value) {
+			(Some(value), None) | (None, Some(value)) => is_forward_instance_default(property, value),
+			_ => false,
+		};
+		if serialized_default {
+			return true;
+		}
+	}
+	if matches!(
+		node.class.as_str(),
+		"Folder" | "Script" | "LocalScript" | "ModuleScript"
+	) && property == "SourceAssetId"
+		&& matches!(
+			(left_value, right_value),
+			(Some(Variant::Int64(-1)), Some(Variant::Int64(0))) | (Some(Variant::Int64(0)), Some(Variant::Int64(-1)))
+		) {
+		return true;
+	}
 	if node.class.as_str() != "Lighting" {
 		return false;
 	}
@@ -1558,6 +1609,55 @@ mod tests {
 		assert_eq!(report.blocking_differences, 0);
 		assert_eq!(report.non_gameplay_differences, 0);
 		let _ = fs::remove_file(path);
+	}
+
+	#[test]
+	fn hydrated_service_defaults_require_exact_class_property_and_value() {
+		assert!(is_default_hydrated_service_property(
+			"Players",
+			"UseStrafingAnimations",
+			&Variant::Bool(false),
+		));
+		assert!(!is_default_hydrated_service_property(
+			"Players",
+			"UseStrafingAnimations",
+			&Variant::Bool(true),
+		));
+		assert!(is_default_hydrated_service_property(
+			"Players",
+			"PreferredPlayers",
+			&Variant::Int32(0),
+		));
+		assert!(!is_default_hydrated_service_property(
+			"Players",
+			"PreferredPlayers",
+			&Variant::Int32(1),
+		));
+		assert!(is_default_hydrated_service_property(
+			"StarterGui",
+			"ShowDevelopmentGui",
+			&Variant::Bool(true),
+		));
+		assert!(!is_default_hydrated_service_property(
+			"StarterGui",
+			"ShowDevelopmentGui",
+			&Variant::Bool(false),
+		));
+		assert!(is_default_hydrated_service_property(
+			"StarterGui",
+			"ClipsDescendantsSupportsRotation",
+			&Variant::Enum(Enum::from_u32(0)),
+		));
+		assert!(!is_default_hydrated_service_property(
+			"StarterGui",
+			"ClipsDescendantsSupportsRotation",
+			&Variant::Enum(Enum::from_u32(1)),
+		));
+		assert!(!is_default_hydrated_service_property(
+			"Folder",
+			"ShowDevelopmentGui",
+			&Variant::Bool(true),
+		));
 	}
 
 	#[test]

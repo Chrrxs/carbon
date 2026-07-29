@@ -32,6 +32,11 @@ assert(
 	"managed reload must retain the replacement project name for reconnect verification"
 )
 assert(
+	string.find(managedReloadHandler, "self.expectedWorktree.sourceGeneration = data.sourceGeneration", 1, true)
+		and not string.find(managedReloadHandler, "self.expectedWorktree.sourceGeneration = nil", 1, true),
+	"managed reload must trust the authenticated generation captured before the transition"
+)
+assert(
 	not string.find(managedReloadHandler, "__commitManagedProjectName", 1, true)
 		and not string.find(managedReloadHandler, "__StudioWorktree_CarbonProject", 1, true),
 	"managed reload must not advertise the replacement project before reconnect succeeds"

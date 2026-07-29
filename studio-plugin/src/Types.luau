@@ -141,6 +141,7 @@ export type Disconnect = {
 export type ManagedReloadData = {
 	transitionId: string,
 	projectName: string,
+	sourceGeneration: string,
 	worktreeId: string,
 	sessionToken: string,
 }
