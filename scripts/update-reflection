@@ -27,8 +27,13 @@ if [[ ! -s "${api_dump}" ]]; then
 	mv -- "${temporary}" "${api_dump}"
 	trap - EXIT
 fi
+env_api_dump="${api_dump}"
+if command -v cygpath >/dev/null 2>&1; then
+	env_api_dump="$(cygpath -w "${api_dump}")"
+fi
+
 if [[ -n "${GITHUB_ENV:-}" ]]; then
-	printf 'CARBON_REFLECTION_API_DUMP=%s\n' "${api_dump}" >> "${GITHUB_ENV}"
+	printf 'CARBON_REFLECTION_API_DUMP=%s\n' "${env_api_dump}" >> "${GITHUB_ENV}"
 	printf 'CARBON_REFLECTION_VERSION=%s\n' "${studio_version}" >> "${GITHUB_ENV}"
 fi
 
