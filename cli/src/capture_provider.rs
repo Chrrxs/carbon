@@ -9,12 +9,16 @@ use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+	borrow::Cow,
 	io::{Cursor, Read, Write},
 	time::Duration,
 };
 
 use crate::privileged_bridge::Bridge;
-use rbx_dom_weak::{types::Ref, Ustr};
+use rbx_dom_weak::{
+	types::{Attributes, Ref},
+	Ustr,
+};
 
 const ENVELOPE_MAGIC: &[u8; 9] = b"CARBONCP4";
 pub const CAPTURE_ENVELOPE_VERSION: u16 = 10;
@@ -27,7 +31,16 @@ const SYNTHETIC_NODE: u32 = u32::MAX;
 const IDENTITY_REMAP_CHUNK_PAIRS: usize = 4096;
 /// Bump whenever capture normalization, canonical artifact semantics, or the
 /// interpretation of fingerprinted native evidence changes.
-pub(crate) const CAPTURE_SEMANTICS_VERSION: u32 = 3;
+pub(crate) const CAPTURE_SEMANTICS_VERSION: u32 = 4;
+pub(crate) const CAPTURE_TRANSIENT_ATTRIBUTE_NAMES: &[&str] = &[
+	"__StudioWorktree_CarbonEndpoint",
+	"__StudioWorktree_CarbonProject",
+	"__StudioWorktree_CarbonGeneration",
+	"__StudioWorktree_CarbonManifestId",
+	"__StudioWorktree_Identity",
+	"__StudioWorktree_Session",
+	"__MCPPlaceId",
+];
 pub(crate) const CAPTURE_HIERARCHY_FLAG_SERIALIZED: u32 = 1 << 0;
 pub(crate) const CAPTURE_HIERARCHY_FLAG_SERVICE_SHELL: u32 = 1 << 1;
 pub(crate) const CAPTURE_HIERARCHY_FLAG_DEFAULT_HYDRATED_SERVICE: u32 = 1 << 2;
@@ -344,6 +357,23 @@ pub struct CaptureShellCarrier {
 	pub type_name: String,
 	pub carrier_class: String,
 	pub serialized_root_index: u32,
+}
+
+fn semantic_shell_property_value(property: &CaptureShellProperty) -> Cow<'_, [u8]> {
+	if property.property != "Attributes" {
+		return Cow::Borrowed(&property.value);
+	}
+	let Ok(mut attributes) = Attributes::from_reader(property.value.as_slice()) else {
+		return Cow::Borrowed(&property.value);
+	};
+	for name in CAPTURE_TRANSIENT_ATTRIBUTE_NAMES {
+		attributes.remove(*name);
+	}
+	let mut normalized = Vec::new();
+	if attributes.to_writer(&mut normalized).is_err() {
+		return Cow::Borrowed(&property.value);
+	}
+	Cow::Owned(normalized)
 }
 
 #[derive(Clone, Debug)]
@@ -811,7 +841,7 @@ impl CaptureEnvelope {
 			hasher.update(&property.owner_ordinal.to_le_bytes());
 			text(&mut hasher, &property.property);
 			text(&mut hasher, &property.type_name);
-			bytes(&mut hasher, &property.value);
+			bytes(&mut hasher, &semantic_shell_property_value(property));
 		}
 		count(&mut hasher, self.shell_carriers.len());
 		for carrier in &self.shell_carriers {
@@ -1220,6 +1250,37 @@ mod tests {
 			}
 		));
 		assert_evidence_changes_fingerprint!(|value: &mut CaptureEnvelope| value.serialized_root_ordinals.push(1));
+	}
+
+	#[test]
+	fn semantic_fingerprint_ignores_transport_attributes_but_covers_authored_attributes() {
+		fn encoded_attributes(project: &str, authored: &str) -> Vec<u8> {
+			let attributes = rbx_dom_weak::types::Attributes::new()
+				.with("__StudioWorktree_CarbonProject", project)
+				.with("__StudioWorktree_CarbonGeneration", format!("generation-{project}"))
+				.with("__MCPPlaceId", format!("mcp-{project}"))
+				.with("Authored", authored);
+			let mut bytes = Vec::new();
+			attributes.to_writer(&mut bytes).unwrap();
+			bytes
+		}
+
+		let mut original = CaptureEnvelope::decode(&fixture(b"native rbxm", false)).unwrap();
+		original.shell_properties = vec![CaptureShellProperty {
+			owner_ordinal: 1,
+			property: "Attributes".to_owned(),
+			type_name: "BinaryString".to_owned(),
+			value: encoded_attributes("before", "keep"),
+		}];
+		let fingerprint = original.semantic_fingerprint();
+
+		let mut transport_changed = original.clone();
+		transport_changed.shell_properties[0].value = encoded_attributes("after", "keep");
+		assert_eq!(fingerprint, transport_changed.semantic_fingerprint());
+
+		let mut authored_changed = original;
+		authored_changed.shell_properties[0].value = encoded_attributes("before", "changed");
+		assert_ne!(fingerprint, authored_changed.semantic_fingerprint());
 	}
 
 	#[test]

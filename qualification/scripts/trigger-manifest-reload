@@ -7,10 +7,13 @@ temporary="${project}.qualification-reload.$$"
 case "$mode" in
   trigger)
     cp -- "$project" "$backup"
-    cp -- "$project" "$temporary"
-    printf '\n' >> "$temporary"
+    command -v jq >/dev/null 2>&1 || {
+      printf 'jq is required to rewrite the qualification project name\n' >&2
+      exit 1
+    }
+    jq '.name += "-Reloaded"' "$project" > "$temporary"
     mv -- "$temporary" "$project"
-    printf 'manifest reload triggered atomically\n'
+    printf 'manifest reload with project rename triggered atomically\n'
     ;;
   restore)
     if [[ ! -f "$backup" ]]; then

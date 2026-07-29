@@ -47,7 +47,8 @@ use crate::{
 	artifact_store::{self, CapturePropertySpools},
 	capture_artifact::{reference_dependency_ordinal, CaptureModelArtifact, CaptureModelChunk},
 	capture_provider::{
-		CaptureEnvelope, CaptureReferenceTarget, ManifestIdentityRemap, CAPTURE_HIERARCHY_FLAG_DEFAULT_HYDRATED_SERVICE,
+		CaptureEnvelope, CaptureReferenceTarget, ManifestIdentityRemap,
+		CAPTURE_HIERARCHY_FLAG_DEFAULT_HYDRATED_SERVICE, CAPTURE_TRANSIENT_ATTRIBUTE_NAMES,
 	},
 	core::{snapshot::Snapshot, tree::Tree},
 	manifest_identity::ManifestIdentityAllocator,
@@ -767,16 +768,8 @@ fn normalize_property(class: &str, name: Ustr, mut value: Variant) -> Option<(Us
 		let Variant::Attributes(attributes) = &mut value else {
 			return Some((name, value));
 		};
-		for attribute in [
-			"__StudioWorktree_CarbonEndpoint",
-			"__StudioWorktree_CarbonProject",
-			"__StudioWorktree_CarbonGeneration",
-			artifact_store::MANIFEST_IDENTITY_ATTRIBUTE,
-			"__StudioWorktree_Identity",
-			"__StudioWorktree_Session",
-			"__MCPPlaceId",
-		] {
-			attributes.remove(attribute);
+		for attribute in CAPTURE_TRANSIENT_ATTRIBUTE_NAMES {
+			attributes.remove(*attribute);
 		}
 		if attributes.is_empty() {
 			return None;

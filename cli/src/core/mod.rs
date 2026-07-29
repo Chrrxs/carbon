@@ -1182,7 +1182,7 @@ impl Core {
 					.read()
 					.unwrap()
 					.clone();
-				if !force_full && staged_composite.is_noop()? {
+				if staged_composite.is_noop()? {
 					ensure!(
 						self.exact_project_realization_generation()? == project_realization_generation,
 						"filesystem mapping realization changed during Capture Manifest; retry after project source settles"
@@ -1218,8 +1218,13 @@ impl Core {
 							project_generation: project_realization_generation.clone(),
 						},
 					)?;
+					let capture_kind = if force_full {
+						"full rebuild authored no-op"
+					} else {
+						"authored no-op"
+					};
 					crate::carbon_info!(
-						"Capture Manifest authored no-op timings for {}: native-wait={:.1}ms, artifact-transfer={:.1}ms, artifact-validation={:.1}ms, compile={:.1}ms, composite-stage={:.1}ms, commit={:.1}ms, total={:.1}ms",
+						"Capture Manifest {capture_kind} timings for {}: native-wait={:.1}ms, artifact-transfer={:.1}ms, artifact-validation={:.1}ms, compile={:.1}ms, composite-stage={:.1}ms, commit={:.1}ms, total={:.1}ms",
 						request_id,
 						native_wait_elapsed.as_secs_f64() * 1_000.0,
 						transfer_elapsed.as_secs_f64() * 1_000.0,
@@ -1403,8 +1408,13 @@ impl Core {
 				} else {
 					operation.state = "complete".to_owned();
 					operation.message = Some(if exact_noop {
-						"Manifest capture exact no-op was fully validated and retained the exact RML hierarchy contract"
-							.to_owned()
+						if force_full {
+							"Manifest capture full rebuild verified an exact authored no-op and retained the canonical artifact"
+								.to_owned()
+						} else {
+							"Manifest capture exact no-op was fully validated and retained the exact RML hierarchy contract"
+								.to_owned()
+						}
 					} else {
 						"Manifest capture full rebuild committed atomically and refreshed the exact RML hierarchy contract"
 							.to_owned()

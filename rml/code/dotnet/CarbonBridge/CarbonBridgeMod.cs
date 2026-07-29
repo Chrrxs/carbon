@@ -232,6 +232,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private readonly HashSet<string> _managedOwnershipRoots = new(StringComparer.Ordinal);
     private readonly HashSet<string> _managedOwnedSourceIds = new(StringComparer.Ordinal);
     private readonly Dictionary<nuint, LaunchHydratedServiceDefaults> _launchHydratedRootDefaults = [];
+    private readonly HashSet<nuint> _pendingLaunchHydratedRootDefaultRefreshes = [];
     private readonly Dictionary<nuint, LaunchHydratedServiceDefaults> _attachedManagedRootBaselines = [];
     private string[] _launchHydratedDefaultFailures = [];
     private readonly ManagedBindingReleaseGate _managedBindingReleases = new();
@@ -391,6 +392,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _managedOwnershipRoots.Clear();
             _managedOwnedSourceIds.Clear();
             _launchHydratedRootDefaults.Clear();
+            _pendingLaunchHydratedRootDefaultRefreshes.Clear();
             _attachedManagedRootBaselines.Clear();
             _launchHydratedDefaultFailures = [];
             _stagedManagedSource = null;
@@ -596,6 +598,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _managedOwnershipRoots.Clear();
             _managedOwnedSourceIds.Clear();
             _launchHydratedRootDefaults.Clear();
+            _pendingLaunchHydratedRootDefaultRefreshes.Clear();
             _attachedManagedRootBaselines.Clear();
             _launchHydratedDefaultFailures = [];
             _stagedManagedSource = null;
@@ -797,6 +800,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 {
                     _launchHydratedRootDefaults.Add(handle, defaults);
                 }
+                _pendingLaunchHydratedRootDefaultRefreshes.Clear();
                 _attachedManagedRootBaselines.Clear();
                 foreach (var (handle, baseline) in attachedManagedRootBaselines)
                 {
@@ -1134,6 +1138,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         {
             var handle = InstanceHierarchy.RuntimeHandle(instance);
             _launchHydratedRootDefaults.Remove(handle);
+            _pendingLaunchHydratedRootDefaultRefreshes.Remove(handle);
             _attachedManagedRootBaselines.Remove(handle);
         }
         ClearStudioIdentity(instance);
@@ -1156,7 +1161,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         lock (_managedHierarchyLock)
         {
             if (_managedByRuntime.ContainsKey(runtimeId)
-                || _launchHydratedRootDefaults.ContainsKey(handle))
+                || _launchHydratedRootDefaults.ContainsKey(handle)
+                || _pendingLaunchHydratedRootDefaultRefreshes.Contains(handle))
             {
                 return false;
             }
@@ -1173,6 +1179,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             {
                 _launchHydratedRootDefaults.TryAdd(handle, baseline);
             }
+            _pendingLaunchHydratedRootDefaultRefreshes.Add(handle);
             if (failures.Length != 0)
             {
                 _launchHydratedDefaultFailures = [.. _launchHydratedDefaultFailures, .. failures];
@@ -1210,26 +1217,23 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                     return true;
                 }
 
-                HashSet<nuint> launchHydratedHandles;
+                HashSet<nuint> pendingHandles;
                 lock (_managedHierarchyLock)
                 {
-                    launchHydratedHandles = _launchHydratedRootDefaults.Keys.ToHashSet();
+                    pendingHandles = new(_pendingLaunchHydratedRootDefaultRefreshes);
+                    _pendingLaunchHydratedRootDefaultRefreshes.Clear();
                 }
                 var roots = dataModel.GetChildren()
-                    .Where(instance => launchHydratedHandles.Contains(
+                    .Where(instance => pendingHandles.Contains(
                         InstanceHierarchy.RuntimeHandle(instance)))
                     .ToArray();
                 var (defaults, failures) = CaptureLaunchHydratedRootDefaults(roots);
                 lock (_managedHierarchyLock)
                 {
-                    foreach (var handle in launchHydratedHandles)
-                    {
-                        _launchHydratedRootDefaults.Remove(handle);
-                    }
-                    foreach (var (handle, baseline) in defaults)
-                    {
-                        _launchHydratedRootDefaults.Add(handle, baseline);
-                    }
+                    RefreshPendingLaunchHydratedRootDefaults(
+                        _launchHydratedRootDefaults,
+                        defaults,
+                        pendingHandles);
                     _launchHydratedDefaultFailures = failures;
                 }
                 return true;
@@ -3347,11 +3351,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 _managedBySource.Clear();
                 _managedByRuntime.Clear();
                 _managedByDebug.Clear();
-                _launchHydratedRootDefaults.Clear();
-                foreach (var (handle, defaults) in launchHydratedRootDefaults)
-                {
-                    _launchHydratedRootDefaults.Add(handle, defaults);
-                }
+                ReconcileLaunchHydratedRootDefaults(
+                    _launchHydratedRootDefaults,
+                    launchHydratedRootDefaults);
+                _pendingLaunchHydratedRootDefaultRefreshes.ExceptWith(authoredRootHandles);
                 _attachedManagedRootBaselines.Clear();
                 foreach (var (handle, baseline) in attachedManagedRootBaselines)
                 {
@@ -5811,6 +5814,31 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         bool hasPersistentChildren,
         bool matchesCurrentDefaults) =>
         launchHydrated && !hasPersistentChildren && matchesCurrentDefaults;
+
+    internal static void ReconcileLaunchHydratedRootDefaults<T>(
+        Dictionary<nuint, T> launchDefaults,
+        IReadOnlyDictionary<nuint, T> currentlyHydrated)
+    {
+        foreach (var (handle, defaults) in currentlyHydrated)
+        {
+            launchDefaults.TryAdd(handle, defaults);
+        }
+    }
+
+    internal static void RefreshPendingLaunchHydratedRootDefaults<T>(
+        Dictionary<nuint, T> launchDefaults,
+        IReadOnlyDictionary<nuint, T> currentValues,
+        IReadOnlySet<nuint> pendingHandles)
+    {
+        foreach (var handle in pendingHandles)
+        {
+            launchDefaults.Remove(handle);
+            if (currentValues.TryGetValue(handle, out var current))
+            {
+                launchDefaults.Add(handle, current);
+            }
+        }
+    }
 
     private static bool CaptureServiceMatchesLaunchDefaults(
         Instance service,

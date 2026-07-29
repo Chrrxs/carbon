@@ -296,7 +296,7 @@
           "args": ["trigger", "${project}", "${manifest_reload_backup}"],
           "cwd": "${repo}",
           "timeout_seconds": 30,
-          "stdout_contains": ["manifest reload triggered atomically"]
+          "stdout_contains": ["manifest reload with project rename triggered atomically"]
         },
         {
           "name": "managed-reload-preserves-studio-process",
@@ -312,13 +312,28 @@
           ]
         },
         {
+          "name": "wait-for-managed-reload-project-name",
+          "kind": "mcp",
+          "tool": "execute_luau",
+          "arguments": {
+            "instance_id": "${studio_instance}",
+            "target": "edit",
+            "code": "return workspace:GetAttribute('__StudioWorktree_CarbonProject')"
+          },
+          "timeout_seconds": 30,
+          "poll_interval_ms": 100,
+          "checks": [
+            {"pointer": "/returnValue", "op": "equals", "value": "${studio_data_model}-Reloaded"}
+          ]
+        },
+        {
           "name": "managed-reload-preserves-pending-studio-change",
           "kind": "mcp",
           "tool": "execute_luau",
           "arguments": {
             "instance_id": "${studio_instance}",
             "target": "edit",
-            "code": "local parent = game:GetService('Workspace'):FindFirstChild('CarbonManifestScriptParent'); assert(parent and parent:IsA('Part'), 'capture parent missing after managed reload'); assert(parent:GetAttribute('CarbonManifestRevision') == 2, 'pending Studio attribute was lost during managed reload'); assert(parent.Size == Vector3.new(7, 3, 5), 'pending Studio property was lost during managed reload'); assert(parent:FindFirstChild('CarbonManifestDeletedOnMutation') == nil, 'pending Studio deletion was lost during managed reload'); return true"
+            "code": "assert(workspace:GetAttribute('__StudioWorktree_CarbonProject') == '${studio_data_model}-Reloaded', 'managed reload retained the stale project name'); local parent = game:GetService('Workspace'):FindFirstChild('CarbonManifestScriptParent'); assert(parent and parent:IsA('Part'), 'capture parent missing after managed reload'); assert(parent:GetAttribute('CarbonManifestRevision') == 2, 'pending Studio attribute was lost during managed reload'); assert(parent.Size == Vector3.new(7, 3, 5), 'pending Studio property was lost during managed reload'); assert(parent:FindFirstChild('CarbonManifestDeletedOnMutation') == nil, 'pending Studio deletion was lost during managed reload'); return true"
           },
           "timeout_seconds": 30,
           "max_duration_ms": 2000

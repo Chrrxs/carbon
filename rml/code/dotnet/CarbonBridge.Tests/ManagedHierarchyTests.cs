@@ -77,6 +77,62 @@ public sealed class ManagedHierarchyTests
     }
 
     [Fact]
+    public void ManagedContractReloadPreservesEstablishedHydrationBaselines()
+    {
+        var launchDefaults = new Dictionary<nuint, string>
+        {
+            [1] = "original",
+            [2] = "established-before-becoming-authored",
+        };
+        var currentlyHydrated = new Dictionary<nuint, string>
+        {
+            [1] = "user-edited",
+            [3] = "newly-hydrated",
+        };
+
+        CarbonBridgeMod.ReconcileLaunchHydratedRootDefaults(
+            launchDefaults,
+            currentlyHydrated);
+
+        Assert.Equal(
+            new Dictionary<nuint, string>
+            {
+                [1] = "original",
+                [2] = "established-before-becoming-authored",
+                [3] = "newly-hydrated",
+            },
+            launchDefaults);
+    }
+
+    [Fact]
+    public void DelayedHydrationRefreshUpdatesOnlyNewlyHydratedServices()
+    {
+        var launchDefaults = new Dictionary<nuint, string>
+        {
+            [1] = "original",
+            [2] = "early-hydration",
+        };
+        var currentValues = new Dictionary<nuint, string>
+        {
+            [1] = "user-edited",
+            [2] = "settled-hydration",
+        };
+
+        CarbonBridgeMod.RefreshPendingLaunchHydratedRootDefaults(
+            launchDefaults,
+            currentValues,
+            new HashSet<nuint> { 2 });
+
+        Assert.Equal(
+            new Dictionary<nuint, string>
+            {
+                [1] = "original",
+                [2] = "settled-hydration",
+            },
+            launchDefaults);
+    }
+
+    [Fact]
     public void UniqueClassNameIndexRequiresOneGlobalSourceCandidate()
     {
         var source = new[]

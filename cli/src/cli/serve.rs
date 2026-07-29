@@ -130,7 +130,40 @@ fn launch_disposable_managed_place<T>(build_path: &Path, launch: impl FnOnce() -
 	}
 }
 
-fn clean(build: &Path, composite: &Path, session: Option<&Session>, managed_studio: Option<&studio::ManagedStudio>) {
+#[derive(Clone)]
+struct ServeCleanupPaths {
+	build: PathBuf,
+	composites: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl ServeCleanupPaths {
+	fn new(build: PathBuf, composite: PathBuf) -> Self {
+		Self {
+			build,
+			composites: Arc::new(Mutex::new(if composite.as_os_str().is_empty() {
+				Vec::new()
+			} else {
+				vec![composite]
+			})),
+		}
+	}
+
+	fn register_composite(&self, composite: PathBuf) {
+		let mut composites = self.composites.lock();
+		if !composites.contains(&composite) {
+			composites.push(composite);
+		}
+	}
+
+	fn clean(&self) {
+		let _ = fs::remove_file(&self.build);
+		for composite in self.composites.lock().clone() {
+			let _ = fs::remove_dir_all(composite);
+		}
+	}
+}
+
+fn clean(paths: &ServeCleanupPaths, session: Option<&Session>, managed_studio: Option<&studio::ManagedStudio>) {
 	if let Some(managed_studio) = managed_studio {
 		if let Err(error) = managed_studio.stop() {
 			crate::carbon_error!(
@@ -143,8 +176,7 @@ fn clean(build: &Path, composite: &Path, session: Option<&Session>, managed_stud
 	if let Some(session) = session {
 		let _ = sessions::remove(session);
 	}
-	let _ = fs::remove_file(build);
-	let _ = fs::remove_dir_all(composite);
+	paths.clean();
 }
 
 fn capture_before_shutdown(core: &Arc<Core>) -> Result<()> {
@@ -156,28 +188,26 @@ fn capture_before_shutdown(core: &Arc<Core>) -> Result<()> {
 
 fn prepare_served_core(
 	project_path: &Path,
-	project_name: &str,
 	worktree_id: &str,
 	session_token: &str,
 	control_sender: &server::ServeControlSender,
-) -> Result<(Arc<Core>, PathBuf)> {
+	cleanup_paths: &ServeCleanupPaths,
+) -> Result<Arc<Core>> {
 	let materialized = project::materialize(project_path).context("failed to materialize served project topology")?;
+	let project_name = materialized.name.clone();
 	let policy = project::live_policy(project_path, &materialized);
 	let composite_directory = materialized.directory.clone();
+	cleanup_paths.register_composite(composite_directory.clone());
 	let core = Arc::new(Core::new_project_with_worktree_and_control(
 		project_path,
 		&materialized,
-		(
-			project_name.to_owned(),
-			worktree_id.to_owned(),
-			session_token.to_owned(),
-		),
+		(project_name, worktree_id.to_owned(), session_token.to_owned()),
 		Some(control_sender.clone()),
 	)?);
 	core.register_ephemeral_path(composite_directory.clone());
 	drop(materialized);
 	project::persist_studio_domain(&policy).context("failed to prune mapping barriers before serve startup")?;
-	Ok((core, composite_directory))
+	Ok(core)
 }
 
 fn connected_instance_id(
@@ -258,16 +288,17 @@ impl Serve {
 		);
 
 		let (control_sender, control_receiver) = server::serve_control_channel();
-		let (mut core, mut composite_directory) = match prepare_served_core(
+		let cleanup_paths = ServeCleanupPaths::new(build_path.clone(), PathBuf::new());
+		let mut core = match prepare_served_core(
 			&project_path,
-			&inspection.name,
 			&worktree_id,
 			&session_token,
 			&control_sender,
+			&cleanup_paths,
 		) {
 			Ok(generation) => generation,
 			Err(error) => {
-				clean(&build_path, Path::new(""), None, Some(&managed_studio));
+				clean(&cleanup_paths, None, Some(&managed_studio));
 				return Err(error);
 			}
 		};
@@ -291,12 +322,12 @@ impl Serve {
 		let end_signal_received = Arc::new(AtomicBool::new(false));
 		let handler_end_signal_received = Arc::clone(&end_signal_received);
 		let handler_control = control_sender.clone();
-		let force_build = build_path.clone();
+		let force_cleanup_paths = cleanup_paths.clone();
 		let force_session = session.clone();
 		let force_studio = managed_studio.clone();
 		ctrlc::set_handler(move || {
 			if handler_end_signal_received.swap(true, Ordering::AcqRel) {
-				clean(&force_build, Path::new(""), Some(&force_session), Some(&force_studio));
+				clean(&force_cleanup_paths, Some(&force_session), Some(&force_studio));
 				process::exit(130);
 			}
 			let _ = handler_control.try_send(server::ServeControl::Shutdown);
@@ -364,10 +395,10 @@ impl Serve {
 			let prepared_result = Arc::clone(&prepared);
 			let active_core = Arc::clone(&core);
 			let reload_project = project_path.clone();
-			let reload_name = inspection.name.clone();
 			let reload_worktree = worktree_id.clone();
 			let reload_session = session_token.clone();
 			let reload_control = control_sender.clone();
+			let reload_cleanup_paths = cleanup_paths.clone();
 			let callback_build = build_path.clone();
 			let active_server = Server::new(Arc::clone(&core), SERVE_HOST, port);
 			let reload_stop_requested = active_server.external_stop_signal();
@@ -388,21 +419,21 @@ impl Serve {
 						crate::carbon_info!("Project manifest changed; capturing Studio before synchronization reload");
 						if let Err(error) = active_core.capture_before_shutdown() {
 							crate::carbon_error!("Capture Manifest before synchronization reload failed: {error:#}");
-							reload_control.fail_reload();
+							reload_control.fail_reload(true);
 							return false;
 						}
-						let (next_core, next_composite) =
+						let next_core =
 							match prepare_served_core(
 								&reload_project,
-								&reload_name,
 								&reload_worktree,
 								&reload_session,
 								&reload_control,
+								&reload_cleanup_paths,
 							) {
 								Ok(generation) => generation,
 								Err(error) => {
 									crate::carbon_error!("Could not prepare synchronization reload; retaining active generation: {error:#}");
-									reload_control.fail_reload();
+									reload_control.fail_reload(false);
 									return false;
 								}
 							};
@@ -414,7 +445,7 @@ impl Serve {
 								crate::carbon_error!(
 									"Could not prepare qualification export for synchronization reload: {error:#}"
 								);
-								reload_control.fail_reload();
+								reload_control.fail_reload(false);
 								return false;
 							}
 						}
@@ -426,23 +457,24 @@ impl Serve {
 							Ok(listener) => listener,
 							Err(error) => {
 								crate::carbon_error!("Could not announce managed synchronization reload: {error:#}");
-								reload_control.fail_reload();
+								reload_control.fail_reload(true);
 								return false;
 							}
 						};
 						if let Err(error) = active_core.queue().push(
 							server::Message::ManagedReload(server::ManagedReload {
 								transition_id,
+								project_name: next_core.name().to_owned(),
 								worktree_id: reload_worktree.clone(),
 								session_token: reload_session.clone(),
 							}),
 							Some(reload_listener),
 						) {
 							crate::carbon_error!("Could not announce managed synchronization reload: {error:#}");
-							reload_control.fail_reload();
+							reload_control.fail_reload(true);
 							return false;
 						}
-						*prepared_result.lock() = Some((next_core, next_composite));
+						*prepared_result.lock() = Some(next_core);
 						reload_control.acknowledge_reload();
 						true
 					}
@@ -452,9 +484,8 @@ impl Serve {
 				prepared.lock().take();
 				break server_result;
 			}
-			if let Some((next_core, next_composite)) = prepared.lock().take() {
+			if let Some(next_core) = prepared.lock().take() {
 				core = next_core;
-				composite_directory = next_composite;
 				crate::carbon_info!("Synchronization reloaded in process on {}", endpoint.bold());
 				continue;
 			}
@@ -462,7 +493,7 @@ impl Serve {
 		};
 		readiness_stopping.store(true, Ordering::Release);
 		let _ = readiness_worker.join();
-		clean(&build_path, &composite_directory, Some(&session), Some(&managed_studio));
+		clean(&cleanup_paths, Some(&session), Some(&managed_studio));
 		if end_signal_received.load(Ordering::Acquire) {
 			process::exit(130);
 		}
@@ -550,6 +581,25 @@ mod tests {
 			format!("{error:#}"),
 			"failed to launch the managed Roblox Studio place: synthetic broker failure"
 		);
+	}
+
+	#[test]
+	fn forced_cleanup_removes_the_current_reloaded_composite() {
+		let temp = tempfile::tempdir().unwrap();
+		let build = temp.path().join("launch.rbxl");
+		let initial = temp.path().join(".carbon-composite-initial");
+		let reloaded = temp.path().join(".carbon-composite-reloaded");
+		fs::write(&build, b"managed launch").unwrap();
+		fs::create_dir(&initial).unwrap();
+		fs::create_dir(&reloaded).unwrap();
+		let paths = ServeCleanupPaths::new(build.clone(), initial.clone());
+
+		paths.register_composite(reloaded.clone());
+		paths.clean();
+
+		assert!(!build.exists());
+		assert!(!reloaded.exists());
+		assert!(!initial.exists());
 	}
 
 	#[test]

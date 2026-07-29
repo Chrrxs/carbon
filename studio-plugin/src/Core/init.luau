@@ -194,6 +194,7 @@ function Core:run(): Promise.Promise
 		if self.status ~= Core.Status.Connecting then
 			return reject(Error.new(Error.Terminated))
 		end
+		self:__commitManagedProjectName(project.name)
 		self.status = Core.Status.Connected
 		self.__ready(project)
 		Log.trace("Starting filesystem sync loop..")
@@ -336,6 +337,14 @@ function Core:__advanceSourceGeneration(sourceGeneration: string)
 	end
 end
 
+function Core:__commitManagedProjectName(projectName: string)
+	if not self.expectedWorktree then
+		return
+	end
+	self.expectedWorktree.name = projectName
+	TransientMetadata.setTransportAttribute(workspace, "__StudioWorktree_CarbonProject", projectName)
+end
+
 function Core:__startSyncLoop()
 	return Promise.new(function(resolve, reject)
 		while self.status == Core.Status.Connected do
@@ -366,6 +375,8 @@ function Core:__startSyncLoop()
 				local valid = type(data) == "table"
 					and type(data.transitionId) == "string"
 					and data.transitionId ~= ""
+					and type(data.projectName) == "string"
+					and data.projectName ~= ""
 					and type(data.worktreeId) == "string"
 					and type(data.sessionToken) == "string"
 					and self.expectedWorktree ~= nil
@@ -378,6 +389,7 @@ function Core:__startSyncLoop()
 					-- The replacement generation intentionally has a different source
 					-- generation. Preserve the managed identity contract, but force the
 					-- ordinary untrusted capture and full reconciliation path.
+					self.expectedWorktree.name = data.projectName
 					self.expectedWorktree.sourceGeneration = nil
 					self.status = Core.Status.Disconnecting
 					return reject(Error.new(Error.ManagedReload, data.transitionId))
