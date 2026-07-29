@@ -196,6 +196,10 @@ impl Queue {
 		read!(self.listeners).iter().any(|listener| listener.id == id)
 	}
 
+	pub fn has_subscribers(&self) -> bool {
+		!read!(self.listeners).is_empty()
+	}
+
 	pub fn single_listener_id(&self) -> Result<u32> {
 		let listeners = read!(self.listeners);
 		match listeners.as_slice() {

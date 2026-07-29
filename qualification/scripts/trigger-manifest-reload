@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mode="$1"
+project="$2"
+backup="$3"
+temporary="${project}.qualification-reload.$$"
+case "$mode" in
+  trigger)
+    cp -- "$project" "$backup"
+    command -v jq >/dev/null 2>&1 || {
+      printf 'jq is required to rewrite the qualification project name\n' >&2
+      exit 1
+    }
+    jq '.name += "-Reloaded"' "$project" > "$temporary"
+    mv -- "$temporary" "$project"
+    printf 'manifest reload with project rename triggered atomically\n'
+    ;;
+  restore)
+    if [[ ! -f "$backup" ]]; then
+      printf 'manifest restore skipped; no backup was created\n'
+      exit 0
+    fi
+    cp -- "$backup" "$temporary"
+    mv -- "$temporary" "$project"
+    rm -f -- "$backup"
+    printf 'manifest restored atomically\n'
+    ;;
+  *)
+    printf 'usage: %s trigger|restore PROJECT BACKUP\n' "$0" >&2
+    exit 2
+    ;;
+esac

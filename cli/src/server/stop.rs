@@ -1,28 +1,54 @@
 use actix_web::{post, web::Data, HttpResponse, Responder};
 use anyhow::Result;
 use log::{error, info, trace};
-use std::{sync::Arc, time::Duration};
+use std::{
+	sync::{atomic::Ordering, Arc},
+	time::Duration,
+};
 
-use crate::{core::Core, server::StopHandle};
+use crate::{
+	core::Core,
+	server::{StopHandle, StopRequested},
+};
 
-fn settle_stop<Capture>(capture: Capture) -> Result<String>
+const DISCONNECTED_STOP_MESSAGE: &str = "Studio disconnected; latest committed manifest retained";
+
+fn settle_stop<Connected, Capture>(connected: Connected, capture: Capture) -> Result<String>
 where
+	Connected: Fn() -> bool,
 	Capture: FnOnce() -> Result<String>,
 {
-	capture()
+	if !connected() {
+		return Ok(DISCONNECTED_STOP_MESSAGE.to_owned());
+	}
+	match capture() {
+		Ok(message) => Ok(message),
+		Err(_) if !connected() => Ok(DISCONNECTED_STOP_MESSAGE.to_owned()),
+		Err(error) => Err(error),
+	}
 }
 
 #[post("/stop")]
-async fn main(core: Data<Arc<Core>>, stop_handle: Data<StopHandle>) -> impl Responder {
+async fn main(
+	core: Data<Arc<Core>>,
+	stop_handle: Data<StopHandle>,
+	stop_requested: Data<StopRequested>,
+) -> impl Responder {
 	trace!("Received request: stop");
 	let Some(stop_handle) = stop_handle.get().cloned() else {
 		return HttpResponse::InternalServerError().body("Carbon server stop handle is unavailable");
 	};
+	stop_requested.store(true, Ordering::Release);
 
 	info!("Carbon stop requested; capturing the connected Studio place before shutdown");
 	let shutdown_core = Arc::clone(core.get_ref());
-	let capture =
-		actix_web::rt::task::spawn_blocking(move || settle_stop(|| shutdown_core.capture_before_shutdown())).await;
+	let capture = actix_web::rt::task::spawn_blocking(move || {
+		settle_stop(
+			|| shutdown_core.queue().has_subscribers(),
+			|| shutdown_core.capture_before_shutdown(),
+		)
+	})
+	.await;
 
 	actix_web::rt::spawn(async move {
 		// Let the response reach `carbon stop` before ending the HTTP workers.
@@ -60,10 +86,13 @@ mod tests {
 	#[test]
 	fn stop_waits_for_capture() {
 		let capture_calls = Cell::new(0);
-		let message = settle_stop(|| {
-			capture_calls.set(capture_calls.get() + 1);
-			Ok("Studio artifact committed".to_owned())
-		})
+		let message = settle_stop(
+			|| true,
+			|| {
+				capture_calls.set(capture_calls.get() + 1);
+				Ok("Studio artifact committed".to_owned())
+			},
+		)
 		.unwrap();
 
 		assert_eq!(message, "Studio artifact committed");
@@ -73,13 +102,47 @@ mod tests {
 	#[test]
 	fn stop_propagates_capture_failure() {
 		let capture_calls = Cell::new(0);
-		let error = settle_stop(|| {
-			capture_calls.set(capture_calls.get() + 1);
-			anyhow::bail!("capture failed")
-		})
+		let error = settle_stop(
+			|| true,
+			|| {
+				capture_calls.set(capture_calls.get() + 1);
+				anyhow::bail!("capture failed")
+			},
+		)
 		.unwrap_err();
 
 		assert_eq!(error.to_string(), "capture failed");
 		assert_eq!(capture_calls.get(), 1);
+	}
+
+	#[test]
+	fn stop_retains_the_latest_capture_when_studio_is_already_disconnected() {
+		let capture_calls = Cell::new(0);
+		let message = settle_stop(
+			|| false,
+			|| {
+				capture_calls.set(capture_calls.get() + 1);
+				anyhow::bail!("capture must not run")
+			},
+		)
+		.unwrap();
+
+		assert_eq!(message, "Studio disconnected; latest committed manifest retained");
+		assert_eq!(capture_calls.get(), 0);
+	}
+
+	#[test]
+	fn stop_tolerates_a_disconnect_while_capture_starts() {
+		let connected = Cell::new(true);
+		let message = settle_stop(
+			|| connected.get(),
+			|| {
+				connected.set(false);
+				anyhow::bail!("Capture Manifest requires one connected Studio client")
+			},
+		)
+		.unwrap();
+
+		assert_eq!(message, "Studio disconnected; latest committed manifest retained");
 	}
 }

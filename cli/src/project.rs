@@ -82,6 +82,7 @@ impl Inspection {
 
 #[derive(Debug)]
 pub struct MaterializedProject {
+	pub name: String,
 	pub directory: PathBuf,
 	pub manifest_path: PathBuf,
 	pub mapped_refs: HashSet<Ref>,
@@ -1257,6 +1258,7 @@ fn materialize_mode(project_path: &Path, allow_transitions: bool) -> Result<Mate
 	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs);
 	let mapped_watch_roots = mapped_traversal.watch_roots.into_iter().collect();
 	Ok(MaterializedProject {
+		name: project.name,
 		directory,
 		manifest_path,
 		mapped_refs,

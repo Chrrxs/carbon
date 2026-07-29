@@ -93,6 +93,28 @@ if ! grep -Fq -- 'if (IsIconic(target_hwnd))' "$HELPER_SOURCE"; then
 	failure=1
 fi
 
+PROXY_GENERATOR_SOURCE="${SCRIPT_DIR}/../rml/code/tools/proxy_generator/src/main.cpp"
+
+if ! grep -Fq -- 'if (isolated_loader.empty()) return nullptr;' "$PROXY_GENERATOR_SOURCE"; then
+	echo "FAIL: RML proxy must stay inactive outside Carbon-launched Studio" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'setup_function_pointers();' "$PROXY_GENERATOR_SOURCE"; then
+	echo "FAIL: RML proxy must forward dwmapi exports without loading RML" >&2
+	failure=1
+fi
+
+if grep -Fq -- 'current_path / \"RobloxModLoader\" / \"roblox_modloader.dll\"' "$PROXY_GENERATOR_SOURCE"; then
+	echo "FAIL: RML proxy must not load Carbon RML during a normal Studio launch" >&2
+	failure=1
+fi
+
+if grep -Fq -- 'FreeLibrary(mod_loader);' "$PROXY_GENERATOR_SOURCE"; then
+	echo "FAIL: RML proxy must not unload an attestation failure from DllMain" >&2
+	failure=1
+fi
+
 if ((failure != 0)); then
 	exit "$failure"
 fi
