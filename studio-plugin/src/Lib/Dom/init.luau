@@ -4,9 +4,15 @@ local RuntimeServices = require(Carbon.RuntimeServices)
 local HttpService = RuntimeServices.get("HttpService") :: HttpService
 
 local TransientMetadata = require(Carbon.TransientMetadata)
-local Base64 = require(Carbon.Lib.Base64)
-local database = require(script.database)
-local DatabaseDefaultValue = require(script.DatabaseDefaultValue)
+local database: { [string]: any } = {}
+local reflectionInitialized = false
+local defaultPropertiesCache = {}
+
+local function getDatabase()
+	assert(reflectionInitialized, "reflection database is not initialized")
+	return database
+end
+
 local Error = require(script.Error)
 local EncodedValue = require(script.EncodedValue)
 local ExactSerializedAccess = require(script.ExactSerializedAccess)
@@ -17,10 +23,8 @@ local PrivilegedReadPlan = require(script.PrivilegedReadPlan)
 local PrivilegedValueCodec = require(script.PrivilegedValueCodec)
 local LiveReflection = require(script.LiveReflection)
 
-local defaultPropertiesCache = {}
-
 local function reflectionVersion(): string
-	return table.concat(database.Version, ".")
+	return table.concat(getDatabase().Version, ".")
 end
 
 local function applyReflection(version: { number }, apiDump: string | { [string]: any }, studioVersion: string)
@@ -49,7 +53,10 @@ local function applyReflection(version: { number }, apiDump: string | { [string]
 		"invalid API dump: missing Classes or Enums table"
 	)
 
-	local result = LiveReflection.apply(database, api, version)
+	local nextDatabase = {}
+	local result = LiveReflection.apply(nextDatabase, api, version)
+	database = nextDatabase
+	reflectionInitialized = true
 	table.clear(defaultPropertiesCache)
 	return result
 end
@@ -66,7 +73,7 @@ local function findCanonicalPropertyDescriptor(className, propertyName)
 	local currentClassName = className
 
 	repeat
-		local currentClass = database.Classes[currentClassName]
+		local currentClass = getDatabase().Classes[currentClassName]
 
 		if currentClass == nil then
 			return currentClass
@@ -115,7 +122,7 @@ local function deriveRuntimeDefaults(className, properties)
 	local seen = {}
 	local currentClassName = className
 	while currentClassName ~= nil do
-		local class = database.Classes[currentClassName]
+		local class = getDatabase().Classes[currentClassName]
 		if class == nil then
 			break
 		end
@@ -160,7 +167,7 @@ local function getDefaultProperties(className)
 		return defaultPropertiesCache[className]
 	end
 
-	local class = database.Classes[className]
+	local class = getDatabase().Classes[className]
 	local properties = {}
 
 	if not class then
@@ -168,7 +175,7 @@ local function getDefaultProperties(className)
 	end
 	local protected = {}
 	for _, property in
-		ProtectedProperties.forClass(database, className, function(descriptor)
+		ProtectedProperties.forClass(getDatabase(), className, function(descriptor)
 			return PrivilegedAccess.supportsDescriptor(descriptor)
 				or PrivilegedAccess.supportsMaterializedDescriptor(descriptor)
 				or PrivilegedAccess.supportsReferenceDescriptor(descriptor)
@@ -177,22 +184,6 @@ local function getDefaultProperties(className)
 		protected[property] = true
 	end
 
-	for property, default in pairs(class.DefaultProperties) do
-		local descriptor = findCanonicalPropertyDescriptor(className, property)
-
-		if
-			descriptor
-			and descriptor.serializes
-			and not protected[property]
-			and (descriptor:canRead() or PrivilegedAccess.supportsDescriptor(descriptor) or PrivilegedAccess.supportsReferenceDescriptor(
-				descriptor
-			))
-			and not descriptor.privilegedExcluded
-			and next(default)
-		then
-			properties[property] = DatabaseDefaultValue.decode(default, Base64.decode, EncodedValue.uniqueIdFromHex)
-		end
-	end
 	deriveRuntimeDefaults(className, properties)
 	for property in protected do
 		properties[property] = nil
@@ -252,7 +243,7 @@ local function getRefProperties(className)
 	local currentClassName = className
 
 	while currentClassName ~= nil do
-		local currentClass = database.Classes[currentClassName]
+		local currentClass = getDatabase().Classes[currentClassName]
 
 		if currentClass == nil then
 			break
@@ -287,7 +278,7 @@ local function getRefProperties(className)
 end
 
 local function getProtectedSerializedProperties(className)
-	return ProtectedProperties.forClass(database, className, function(descriptor)
+	return ProtectedProperties.forClass(getDatabase(), className, function(descriptor)
 		return PrivilegedAccess.supportsDescriptor(descriptor)
 			or PrivilegedAccess.supportsMaterializedDescriptor(descriptor)
 			or PrivilegedAccess.supportsReferenceDescriptor(descriptor)
@@ -295,277 +286,22 @@ local function getProtectedSerializedProperties(className)
 end
 
 local function getPrivilegedSerializedProperties(className)
-	return ProtectedProperties.supportedForClass(database, className, function(descriptor)
+	return ProtectedProperties.supportedForClass(getDatabase(), className, function(descriptor)
 		return PrivilegedAccess.supportsDescriptor(descriptor)
 			or PrivilegedAccess.supportsMaterializedDescriptor(descriptor)
 	end)
 end
 
-local function getBatchPrivilegedSerializedProperties(className)
-	return ProtectedProperties.supportedForClass(database, className, PrivilegedAccess.supportsDescriptor)
-end
-
-local function isCreatable(className)
-	local class = database.Classes[className]
-
-	if not class then
-		return false
-	end
-
-	return (table.find(class.Tags, "NotCreatable") or table.find(class.Tags, "Service")) == nil
-end
-
-local function isService(className: string): boolean
-	local class = database.Classes[className]
-	return class ~= nil and table.find(class.Tags, "Service") ~= nil
-end
-
-local function hasClass(className: string): boolean
-	return database.Classes[className] ~= nil
-end
-
-local function isRemovable(className: string): boolean
-	return not isService(className)
-end
-
-local function isStudioTransient(instance: Instance): boolean
-	-- Workspace.CurrentCamera is Studio's edit camera, not authored place state.
-	-- It is deliberately absent from Carbon's source tree, so it must also be
-	-- absent from sibling coordinates reported for authored Workspace children.
-	-- This is identity-based: an ordinary authored Camera beside it remains
-	-- serializable regardless of its name.
-	if instance.Parent == workspace and instance == workspace.CurrentCamera then
-		return true
-	end
-	local current = instance
-	while current.Parent ~= nil and current.Parent ~= game do
-		local parent = current.Parent
-		if TransientMetadata.isInstance(current.ClassName, current.Name, parent.ClassName, current.Archivable) then
-			return true
-		end
-		current = parent
-	end
-	return current.Parent ~= nil
-		and TransientMetadata.isInstance(current.ClassName, current.Name, current.Parent.ClassName, current.Archivable)
-end
-
-local function readProperty(instance, propertyName)
-	-- Workspace.CurrentCamera in edit mode points at Studio's transient camera.
-	-- It is not place-authored state and its target is deliberately absent from
-	-- the capture tree, so represent it as the serialized nil/default reference.
-	if instance == workspace and propertyName == "CurrentCamera" then
-		local currentCamera = workspace.CurrentCamera
-		if currentCamera ~= nil and isStudioTransient(currentCamera) then
-			return true, nil
-		end
-	end
-
-	local descriptor = findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
-
-	if descriptor == nil then
-		local fullName = ("%s.%s"):format(instance.ClassName, propertyName)
-
-		return false, Error.new(Error.Kind.UnknownProperty, fullName)
-	end
-
-	if descriptor.dataType == "Attributes" and descriptor.serializedName ~= nil then
-		if propertyName == "Attributes" and TransientMetadata.hasAttributeOverlay(instance) then
-			return descriptor:read(instance)
-		end
-		local success, value =
-			ExactSerializedAccess.read(PrivilegedAccess, instance, descriptor.serializedName, "BinaryString")
-		if success then
-			return true, value
-		end
-		if success == false then
-			return false, Error.new(Error.Kind.Roblox, value)
-		end
-	end
-
-	if PrivilegedAccess.supportsReferenceDescriptor(descriptor) then
-		local success, value = PrivilegedAccess.readReference(instance, descriptor)
-		if success then
-			return true, value
-		end
-		return false, Error.new(Error.Kind.Roblox, value)
-	end
-
-	if PrivilegedAccess.supportsRawDescriptor(descriptor) then
-		local success, value =
-			PrivilegedAccess.readRaw(instance, descriptor.name, PrivilegedAccess.rawType(descriptor) :: string)
-		if success then
-			return true, value
-		end
-		return false, Error.new(Error.Kind.Roblox, value)
-	end
-
-	if PrivilegedAccess.supportsDescriptor(descriptor) then
-		local success, value = PrivilegedAccess.read(instance, descriptor)
-		if success then
-			return true, value
-		end
-		return false, Error.new(Error.Kind.Roblox, value)
-	end
-
-	return descriptor:read(instance)
-end
-
-local function writeProperty(instance, propertyName, value)
-	local descriptor = findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
-
-	if
-		descriptor ~= nil
-		and descriptor.dataType == "Attributes"
-		and descriptor.serializedName ~= nil
-		and type(value) == "string"
-	then
-		local transientAttributes = {}
-		if propertyName == "Attributes" then
-			for name, attributeValue in instance:GetAttributes() do
-				if TransientMetadata.isAttribute(instance, name) then
-					transientAttributes[name] = attributeValue
-				end
-			end
-		end
-		local success, reason =
-			ExactSerializedAccess.write(PrivilegedAccess, instance, descriptor.serializedName, "BinaryString", value)
-		if success then
-			if propertyName == "Attributes" and TransientMetadata.hasAttributeOverlay(instance) then
-				TransientMetadata.rememberAuthoredAttributes(instance, instance:GetAttributes())
-			end
-			for name, attributeValue in transientAttributes do
-				TransientMetadata.setTransportAttribute(instance, name, attributeValue)
-			end
-			return true
-		end
-		return false, Error.new(Error.Kind.Roblox, reason)
-	end
-
-	if descriptor ~= nil and PrivilegedAccess.supportsRawDescriptor(descriptor) and type(value) == "string" then
-		local success, reason =
-			PrivilegedAccess.writeRaw(instance, descriptor.name, PrivilegedAccess.rawType(descriptor) :: string, value)
-		if success then
-			return true
-		end
-		return false, Error.new(Error.Kind.Roblox, reason)
-	end
-
-	if descriptor == nil then
-		local fullName = ("%s.%s"):format(instance.ClassName, propertyName)
-
-		return false, Error.new(Error.Kind.UnknownProperty, fullName)
-	end
-
-	if PrivilegedAccess.supportsReferenceDescriptor(descriptor) then
-		local success, reason = PrivilegedAccess.writeReference(instance, descriptor, value)
-		if success then
-			return true
-		end
-		return false, Error.new(Error.Kind.Roblox, reason)
-	end
-
-	if PrivilegedAccess.supportsMaterializedDescriptor(descriptor) then
-		local success, reason = PrivilegedAccess.writeMaterialized(instance, descriptor, value)
-		if success then
-			return true
-		end
-		return false, Error.new(Error.Kind.Roblox, reason)
-	end
-
-	if PrivilegedAccess.supportsDescriptor(descriptor) then
-		local success, reason = PrivilegedAccess.write(instance, descriptor, value)
-		if success then
-			return true
-		end
-		return false, Error.new(Error.Kind.Roblox, reason)
-	end
-
-	return descriptor:write(instance, value)
-end
-
-local function configurePrivileged(client, capabilities)
-	PrivilegedAccess.configure(client, capabilities)
-	table.clear(defaultPropertiesCache)
-end
-
-local function beginPrivilegedBatch(instances: { Instance }): (boolean, any?)
-	local requests = PrivilegedReadPlan.build(instances, {
-		debugId = function(instance)
-			return instance:GetDebugId(128)
-		end,
-		attributes = function(instance)
-			local descriptor = findCanonicalPropertyDescriptor(instance.ClassName, "Attributes")
-			return if descriptor ~= nil
-					and descriptor.serializedName ~= nil
-					and PrivilegedAccess.supportsType("BinaryString")
-				then descriptor.serializedName
-				else nil
-		end,
-		defaults = function(instance)
-			return getDefaultProperties(instance.ClassName)
-		end,
-		descriptor = function(instance, property)
-			return findCanonicalPropertyDescriptor(instance.ClassName, property)
-		end,
-		supportsRaw = PrivilegedAccess.supportsRawDescriptor,
-		privileged = function(instance)
-			return getBatchPrivilegedSerializedProperties(instance.ClassName)
-		end,
-	})
-	local referenceRequests = {}
-	for _, instance in instances do
-		local debugId = instance:GetDebugId(128)
-		for _, property in getRefProperties(instance.ClassName) do
-			local descriptor = findCanonicalPropertyDescriptor(instance.ClassName, property)
-			if descriptor ~= nil and PrivilegedAccess.supportsReferenceDescriptor(descriptor) then
-				table.insert(referenceRequests, { debugId = debugId, property = descriptor.name })
-			end
-		end
-	end
-	return PrivilegedAccess.beginBatch(requests, referenceRequests, instances)
-end
-
-local function hasUnknownPrivilegedDefault(className: string, properties: { [string]: any }): boolean
-	local defaults = getDefaultProperties(className)
-	for _, descriptor in getPrivilegedSerializedProperties(className) do
-		if properties[descriptor.name] == nil and defaults[descriptor.name] == nil then
-			return true
-		end
-	end
-	return false
-end
-
-local function createPrivileged(className: string, parent: Instance, name: string): Instance?
-	return PrivilegedAccess.create(className, parent, name)
-end
-
 return {
-	hasClass = hasClass,
-	isCreatable = isCreatable,
-	isService = isService,
-	isRemovable = isRemovable,
-	isStudioTransient = isStudioTransient,
-	readProperty = readProperty,
-	writeProperty = writeProperty,
-	canWriteProperty = canWriteProperty,
-	canonicalPropertyName = canonicalPropertyName,
+	getDatabase = getDatabase,
+	reflectionVersion = reflectionVersion,
+	applyReflection = applyReflection,
+	assertReflectionVersion = assertReflectionVersion,
 	findCanonicalPropertyDescriptor = findCanonicalPropertyDescriptor,
 	getDefaultProperties = getDefaultProperties,
+	canWriteProperty = canWriteProperty,
+	canonicalPropertyName = canonicalPropertyName,
 	getRefProperties = getRefProperties,
 	getProtectedSerializedProperties = getProtectedSerializedProperties,
 	getPrivilegedSerializedProperties = getPrivilegedSerializedProperties,
-	configurePrivileged = configurePrivileged,
-	setPrivilegedReferenceSourceIds = PrivilegedAccess.setReferenceSourceIds,
-	encodePrivilegedContentObject = PrivilegedAccess.encodeContentObject,
-	beginPrivilegedBatch = beginPrivilegedBatch,
-	endPrivilegedBatch = PrivilegedAccess.endBatch,
-	hasUnknownPrivilegedDefault = hasUnknownPrivilegedDefault,
-	createPrivileged = createPrivileged,
-	hasPrivilegedAccess = PrivilegedAccess.isAvailable,
-	reflectionVersion = reflectionVersion,
-	assertReflectionVersion = assertReflectionVersion,
-	applyReflection = applyReflection,
-	isRawType = PrivilegedAccess.isRawType,
-	Error = Error,
-	EncodedValue = EncodedValue,
 }

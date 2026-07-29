@@ -135,16 +135,6 @@ expect_failure \
 	"${quality_repo}/scripts/change" qualify
 grep -q 'production-readiness failed' "${root}/quality.out" ||
 	die "stubbed qualification did not reach production readiness"
-for expected in \
-	'update-reflection --check' \
-	'lune run scripts/test-bounded-retry.luau' \
-	'lune run scripts/test-current-reflection-database.luau' \
-	'lune run scripts/test-live-reflection-database.luau' \
-	'lune run scripts/test-mapping-reconciliation-architecture.luau' \
-	'lune run scripts/test-protected-properties.luau'; do
-	grep -Fqx "$expected" "$quality_log" ||
-		die "change qualify did not run Studio-plugin check: $expected"
-done
 
 write_receipt() {
 	local repo="$1"

@@ -2,10 +2,38 @@
 
 local fs = require("@lune/fs")
 
-local MsgPack = require("../src/Lib/MsgPack")
 local StyleRuleProperties = require("../src/Lib/Dom/StyleRuleProperties")
 
-local database = MsgPack.decode(fs.readFile("src/Lib/Dom/database.msgpack"))
+local LiveReflection = require("../src/Lib/Dom/LiveReflection")
+local database = {}
+LiveReflection.apply(database, {
+	Classes = {
+		{
+			Name = "StyleRule",
+			Superclass = "Instance",
+			Tags = {},
+			Members = {
+				{
+					MemberType = "Property",
+					Name = "Properties",
+					Security = { Read = "None", Write = "None" },
+					Serialization = { CanLoad = false, CanSave = false },
+					Tags = {},
+					ValueType = { Category = "Primitive", Name = "string" },
+				},
+				{
+					MemberType = "Property",
+					Name = "PropertiesSerialize",
+					Security = { Read = "RobloxSecurity", Write = "RobloxSecurity" },
+					Serialization = { CanLoad = true, CanSave = true },
+					Tags = { "Hidden", "NotScriptable" },
+					ValueType = { Category = "DataType", Name = "BinaryString" },
+				},
+			},
+		},
+	},
+	Enums = {},
+}, { 0, 0, 0, 0 })
 local descriptor = database.Classes.StyleRule.Properties.Properties
 assert(descriptor.Scriptability == "Custom", "StyleRule.Properties must use its custom interface")
 assert(

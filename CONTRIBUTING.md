@@ -55,9 +55,9 @@ a configured Windows/WSL2 host. If you do not have that host, open a draft pull
 request with the focused test and local results; a maintainer must run the full
 gate before merge.
 
-Generated reflection data must remain reproducible. Do not hand-edit
-`studio-plugin/src/Lib/Dom/database.luau`; use the generator documented by the
-plugin toolchain.
+Reflection comes from the current Roblox API dump at runtime. Run
+`./scripts/update-reflection --check` to verify that Carbon can build and apply
+the current schema and its version-independent serialization policy.
 
 ## Pull requests
 

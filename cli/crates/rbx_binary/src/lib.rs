@@ -70,6 +70,7 @@ mod tests;
 use std::io::{Read, Write};
 
 use rbx_dom_weak::{types::Ref, WeakDom};
+use rbx_reflection::ReflectionDatabase;
 
 /// An unstable textual format that can be used to debug binary models.
 #[cfg(feature = "unstable_text_format")]
@@ -87,12 +88,30 @@ pub use crate::{
 };
 
 /// Deserialize a Roblox binary model or place from a stream.
+/// Deserialize a Roblox binary model or place from a stream using default settings.
 pub fn from_reader<R: Read>(reader: R) -> Result<WeakDom, DecodeError> {
-	Deserializer::new().deserialize(reader)
+	Deserializer::new_empty().deserialize(reader)
 }
 
-/// Serializes a subset of the given DOM to a binary format model or place,
-/// writing to something that implements the `std::io::Write` trait.
+/// Deserialize a Roblox binary model or place from a stream with a reflection database.
+pub fn from_reader_with_database<R: Read>(
+	reader: R,
+	database: &ReflectionDatabase<'_>,
+) -> Result<WeakDom, DecodeError> {
+	Deserializer::new(database).deserialize(reader)
+}
+
+/// Serializes a subset of the given DOM to a binary format model or place.
 pub fn to_writer<W: Write>(writer: W, dom: &WeakDom, refs: &[Ref]) -> Result<(), EncodeError> {
-	Serializer::new().serialize(writer, dom, refs)
+	Serializer::new_empty().serialize(writer, dom, refs)
+}
+
+/// Serializes a subset of the given DOM to a binary format model or place with a reflection database.
+pub fn to_writer_with_database<W: Write>(
+	writer: W,
+	dom: &WeakDom,
+	refs: &[Ref],
+	database: &ReflectionDatabase<'_>,
+) -> Result<(), EncodeError> {
+	Serializer::new(database).serialize(writer, dom, refs)
 }

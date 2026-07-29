@@ -113,7 +113,7 @@ local function candidatesForClass(database, className: string): { any }
 				or propertyData.Scriptability == "Write"
 				or (propertyData.Scriptability == "Custom" and dataType == "OptionalCFrame")
 				or (
-					propertyData.Scriptability == "Read"
+					(propertyData.Scriptability == "Read" or propertyData.Scriptability == "Custom")
 					and ProtectedProperties.isPersistentReadOnly(currentClassName, propertyName)
 				)
 			local candidate = propertyData.Kind.Canonical ~= nil

@@ -571,9 +571,7 @@ pub fn extract_binary(input: &Path, project_path: &Path) -> Result<ExtractReport
 	);
 	let project_root = project_path.parent().unwrap_or_else(|| Path::new("."));
 	let file = File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
-	let dom = rbx_binary::Deserializer::new()
-		.reflection_database(util::get_reflection_database())
-		.deserialize(BufReader::new(file))?;
+	let dom = rbx_binary::Deserializer::new(util::get_reflection_database()).deserialize(BufReader::new(file))?;
 	let mut snapshot = dom_snapshot(&dom, dom.root_ref())?;
 	stabilize_snapshot_ids(&mut snapshot)?;
 	let extracted = plan_script_extraction(&snapshot);
@@ -7265,7 +7263,11 @@ mod tests {
 
 		let output = project_root.join("rebuilt.rbxl");
 		compile(&policy.project_path, &output, None).unwrap();
-		let rebuilt = rbx_binary::from_reader(BufReader::new(File::open(&output).unwrap())).unwrap();
+		let rebuilt = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&output).unwrap()),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 		let rebuilt_script = rebuilt
 			.descendants()
 			.find(|instance| instance.name == "NestedScript")

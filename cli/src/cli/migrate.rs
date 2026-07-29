@@ -85,7 +85,13 @@ mod tests {
 						),
 				),
 		);
-		rbx_binary::to_writer(File::create(&input).unwrap(), &dom, dom.root().children()).unwrap();
+		rbx_binary::to_writer_with_database(
+			File::create(&input).unwrap(),
+			&dom,
+			dom.root().children(),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 
 		Migrate {
 			input: input.clone(),
@@ -134,7 +140,13 @@ mod tests {
 				),
 			),
 		);
-		rbx_binary::to_writer(File::create(&input).unwrap(), &dom, dom.root().children()).unwrap();
+		rbx_binary::to_writer_with_database(
+			File::create(&input).unwrap(),
+			&dom,
+			dom.root().children(),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 
 		Migrate {
 			input: input.clone(),

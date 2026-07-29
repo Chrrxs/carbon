@@ -864,8 +864,7 @@ fn write_artifact(
 		writer.write_all(&[0_u8; FIXED_HEADER_BYTES as usize])?;
 		let (report, payload_len, payload_hash) = {
 			let mut payload = DigestingWriter::new(&mut writer);
-			let report = Serializer::new()
-				.reflection_database(util::get_reflection_database())
+			let report = Serializer::new(util::get_reflection_database())
 				.metadata(metadata.clone())
 				.serialize_source_with_report(&mut payload, &normalized, &[root])?;
 			payload.flush()?;
@@ -1024,9 +1023,7 @@ fn hydrate_external(tree: &mut Tree, artifact: &Artifact, blob_anchor: &Path, hy
 }
 
 fn load_artifact_structure(artifact: &Artifact) -> Result<Tree> {
-	let decoder = Deserializer::new()
-		.reflection_database(util::get_reflection_database())
-		.strict(true);
+	let decoder = Deserializer::new(util::get_reflection_database()).strict(true);
 	let structure = decoder.deserialize_structure(BufReader::new(artifact.payload()?))?;
 	ensure!(
 		structure.metadata() == &artifact.sideband.metadata,
@@ -1096,9 +1093,7 @@ fn load_artifact_structure(artifact: &Artifact) -> Result<Tree> {
 fn load_artifact_tree_from(artifact: &Artifact, blob_anchor: &Path, hydrate_values: bool) -> Result<Tree> {
 	#[cfg(test)]
 	TEST_TREE_LOADS.with(|loads| loads.set(loads.get() + 1));
-	let decoder = Deserializer::new()
-		.reflection_database(util::get_reflection_database())
-		.strict(true);
+	let decoder = Deserializer::new(util::get_reflection_database()).strict(true);
 	let arena = decoder.deserialize_compact_source(BufReader::new(artifact.payload()?))?;
 	ensure!(
 		arena.metadata() == &artifact.sideband.metadata,
@@ -1289,9 +1284,8 @@ pub fn extract_snapshot_with_metadata(
 }
 
 pub fn extract_binary(input: &Path, output: &Path) -> Result<ExtractReport> {
-	let arena = Deserializer::new()
-		.reflection_database(util::get_reflection_database())
-		.deserialize_source(BufReader::new(File::open(input)?))?;
+	let arena =
+		Deserializer::new(util::get_reflection_database()).deserialize_source(BufReader::new(File::open(input)?))?;
 	let name = output.get_stem();
 	fn convert(
 		source: &dyn InstanceSource,
@@ -1414,7 +1408,7 @@ fn serialize_tree(
 		}
 	}
 	let writer = BufWriter::new(File::create(output)?);
-	let serializer = Serializer::new().reflection_database(util::get_reflection_database());
+	let serializer = Serializer::new(util::get_reflection_database());
 	let result = match indexed_refs {
 		Some(indexed_refs) => serializer
 			.serialize_source_with_report_and_index(writer, tree, tree.place_root_refs(), indexed_refs)
@@ -3330,9 +3324,7 @@ pub(crate) fn canonical_cframe_spools(
 	);
 	let artifact = Artifact::open(artifact_path)?;
 	let mut spools = CapturePropertySpools::new(directory)?;
-	let decoder = Deserializer::new()
-		.reflection_database(util::get_reflection_database())
-		.strict(true);
+	let decoder = Deserializer::new(util::get_reflection_database()).strict(true);
 	{
 		let mut sink = CanonicalCFrameSink {
 			ids: &artifact.sideband.ids,
@@ -3540,8 +3532,7 @@ pub(crate) fn visit_prior_identity_headers_cancellable(
 	mut visit: impl FnMut(PriorIdentityHeader) -> Result<()>,
 ) -> Result<()> {
 	let artifact = Artifact::open(path)?;
-	let structure = Deserializer::new()
-		.reflection_database(util::get_reflection_database())
+	let structure = Deserializer::new(util::get_reflection_database())
 		.strict(true)
 		.deserialize_structure(BufReader::new(artifact.payload()?))?;
 	let synthetic_root = structure
@@ -4331,8 +4322,7 @@ mod tests {
 				.with_name("DataModel"),
 		);
 		let mut bytes = Vec::new();
-		Serializer::new()
-			.reflection_database(util::get_reflection_database())
+		Serializer::new(util::get_reflection_database())
 			.serialize_source(&mut bytes, &dom, &[dom.root_ref()])
 			.unwrap();
 		bytes.resize(bytes.len().max(FIXED_HEADER_BYTES as usize), 0);
@@ -4406,8 +4396,7 @@ mod tests {
 			},
 		)
 		.unwrap();
-		let arena = Deserializer::new()
-			.reflection_database(util::get_reflection_database())
+		let arena = Deserializer::new(util::get_reflection_database())
 			.deserialize_source(BufReader::new(File::open(&output).unwrap()))
 			.unwrap();
 		let root = arena.get_by_ref(arena.root_ref()).unwrap();
@@ -4506,8 +4495,7 @@ mod tests {
 						.with_property("FallbackImageContent", Content::from_referent(source_target)),
 				),
 		);
-		Serializer::new()
-			.reflection_database(util::get_reflection_database())
+		Serializer::new(util::get_reflection_database())
 			.serialize_source(BufWriter::new(File::create(&input).unwrap()), &dom, &[dom.root_ref()])
 			.unwrap();
 

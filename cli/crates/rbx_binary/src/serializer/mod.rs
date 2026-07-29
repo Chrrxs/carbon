@@ -130,7 +130,10 @@ impl InstanceSource for WeakDom {
 //
 // future settings:
 // * recursive: bool = true
-#[non_exhaustive]
+static EMPTY_DATABASE: std::sync::LazyLock<ReflectionDatabase<'static>> =
+	std::sync::LazyLock::new(ReflectionDatabase::new);
+
+/// Configures serialization of a DOM using an explicit reflection database.
 pub struct Serializer<'db> {
 	database: &'db ReflectionDatabase<'db>,
 	compression: CompressionType,
@@ -139,10 +142,20 @@ pub struct Serializer<'db> {
 }
 
 impl<'db> Serializer<'db> {
-	/// Create a new `Serializer` with the default settings.
-	pub fn new() -> Self {
+	/// Create a new `Serializer` using the provided reflection database.
+	pub fn new(database: &'db ReflectionDatabase<'db>) -> Self {
 		Serializer {
-			database: rbx_reflection_database::get().unwrap(),
+			database,
+			compression: CompressionType::default(),
+			metadata: BTreeMap::new(),
+			property_workers: 4,
+		}
+	}
+
+	/// Create a new `Serializer` with an empty reflection database.
+	pub fn new_empty() -> Serializer<'static> {
+		Serializer {
+			database: &EMPTY_DATABASE,
 			compression: CompressionType::default(),
 			metadata: BTreeMap::new(),
 			property_workers: 4,
@@ -323,9 +336,9 @@ impl<W: Write> StreamingSerializer<'_, W> {
 	}
 }
 
-impl Default for Serializer<'_> {
+impl Default for Serializer<'static> {
 	fn default() -> Self {
-		Self::new()
+		Self::new_empty()
 	}
 }
 

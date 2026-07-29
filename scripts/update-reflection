@@ -5,30 +5,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 MODE="${1:-update}"
 
-if [[ "${MODE}" != "update" && "${MODE}" != "--check" ]]; then
-	echo "usage: ./scripts/update-reflection [--check]" >&2
+if [[ "${MODE}" != "update" && "${MODE}" != "--check" && "${MODE}" != "--prepare" ]]; then
+	echo "usage: ./scripts/update-reflection [--check|--prepare]" >&2
 	exit 2
 fi
 
-generated_files=(
-	"${REPO}/studio-plugin/src/Lib/Dom/database.luau"
-	"${REPO}/studio-plugin/src/Lib/Dom/database.msgpack"
-)
-
-generated_fingerprint() {
-	for path in "${generated_files[@]}"; do
-		if [[ -f "${path}" ]]; then
-			sha256sum "${path}"
-		else
-			printf 'missing  %s\n' "${path}"
-		fi
-	done | sha256sum | cut -d ' ' -f 1
-}
-
-before_fingerprint=""
-if [[ "${MODE}" == "--check" ]]; then
-	before_fingerprint="$(generated_fingerprint)"
-fi
 
 metadata="$(curl -fsSL https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64/channel/LIVE)"
 studio_version="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<<"${metadata}")"
@@ -46,18 +27,22 @@ if [[ ! -s "${api_dump}" ]]; then
 	mv -- "${temporary}" "${api_dump}"
 	trap - EXIT
 fi
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+	printf 'CARBON_REFLECTION_API_DUMP=%s\n' "${api_dump}" >> "${GITHUB_ENV}"
+	printf 'CARBON_REFLECTION_VERSION=%s\n' "${studio_version}" >> "${GITHUB_ENV}"
+fi
+
+if [[ "${MODE}" == "--prepare" ]]; then
+	echo "Prepared reflection data for Roblox Studio ${studio_version} (${build_id})"
+	exit 0
+fi
 
 (
 	cd -- "${REPO}/studio-plugin"
-	lune run scripts/update-reflection-database.luau "${api_dump}" "${studio_version}"
-	lune run scripts/generate-database.luau
+	lune run scripts/test-current-reflection-database.luau "${api_dump}" "${studio_version}"
 )
 
 if [[ "${MODE}" == "--check" ]]; then
-	if [[ "$(generated_fingerprint)" != "${before_fingerprint}" ]]; then
-		echo "generated reflection data is stale for Roblox Studio ${studio_version} (${build_id})" >&2
-		exit 1
-	fi
 	echo "Verified reflection data for Roblox Studio ${studio_version} (${build_id})"
 else
 	echo "Updated reflection data for Roblox Studio ${studio_version} (${build_id})"

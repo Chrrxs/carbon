@@ -129,7 +129,7 @@ struct PlaceStructure {
 
 impl PlaceStructure {
 	fn load(path: &Path) -> Result<Self> {
-		let source = Deserializer::new().deserialize_structure(BufReader::new(
+		let source = Deserializer::new(util::get_reflection_database()).deserialize_structure(BufReader::new(
 			File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
 		))?;
 		let metadata = source.metadata().clone();
@@ -431,7 +431,7 @@ fn fingerprint(structure: &mut PlaceStructure) -> Result<FingerprintResult> {
 		studio_runtime_candidates,
 	};
 	let mut deferred_attributes = Vec::new();
-	Deserializer::new().deserialize_properties_with_sink(
+	Deserializer::new(util::get_reflection_database()).deserialize_properties_with_sink(
 		BufReader::new(File::open(&structure.path)?),
 		&mut FingerprintSink {
 			structure,
@@ -918,7 +918,8 @@ fn collect_properties(path: &Path, targets: HashSet<Ref>) -> Result<HashMap<Ref,
 		targets: &targets,
 		properties: HashMap::with_capacity(targets.len()),
 	};
-	Deserializer::new().deserialize_properties_with_sink(BufReader::new(File::open(path)?), &mut sink)?;
+	Deserializer::new(util::get_reflection_database())
+		.deserialize_properties_with_sink(BufReader::new(File::open(path)?), &mut sink)?;
 	Ok(sink.properties)
 }
 
@@ -960,12 +961,14 @@ fn is_engine_default_service_shell(
 			if is_unique_property(name.as_str(), value) || is_forward_instance_default(name.as_str(), value) {
 				return true;
 			}
+			if is_default_hydrated_lighting_property(node.class.as_str(), name.as_str(), value) {
+				return true;
+			}
 			let Some(default) = database.find_default_property(descriptor, name.as_str()) else {
 				return matches!(value, Variant::Ref(target) if target.is_none());
 			};
 			canonical_value(value, structure, true, Some(node), None)
 				== canonical_value(default, structure, true, Some(node), None)
-				|| is_default_hydrated_lighting_property(node.class.as_str(), name.as_str(), value)
 		})
 }
 
@@ -1491,7 +1494,13 @@ mod tests {
 	fn write_fixture(name: &str, root: InstanceBuilder) -> PathBuf {
 		let path = std::env::temp_dir().join(format!("carbon-place-diff-{name}-{}.rbxl", uuid::Uuid::new_v4()));
 		let dom = WeakDom::new(root);
-		rbx_binary::to_writer(File::create(&path).unwrap(), &dom, dom.root().children()).unwrap();
+		rbx_binary::to_writer_with_database(
+			File::create(&path).unwrap(),
+			&dom,
+			dom.root().children(),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 		path
 	}
 

@@ -400,7 +400,8 @@ refresh_shared_component_status() {
 mcp_is_healthy=0
 qualification_http_is_healthy "http://127.0.0.1:${mcp_port}/health" && mcp_is_healthy=1
 shared_update_needed=0
-((needs_carbon_plugin == 0 && needs_mcp_dependencies == 0 && needs_mcp_server == 0)) || shared_update_needed=1
+((needs_carbon_plugin == 0 && needs_mcp_dependencies == 0 && needs_mcp_server == 0 && needs_rml == 0)) ||
+	shared_update_needed=1
 ((mcp_is_healthy == 1)) || shared_update_needed=1
 
 exec {stack_lock_fd}>"${state_dir}/installed-stack.lock"
@@ -417,7 +418,7 @@ refresh_shared_component_status
 # A different run may have changed the component cache between the optimistic
 # status check and our shared lock. Upgrade before touching global components.
 if [[ "$stack_lock_mode" == shared ]] &&
-	((needs_carbon_plugin == 1 || needs_mcp_dependencies == 1 || needs_mcp_server == 1)); then
+	((needs_carbon_plugin == 1 || needs_mcp_dependencies == 1 || needs_mcp_server == 1 || needs_rml == 1)); then
 	flock -u "$stack_lock_fd"
 	step "Waiting for exclusive access to refresh the installed Studio stack"
 	flock -x "$stack_lock_fd"
@@ -462,6 +463,11 @@ if ((needs_mcp_server == 1)); then
 	mcp_rebuilt=1
 else
 	step "robloxstudio-mcp server build is up to date"
+fi
+
+if ((needs_rml == 1)); then
+	step "Updating the shared RobloxModLoader bootstrap"
+	"$candidate" --yes rml ensure
 fi
 
 step "The candidate will extract and pin its embedded RML package when launching Studio"

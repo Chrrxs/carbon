@@ -232,6 +232,10 @@ impl InstanceSource for DecodedArena {
 ///
 /// [ReflectionDatabase]: rbx_reflection::ReflectionDatabase
 /// [reflection_database]: Deserializer#method.reflection_database
+static EMPTY_DATABASE: std::sync::LazyLock<ReflectionDatabase<'static>> =
+	std::sync::LazyLock::new(ReflectionDatabase::new);
+
+/// Configures deserialization using an explicit reflection database.
 pub struct Deserializer<'db> {
 	database: &'db ReflectionDatabase<'db>,
 	strict: bool,
@@ -239,10 +243,19 @@ pub struct Deserializer<'db> {
 }
 
 impl<'db> Deserializer<'db> {
-	/// Create a new `Deserializer` with the default settings.
-	pub fn new() -> Self {
+	/// Create a new `Deserializer` using the provided reflection database.
+	pub fn new(database: &'db ReflectionDatabase<'db>) -> Self {
 		Self {
-			database: rbx_reflection_database::get().unwrap(),
+			database,
+			strict: false,
+			skip_known_non_serializing_properties: false,
+		}
+	}
+
+	/// Create a new `Deserializer` with an empty reflection database.
+	pub fn new_empty() -> Deserializer<'static> {
+		Deserializer {
+			database: &EMPTY_DATABASE,
 			strict: false,
 			skip_known_non_serializing_properties: false,
 		}
@@ -405,8 +418,8 @@ impl<'db> Deserializer<'db> {
 	}
 }
 
-impl Default for Deserializer<'_> {
+impl Default for Deserializer<'static> {
 	fn default() -> Self {
-		Self::new()
+		Self::new_empty()
 	}
 }

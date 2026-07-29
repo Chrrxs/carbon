@@ -676,15 +676,24 @@ static int cmd_inject(
     std::cout << "CARBON_RML_INJECTOR_STARTED" << std::endl;
 
     DWORD waitResult = WaitForSingleObject(hThread.get(), 30000);
-    bool finished = (waitResult == WAIT_OBJECT_0);
-
-    if (finished) {
-        VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
-        return 0;
+    if (waitResult != WAIT_OBJECT_0) {
+        std::cerr << "WaitForSingleObject failed or timed out: " << waitResult << "\n";
+        return 1;
     }
 
-    std::cerr << "WaitForSingleObject failed or timed out: " << waitResult << "\n";
-    return 1;
+    DWORD remoteResult = 0;
+    if (!GetExitCodeThread(hThread.get(), &remoteResult)) {
+        std::cerr << "GetExitCodeThread failed: " << GetLastError() << "\n";
+        return 1;
+    }
+    if (remoteResult == 0) {
+        std::cerr << "LoadLibraryW returned null for the Carbon RML loader\n";
+        VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
+    return 0;
 }
 
 static int cmd_terminate(

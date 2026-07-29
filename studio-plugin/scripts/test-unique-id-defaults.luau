@@ -1,7 +1,5 @@
 --!strict
 
-local MsgPack = require("../src/Lib/MsgPack")
-local fs = require("@lune/fs")
 local roblox = require("@lune/roblox")
 
 Axes = roblox.Axes
@@ -46,12 +44,5 @@ assert(
 	buffer.tostring(EncodedValue.uniqueIdFromHex(hex)) == canonical,
 	"reflection UniqueId hex defaults must preserve canonical wire bytes"
 )
-
-local database = MsgPack.decode(fs.readFile("src/Lib/Dom/database.msgpack"))
-for _, property in { "UniqueId", "HistoryId" } do
-	local default = database.Classes.Folder.DefaultProperties[property].UniqueId
-	local value = EncodedValue.uniqueIdFromHex(default)
-	assert(buffer.len(value) == 16, `Folder.{property} default must become a 16-byte wire value`)
-end
 
 print("PASS: UniqueId defaults and Roblox/canonical component order are exact")

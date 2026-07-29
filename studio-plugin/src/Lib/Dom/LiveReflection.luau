@@ -1,5 +1,7 @@
 --!strict
 
+local ReflectionPolicy = if script then require(script.Parent.ReflectionPolicy) else require("./ReflectionPolicy")
+
 local LiveReflection = {}
 
 local primitiveTypes = {
@@ -264,8 +266,12 @@ function LiveReflection.applyOverlay(database, overlay)
 end
 
 function LiveReflection.apply(database, api, version)
+	assert(type(database) == "table", "database must be a table")
+	database.Classes = database.Classes or {}
+	database.Enums = database.Enums or {}
 	local overlay, skippedTypes, skippedProperties = LiveReflection.fromApi(api, version)
 	local result = LiveReflection.applyOverlay(database, overlay)
+	ReflectionPolicy.apply(database)
 	result.skippedTypes = skippedTypes
 	result.skippedProperties = {}
 	for path, skipped in skippedProperties do

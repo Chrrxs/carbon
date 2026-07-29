@@ -203,7 +203,7 @@ required_ci_checks=(
 	'./scripts/test-public-readiness'
 	'./scripts/test-production-readiness-isolation'
 	'./scripts/test-change-workflow'
-	'lune run scripts/generate-database.luau -- --check'
+	'./scripts/update-reflection --check'
 	'selene src'
 	'stylua src scripts --check'
 	'./scripts/build-studio-plugin target/Carbon.rbxm'

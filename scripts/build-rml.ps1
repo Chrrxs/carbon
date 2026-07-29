@@ -63,6 +63,23 @@ function Invoke-Checked {
     }
 }
 
+function Get-Sha512 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path
+    )
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha512 = [System.Security.Cryptography.SHA512]::Create()
+    try {
+        $hash = $sha512.ComputeHash($stream)
+        return -join ($hash | ForEach-Object { $_.ToString("x2") })
+    } finally {
+        $sha512.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Resolve-VSWhere {
     $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
     $candidate = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
@@ -279,7 +296,7 @@ if (-not (Test-Path -LiteralPath $dotnet -PathType Leaf)) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Write-Host "[fresh-rml] Downloading pinned .NET SDK $dotnetSdkVersion"
     Invoke-WebRequest -UseBasicParsing -Uri $dotnetSdkUrl -OutFile $dotnetSdkArchive
-    $actualDotnetSdkSha512 = (Get-FileHash -LiteralPath $dotnetSdkArchive -Algorithm SHA512).Hash.ToLowerInvariant()
+    $actualDotnetSdkSha512 = Get-Sha512 -Path $dotnetSdkArchive
     if ($actualDotnetSdkSha512 -ne $dotnetSdkSha512) {
         throw "pinned .NET SDK archive hash mismatch: expected $dotnetSdkSha512, got $actualDotnetSdkSha512"
     }

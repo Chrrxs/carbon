@@ -339,11 +339,8 @@ fn unknown_property() {
 }
 
 fn reflection_with_non_serializing_probe(serializes: bool) -> ReflectionDatabase<'static> {
-	let mut database = rbx_reflection_database::get_bundled().clone();
-	let class = database
-		.classes
-		.get_mut("Folder")
-		.expect("Folder reflection is missing");
+	let mut database = ReflectionDatabase::new();
+	let mut class = ClassDescriptor::new("Folder");
 	let mut property = PropertyDescriptor::new("SaveOnlyProbe", DataType::Value(VariantType::Ref));
 	property.kind = PropertyKind::Canonical {
 		serialization: if serializes {
@@ -353,6 +350,7 @@ fn reflection_with_non_serializing_probe(serializes: bool) -> ReflectionDatabase
 		},
 	};
 	class.properties.insert("SaveOnlyProbe", property);
+	database.classes.insert("Folder", class);
 	database
 }
 

@@ -1,9 +1,9 @@
 --!strict
 
 local fs = require("@lune/fs")
-local process = require("@lune/process")
 local serde = require("@lune/serde")
 
+local LiveReflection = require("../src/Lib/Dom/LiveReflection")
 local MsgPack = require("../src/Lib/MsgPack")
 
 assert(string.byte(MsgPack.encode(MsgPack.Map.new())) == 0x80, "empty property maps must use MessagePack map wire type")
@@ -38,8 +38,36 @@ do
 	assert(MsgPack.Int64.toDecimal(decoded) == fixture.decimal, `Int64 wire drifted: {fixture.decimal}`)
 end
 
-local databasePath = process.args[1] or "src/Lib/Dom/database.msgpack"
-local database = MsgPack.decode(fs.readFile(databasePath))
+local function contentClass(name: string, properties: { string })
+	local members = {}
+	for _, propertyName in properties do
+		table.insert(members, {
+			MemberType = "Property",
+			Name = propertyName,
+			Security = { Read = "None", Write = "None" },
+			Serialization = { CanLoad = true, CanSave = true },
+			Tags = {},
+			ValueType = { Category = "DataType", Name = "Content" },
+		})
+	end
+	return {
+		Name = name,
+		Superclass = "Instance",
+		Tags = {},
+		Members = members,
+	}
+end
+
+local database = {}
+LiveReflection.apply(database, {
+	Classes = {
+		contentClass("ParticleEmitter", { "TextureContent" }),
+		contentClass("Beam", { "TextureContent" }),
+		contentClass("Trail", { "TextureContent" }),
+		contentClass("SpecialMesh", { "MeshContent", "TextureContent" }),
+	},
+	Enums = {},
+}, { 0, 0, 0, 0 })
 local allValues = serde.decode("json", fs.readFile("src/Lib/Dom/allValues.json"))
 
 local function findProperty(className: string, propertyName: string): any

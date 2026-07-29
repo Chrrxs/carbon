@@ -441,17 +441,6 @@ pub(crate) fn serialized_property_candidates(class: &str) -> anyhow::Result<Vec<
 		};
 		current = superclass;
 	}
-	// The plugin pins Studio reflection 0.729 while the newest published Rust
-	// database is 0.728. Keep its one additional non-settings serialized
-	// property aligned until rbx_reflection_database publishes 0.729.
-	if class == "VoiceChatService" && seen.insert("EnableVoiceVolumeControls") {
-		candidates.push(SerializedPropertyCandidate {
-			canonical_name: Ustr::from("EnableVoiceVolumeControls"),
-			request_name: "EnableVoiceVolumeControls".to_owned(),
-			data_type: VariantType::Enum,
-			enum_name: Some("RolloutState".to_owned()),
-		});
-	}
 	candidates.sort_unstable_by_key(|candidate| candidate.canonical_name);
 	Ok(candidates)
 }
@@ -760,7 +749,7 @@ fn decode_serialized_property_model(model: &str) -> anyhow::Result<WeakDom> {
 		.context("RML bridge returned an invalid serialized-property model")?;
 	let model_len = bytes.len();
 	debug!("Decoding RML serialized-property carrier model ({model_len} bytes)");
-	rbx_binary::from_reader(std::io::Cursor::new(bytes))
+	rbx_binary::from_reader_with_database(std::io::Cursor::new(bytes), crate::util::get_reflection_database())
 		.map_err(|error| anyhow::anyhow!("failed to decode RML serialized-property model ({model_len} bytes): {error}"))
 }
 
@@ -928,8 +917,13 @@ fn materialized_property_model(
 			.with_property(property, value),
 	);
 	let mut model = Vec::new();
-	rbx_binary::to_writer(&mut model, &dom, &[materialized])
-		.context("failed to encode privileged binary property materialization")?;
+	rbx_binary::to_writer_with_database(
+		&mut model,
+		&dom,
+		&[materialized],
+		crate::util::get_reflection_database(),
+	)
+	.context("failed to encode privileged binary property materialization")?;
 	Ok(model)
 }
 
@@ -1132,7 +1126,8 @@ fn read_live_root_properties(
 fn decode_root_model(response: &RootModel) -> anyhow::Result<WeakDom> {
 	let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &response.model)
 		.context("RML bridge returned an invalid root model")?;
-	rbx_binary::from_reader(std::io::Cursor::new(bytes)).context("failed to decode RML hidden-root model")
+	rbx_binary::from_reader_with_database(std::io::Cursor::new(bytes), crate::util::get_reflection_database())
+		.context("failed to decode RML hidden-root model")
 }
 
 fn root_property_carrier_roots(dom: &WeakDom, response: &RootModel) -> anyhow::Result<HashSet<Ref>> {
@@ -2720,7 +2715,7 @@ fn prepare_hidden_root_bundle(
 		}
 	}
 	let mut bytes = Vec::new();
-	rbx_binary::Serializer::new()
+	rbx_binary::Serializer::new(crate::util::get_reflection_database())
 		.serialize_source(&mut bytes, tree, &root_ids)
 		.context("failed to serialize authoritative hidden root bundle")?;
 	Ok(base64::Engine::encode(
@@ -3580,7 +3575,13 @@ mod tests {
 				.with_property("Value", visible),
 		);
 		let mut bytes = Vec::new();
-		rbx_binary::to_writer(&mut bytes, &dom, &[visible, hidden]).unwrap();
+		rbx_binary::to_writer_with_database(
+			&mut bytes,
+			&dom,
+			&[visible, hidden],
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 		(
 			RootModel {
 				model: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
@@ -3872,7 +3873,8 @@ mod tests {
 		assert_eq!(prepared.references[0].target, Some(hidden));
 		let model = prepare_hidden_root_bundle(&tree, std::slice::from_ref(&prepared)).unwrap();
 		let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, model).unwrap();
-		let decoded = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+		let decoded =
+			rbx_binary::from_reader_with_database(bytes.as_slice(), crate::util::get_reflection_database()).unwrap();
 		assert_eq!(decoded.root().children().len(), 1);
 		let root = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
 		assert_eq!(root.class.as_str(), "Folder");
@@ -4099,7 +4101,8 @@ mod tests {
 				.with_property("CollisionGroupData", BinaryString::from(payload.clone())),
 		);
 		let mut bytes = Vec::new();
-		rbx_binary::to_writer(&mut bytes, &dom, &[wrapper]).unwrap();
+		rbx_binary::to_writer_with_database(&mut bytes, &dom, &[wrapper], crate::util::get_reflection_database())
+			.unwrap();
 		let model = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
 		let value = decode_serialized_property(&model, "owner-debug-id", "CollisionGroupData").unwrap();
 		assert_eq!(serialized_property_bytes(&value).unwrap(), payload);
@@ -4161,7 +4164,11 @@ mod tests {
 		assert!(materialized_property_model("Chat", "LoadDefaultChat", "Bool", b"true").is_ok());
 		assert!(materialized_property_model("MeshPart", "MeshContent", "Content", &[0]).is_ok());
 		let empty_uri_model = materialized_property_model("PackageLink", "PackageContent", "Content", b"\x01").unwrap();
-		let empty_uri_dom = rbx_binary::from_reader(std::io::Cursor::new(empty_uri_model)).unwrap();
+		let empty_uri_dom = rbx_binary::from_reader_with_database(
+			std::io::Cursor::new(empty_uri_model),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 		let empty_uri_owner = empty_uri_dom.get_by_ref(empty_uri_dom.root().children()[0]).unwrap();
 		let Variant::Content(empty_uri) = empty_uri_owner
 			.properties
@@ -4174,7 +4181,11 @@ mod tests {
 		assert!(matches!(empty_uri.value(), ContentType::Uri(uri) if uri.is_empty()));
 		let invalid_string_model =
 			materialized_property_model("PackageLink", "DefaultName", "String", b"\xffname").unwrap();
-		let invalid_string_dom = rbx_binary::from_reader(std::io::Cursor::new(invalid_string_model)).unwrap();
+		let invalid_string_dom = rbx_binary::from_reader_with_database(
+			std::io::Cursor::new(invalid_string_model),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 		let invalid_string_owner = invalid_string_dom
 			.get_by_ref(invalid_string_dom.root().children()[0])
 			.unwrap();
@@ -4206,7 +4217,8 @@ mod tests {
 				.with_property("SolidMeshHolder", NetAssetRef::new(payload.clone())),
 		);
 		let mut bytes = Vec::new();
-		rbx_binary::to_writer(&mut bytes, &dom, &[wrapper]).unwrap();
+		rbx_binary::to_writer_with_database(&mut bytes, &dom, &[wrapper], crate::util::get_reflection_database())
+			.unwrap();
 		let model = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
 		let value = decode_serialized_property(&model, "owner-debug-id", "SolidMeshHolder").unwrap();
 		let encoded = base64::Engine::encode(

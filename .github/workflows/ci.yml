@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Prepare current Studio reflection
+        run: ./scripts/update-reflection --prepare
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           components: clippy, rustfmt
@@ -63,16 +65,11 @@ jobs:
       - name: Install plugin toolchain
         working-directory: studio-plugin
         run: rokit install --no-trust-check
-      - name: Verify current Studio reflection database
+      - name: Test current Studio reflection
         run: ./scripts/update-reflection --check
-      - name: Test reflection database
+      - name: Test live reflection policy
         working-directory: studio-plugin
-        run: |
-          lune run scripts/test-live-reflection-database.luau
-          lune run scripts/test-current-reflection-database.luau
-      - name: Verify generated reflection database
-        working-directory: studio-plugin
-        run: lune run scripts/generate-database.luau -- --check
+        run: lune run scripts/test-live-reflection-database.luau
       - name: Lint Studio plugin
         working-directory: studio-plugin
         run: selene src

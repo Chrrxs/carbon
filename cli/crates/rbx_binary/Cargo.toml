@@ -60,8 +60,6 @@ version = "4.1.0"
 [dependencies.rbx_reflection]
 version = "7.0.0"
 
-[dependencies.rbx_reflection_database]
-version = "3.0.0"
 
 [dependencies.serde]
 version = "1.0.137"

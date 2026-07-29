@@ -1992,10 +1992,9 @@ pub(crate) fn compile_validated(
 	let mut roundtrip_cframe_observed = false;
 	for (chunk_index, chunk) in artifact.chunks.iter().enumerate() {
 		ensure!(!cancelled(), "Capture Manifest was cancelled during chunk decoding");
-		let source = rbx_binary::Deserializer::new()
+		let source = rbx_binary::Deserializer::new(util::get_reflection_database())
 			.strict(true)
 			.skip_known_non_serializing_properties(true)
-			.reflection_database(util::get_reflection_database())
 			.deserialize_source(capture_reader(artifact.open_chunk(input, chunk_index)?, cancelled))?;
 		let alignment = topology.align_chunk(envelope, chunk, serialized_start, &source, &carrier_indexes, true)?;
 		let mut sink = DigestSink {
@@ -2236,10 +2235,9 @@ pub(crate) fn compile_validated(
 					!cancelled(),
 					"Capture Manifest was cancelled during final chunk decoding"
 				);
-				let source = rbx_binary::Deserializer::new()
+				let source = rbx_binary::Deserializer::new(util::get_reflection_database())
 					.strict(true)
 					.skip_known_non_serializing_properties(true)
-					.reflection_database(util::get_reflection_database())
 					.deserialize_source(capture_reader(artifact.open_chunk(input, chunk_index)?, cancelled))?;
 				let alignment =
 					topology.align_chunk(envelope, chunk, serialized_start, &source, &carrier_indexes, false)?;
@@ -2776,7 +2774,13 @@ mod tests {
 					.with_property("Value", true),
 			);
 			let mut child_model = Vec::new();
-			rbx_binary::to_writer(&mut child_model, &dom, &[child]).unwrap();
+			rbx_binary::to_writer_with_database(
+				&mut child_model,
+				&dom,
+				&[child],
+				crate::util::get_reflection_database(),
+			)
+			.unwrap();
 			(
 				framed_capture(&[(vec![2], child_model)]),
 				Some(CaptureHierarchyNode {
@@ -2980,7 +2984,8 @@ mod tests {
 				.with_property("Transform", studio_transform),
 		);
 		let mut model = Vec::new();
-		rbx_binary::to_writer(&mut model, &dom, &[right_wrist]).unwrap();
+		rbx_binary::to_writer_with_database(&mut model, &dom, &[right_wrist], crate::util::get_reflection_database())
+			.unwrap();
 		let capture = framed_capture(&[(vec![2], model)]);
 		let payload = directory.join("capture.rbxm");
 		std::fs::write(&payload, &capture).unwrap();
@@ -3073,13 +3078,11 @@ mod tests {
 				.with_property(binary_property, Variant::Ref(target)),
 		);
 		let mut owner_model = Vec::new();
-		rbx_binary::Serializer::new()
-			.reflection_database(util::get_reflection_database())
+		rbx_binary::Serializer::new(util::get_reflection_database())
 			.serialize(&mut owner_model, &dom, &[owner])
 			.unwrap();
 		let mut target_model = Vec::new();
-		rbx_binary::Serializer::new()
-			.reflection_database(util::get_reflection_database())
+		rbx_binary::Serializer::new(util::get_reflection_database())
 			.serialize(&mut target_model, &dom, &[target])
 			.unwrap();
 		let artifact = framed_capture(&[(vec![2], owner_model), (vec![3], target_model)]);
@@ -3263,7 +3266,8 @@ mod tests {
 				.with_property("Source", Variant::String("return 'native capture'\n".to_owned())),
 		);
 		let mut model = Vec::new();
-		rbx_binary::to_writer(&mut model, &dom, &[parent]).unwrap();
+		rbx_binary::to_writer_with_database(&mut model, &dom, &[parent], crate::util::get_reflection_database())
+			.unwrap();
 		let artifact = framed_capture(&[(vec![2], model)]);
 
 		let directory = std::env::temp_dir().join(format!("carbon-native-manifest-script-{}", uuid::Uuid::new_v4()));
@@ -3379,7 +3383,8 @@ mod tests {
 				.with_property("Value", Variant::Ref(Ref::none())),
 		);
 		let mut model = Vec::new();
-		rbx_binary::to_writer(&mut model, &dom, &[owner]).unwrap();
+		rbx_binary::to_writer_with_database(&mut model, &dom, &[owner], crate::util::get_reflection_database())
+			.unwrap();
 		let artifact = framed_capture(&[(vec![2], model)]);
 		let directory = std::env::temp_dir().join(format!("carbon-mapped-reference-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(&directory).unwrap();
@@ -3483,7 +3488,8 @@ mod tests {
 		let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
 		let native = dom.insert(dom.root_ref(), InstanceBuilder::new("Folder").with_name("Native"));
 		let mut model = Vec::new();
-		rbx_binary::to_writer(&mut model, &dom, &[native]).unwrap();
+		rbx_binary::to_writer_with_database(&mut model, &dom, &[native], crate::util::get_reflection_database())
+			.unwrap();
 		let artifact = framed_capture(&[(vec![2], model)]);
 		let directory =
 			std::env::temp_dir().join(format!("carbon-authoritative-mapped-source-{}", uuid::Uuid::new_v4()));
@@ -3605,11 +3611,23 @@ mod tests {
 			InstanceBuilder::new("DataModel").with_child(InstanceBuilder::new("Folder").with_name("Parent")),
 		);
 		let mut parent_model = Vec::new();
-		rbx_binary::to_writer(&mut parent_model, &parent_dom, parent_dom.root().children()).unwrap();
+		rbx_binary::to_writer_with_database(
+			&mut parent_model,
+			&parent_dom,
+			parent_dom.root().children(),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 		let child_dom =
 			WeakDom::new(InstanceBuilder::new("DataModel").with_child(InstanceBuilder::new("Part").with_name("Child")));
 		let mut child_model = Vec::new();
-		rbx_binary::to_writer(&mut child_model, &child_dom, child_dom.root().children()).unwrap();
+		rbx_binary::to_writer_with_database(
+			&mut child_model,
+			&child_dom,
+			child_dom.root().children(),
+			crate::util::get_reflection_database(),
+		)
+		.unwrap();
 		let bytes = framed_capture(&[(vec![2], parent_model), (vec![3], child_model)]);
 		let path = std::env::temp_dir().join(format!("carbon-frontier-cut-{}.rbxm", uuid::Uuid::new_v4()));
 		std::fs::write(&path, &bytes).unwrap();
@@ -3677,9 +3695,8 @@ mod tests {
 		let mut topology = CaptureTopology::new(&envelope, &artifact, ordinal_refs).unwrap();
 		let mut start = 0;
 		for (index, chunk) in artifact.chunks.iter().enumerate() {
-			let source = rbx_binary::Deserializer::new()
+			let source = rbx_binary::Deserializer::new(util::get_reflection_database())
 				.strict(true)
-				.reflection_database(util::get_reflection_database())
 				.deserialize_source(artifact.open_chunk(&path, index).unwrap())
 				.unwrap();
 			let aligned = topology
@@ -3732,7 +3749,11 @@ mod tests {
 		let mut envelope = CaptureEnvelope::decode(&std::fs::read(envelope_path).unwrap()).unwrap();
 		let mut renamed_payload = None;
 		if rename_first {
-			let mut dom = rbx_binary::from_reader(BufReader::new(File::open(&payload).unwrap())).unwrap();
+			let mut dom = rbx_binary::from_reader_with_database(
+				BufReader::new(File::open(&payload).unwrap()),
+				crate::util::get_reflection_database(),
+			)
+			.unwrap();
 			let matches = dom
 				.descendants()
 				.filter(|instance| instance.name == "Node0000000")
@@ -3752,7 +3773,13 @@ mod tests {
 			);
 			envelope_matches.into_iter().next().unwrap().name = "Node0000000_Renamed".to_owned();
 			let renamed = std::env::temp_dir().join(format!("carbon-capture-rename-{}.rbxm", uuid::Uuid::new_v4()));
-			rbx_binary::to_writer(File::create(&renamed).unwrap(), &dom, dom.root().children()).unwrap();
+			rbx_binary::to_writer_with_database(
+				File::create(&renamed).unwrap(),
+				&dom,
+				dom.root().children(),
+				crate::util::get_reflection_database(),
+			)
+			.unwrap();
 			let bytes = std::fs::read(&renamed).unwrap();
 			envelope.model_bytes = bytes.len() as u64;
 			envelope.model_digest = Sha256::digest(&bytes).into();

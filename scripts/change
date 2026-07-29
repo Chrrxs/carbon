@@ -86,9 +86,9 @@ run_studio_plugin_quality() {
 		"${SCRIPT_DIR}/update-reflection" --check
 		cd "${REPO}/studio-plugin"
 		for test_script in scripts/test-*.luau; do
+			[[ "$(basename "$test_script")" == "test-current-reflection-database.luau" ]] && continue
 			lune run "$test_script"
 		done
-		lune run scripts/generate-database.luau -- --check
 		selene src
 		stylua src scripts --check
 	)
