@@ -104,6 +104,11 @@ if grep -Fq -- 'current_path / \"RobloxModLoader\" / \"roblox_modloader.dll\"' "
 	failure=1
 fi
 
+if grep -Fq -- 'FreeLibrary(mod_loader);' "$PROXY_GENERATOR_SOURCE"; then
+	echo "FAIL: RML proxy must not unload an attestation failure from DllMain" >&2
+	failure=1
+fi
+
 if ((failure != 0)); then
 	exit "$failure"
 fi

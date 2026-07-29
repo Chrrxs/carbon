@@ -311,7 +311,6 @@ int main(int argc, char *argv[]) {
     cpp_file << "    HMODULE mod_loader = LoadLibraryW(isolated_path.c_str());" << endl;
     cpp_file << "    if (!mod_loader) return nullptr;" << endl;
     cpp_file << "    if (!attest_loaded_build(mod_loader, true)) {" << endl;
-    cpp_file << "        FreeLibrary(mod_loader);" << endl;
     cpp_file << "        return nullptr;" << endl;
     cpp_file << "    }" << endl;
     cpp_file << "    return mod_loader;" << endl;
