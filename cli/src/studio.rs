@@ -25,6 +25,7 @@ const LIFECYCLE_ENV: &str = "CARBON_STUDIO_LIFECYCLE";
 const MCP_PROTOCOL_VERSION: u64 = 3;
 const MCP_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 const MCP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+const MCP_INSTANCE_TIMEOUT: Duration = Duration::from_secs(120);
 const MCP_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -117,7 +118,7 @@ impl ManagedStudio {
 		if let ManagedStudioLifecycle::Direct { data_model_name, .. } = &self.lifecycle {
 			return resolve_direct_mcp_instance_id(
 				data_model_name,
-				Instant::now() + MCP_LIFECYCLE_TIMEOUT,
+				Instant::now() + MCP_INSTANCE_TIMEOUT,
 				query_mcp_health,
 				|| thread::sleep(Duration::from_millis(100)),
 			);
@@ -133,7 +134,7 @@ impl ManagedStudio {
 		};
 		resolve_mcp_instance_id(
 			launch_id,
-			Instant::now() + MCP_LIFECYCLE_TIMEOUT,
+			Instant::now() + MCP_INSTANCE_TIMEOUT,
 			|| {
 				mcp_tool(
 					endpoint,
@@ -1262,7 +1263,7 @@ where
 		if Instant::now() >= deadline {
 			let message = format!(
 				"robloxstudio-mcp Studio launch {launch_id} did not report an instance ID within {} seconds",
-				MCP_LIFECYCLE_TIMEOUT.as_secs()
+				MCP_INSTANCE_TIMEOUT.as_secs()
 			);
 			return match status_error {
 				Some(error) => Err(error).context(message),
