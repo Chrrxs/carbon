@@ -34,8 +34,10 @@ namespace
 namespace rml::roblox::internals
 {
 	JobCapabilities::JobCapabilities(
-		const std::ptrdiff_t waiting_scripts_job_script_context_offset) noexcept :
-		m_waiting_scripts_job_script_context_offset(waiting_scripts_job_script_context_offset)
+		const std::ptrdiff_t waiting_scripts_job_script_context_offset,
+		const DataModelAccessor waiting_scripts_job_data_model_accessor) noexcept :
+		m_waiting_scripts_job_script_context_offset(waiting_scripts_job_script_context_offset),
+		m_waiting_scripts_job_data_model_accessor(waiting_scripts_job_data_model_accessor)
 	{
 	}
 	RBX::ScriptContext* JobCapabilities::get_script_context(
@@ -44,5 +46,13 @@ namespace rml::roblox::internals
 		void* value{};
 		return read_pointer_field(job, m_waiting_scripts_job_script_context_offset, value)
 			? static_cast<RBX::ScriptContext*>(value) : nullptr;
+	}
+	RBX::DataModel* JobCapabilities::get_data_model(
+		const RBX::ScriptContextFacets::WaitingHybridScriptsJob* job) const noexcept
+	{
+		const auto script_context = get_script_context(job);
+		return script_context != nullptr && m_waiting_scripts_job_data_model_accessor != nullptr
+			? m_waiting_scripts_job_data_model_accessor(script_context)
+			: nullptr;
 	}
 }

@@ -1,7 +1,6 @@
 #include "RobloxModLoader/roblox/data_model.hpp"
 
 #include "RobloxModLoader/internal/common.hpp"
-#include "RobloxModLoader/roblox/data_model_job.hpp"
 #include "RobloxModLoader/roblox/internals_profile.hpp"
 
 namespace RBX
@@ -25,7 +24,7 @@ namespace RBX
 		return profile->datamodel().data_model_to_task_context(this);
 	}
 
-	DataModel* DataModel::from_job(const DataModelJob* job, const rml::roblox::internals::RobloxInternalsProfile* profile)
+	DataModel* DataModel::from_job(const ScriptContextFacets::WaitingHybridScriptsJob* job, const rml::roblox::internals::RobloxInternalsProfile* profile)
 	{
 		if (job == nullptr)
 		{
@@ -41,12 +40,6 @@ namespace RBX
 			return nullptr;
 		}
 
-		const auto data_model = profile->datamodel().job_subobject_to_data_model(job);
-		if (data_model)
-		{
-			return *data_model;
-		}
-
-		return nullptr;
+		return profile->job().get_data_model(job);
 	}
 }

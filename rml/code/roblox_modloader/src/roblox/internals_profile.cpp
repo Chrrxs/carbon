@@ -1,6 +1,7 @@
 #include "RobloxModLoader/roblox/internals_profile.hpp"
 #include "RobloxModLoader/roblox/datamodel_layout_resolver.hpp"
 #include "RobloxModLoader/roblox/reflection/object.hpp"
+#include "RobloxModLoader/roblox/job_types.hpp"
 
 #include "RobloxModLoader/internal/memory/pe_parser.hpp"
 #include "RobloxModLoader/memory/module.hpp"
@@ -93,6 +94,21 @@ namespace rml::roblox::internals
 		}
 
 		const auto module_base = studio_module.begin().as<std::uintptr_t>();
+		const auto module_contains = [&](const std::uintptr_t address, const std::size_t size) {
+			if (address < module_base)
+				return false;
+			const auto offset = address - module_base;
+			return offset <= studio_module.size() && size <= studio_module.size() - offset;
+		};
+		const auto module_rva_address =
+			[&](const std::int32_t rva, const std::size_t size) -> std::optional<std::uintptr_t> {
+				if (rva < 0)
+					return std::nullopt;
+				const auto offset = static_cast<std::size_t>(rva);
+				if (offset > studio_module.size() || size > studio_module.size() - offset)
+					return std::nullopt;
+				return module_base + offset;
+			};
 		const auto text_address = module_base + static_cast<std::size_t>(section_offset);
 
 		const auto code = std::span{
@@ -365,6 +381,21 @@ namespace rml::roblox::internals
 			});
 		}
 
+		auto instance_candidates =
+			memory::rtti::Scanner::get_class_rtti_candidates("RBX::Instance");
+		if (instance_candidates.empty())
+		{
+			instance_candidates =
+				memory::rtti::Scanner::get_class_rtti_candidates("class RBX::Instance");
+		}
+		if (instance_candidates.empty())
+		{
+			return std::unexpected(CompatibilityError{
+				.capability = "Instance.RTTI",
+				.failure = CompatibilityFailure::missing_signature,
+			});
+		}
+
 		std::vector<std::uintptr_t> datamodel_vfts;
 		datamodel_vfts.reserve(datamodel_candidates.size());
 		for (const auto& candidate : datamodel_candidates)
@@ -386,6 +417,78 @@ namespace rml::roblox::internals
 			});
 		}
 
+		std::vector<const memory::rtti::TypeDescriptor*> instance_type_descriptors;
+		for (const auto& candidate : instance_candidates)
+		{
+			const auto* type_descriptor = candidate->get_type_descriptor();
+			const auto address = reinterpret_cast<std::uintptr_t>(type_descriptor);
+			if (module_contains(address, sizeof(memory::rtti::TypeDescriptor)))
+				instance_type_descriptors.push_back(type_descriptor);
+		}
+
+		std::vector<std::ptrdiff_t> datamodel_instance_base_offsets;
+		for (const auto& candidate : datamodel_candidates)
+		{
+			const auto* hierarchy = candidate->get_class_hierarchy_descriptor();
+			const auto hierarchy_address = reinterpret_cast<std::uintptr_t>(hierarchy);
+			if (!module_contains(
+					hierarchy_address,
+					sizeof(memory::rtti::ClassHierarchyDescriptor)) ||
+				hierarchy->num_base_classes == 0 || hierarchy->num_base_classes > 100)
+			{
+				continue;
+			}
+
+			const auto base_array_address = module_rva_address(
+				hierarchy->base_class_array_offset.value(),
+				hierarchy->num_base_classes * sizeof(memory::pe::IBO32));
+			if (!base_array_address)
+				continue;
+			const auto* base_array =
+				reinterpret_cast<const memory::pe::IBO32*>(*base_array_address);
+			for (std::uint32_t index = 0; index < hierarchy->num_base_classes; ++index)
+			{
+				const auto descriptor_address = module_rva_address(
+					base_array[index].value(),
+					sizeof(memory::rtti::BaseClassDescriptor));
+				if (!descriptor_address)
+					continue;
+				const auto* descriptor =
+					reinterpret_cast<const memory::rtti::BaseClassDescriptor*>(
+						*descriptor_address);
+				const auto type_descriptor_address = module_rva_address(
+					descriptor->type_descriptor_offset,
+					sizeof(memory::rtti::TypeDescriptor));
+				if (!type_descriptor_address)
+					continue;
+				const auto* type_descriptor =
+					reinterpret_cast<const memory::rtti::TypeDescriptor*>(
+						*type_descriptor_address);
+				if (std::ranges::find(instance_type_descriptors, type_descriptor) ==
+						instance_type_descriptors.end() ||
+					descriptor->member_displacement[1] != -1 ||
+					descriptor->member_displacement[0] < 0)
+				{
+					continue;
+				}
+				datamodel_instance_base_offsets.push_back(
+					descriptor->member_displacement[0]);
+			}
+		}
+		std::ranges::sort(datamodel_instance_base_offsets);
+		datamodel_instance_base_offsets.erase(
+			std::ranges::unique(datamodel_instance_base_offsets).begin(),
+			datamodel_instance_base_offsets.end());
+		if (datamodel_instance_base_offsets.size() != 1)
+		{
+			return std::unexpected(CompatibilityError{
+				.capability = "DataModel.RTTI",
+				.failure = datamodel_instance_base_offsets.empty()
+					? CompatibilityFailure::missing_signature
+					: CompatibilityFailure::ambiguous_evidence,
+			});
+		}
+
 		LOG_INFO("Resolving Roblox internals: DataModel layout");
 		auto datamodel_layout = resolve_datamodel_layout(
 			code,
@@ -399,20 +502,6 @@ namespace rml::roblox::internals
 
 		DataModelCapabilities datamodel_caps(module_base, studio_module.size(), datamodel_layout->type_offset);
 
-		auto instance_candidates =
-			memory::rtti::Scanner::get_class_rtti_candidates("RBX::Instance");
-		if (instance_candidates.empty())
-		{
-			instance_candidates =
-				memory::rtti::Scanner::get_class_rtti_candidates("class RBX::Instance");
-		}
-		if (instance_candidates.empty())
-		{
-			return std::unexpected(CompatibilityError{
-				.capability = "Instance.RTTI",
-				.failure = CompatibilityFailure::missing_signature,
-			});
-		}
 		std::vector<std::uintptr_t> instance_vfts;
 		std::vector<std::uintptr_t> instance_vft_entries;
 		for (const auto& candidate : instance_candidates)
@@ -526,14 +615,53 @@ namespace rml::roblox::internals
 				.failure = CompatibilityFailure::invalid_address_range,
 			});
 		}
+		std::ranges::sort(job_vfts);
+		job_vfts.erase(std::ranges::unique(job_vfts).begin(), job_vfts.end());
+		std::vector<std::uintptr_t> waiting_job_step_addresses;
+		for (const auto vft : job_vfts)
+		{
+			const auto entry_address =
+				vft + rml::JobVtable::kWaitingHybridScriptsExecutionStepIndex *
+					sizeof(std::uintptr_t);
+			if (!module_contains(entry_address, sizeof(std::uintptr_t)))
+				continue;
+			std::uintptr_t step_address = 0;
+			std::memcpy(
+				&step_address,
+				reinterpret_cast<const void*>(entry_address),
+				sizeof(step_address));
+			if (step_address >= text_address && step_address < text_address + code.size())
+				waiting_job_step_addresses.push_back(step_address);
+		}
+		std::ranges::sort(waiting_job_step_addresses);
+		waiting_job_step_addresses.erase(
+			std::ranges::unique(waiting_job_step_addresses).begin(),
+			waiting_job_step_addresses.end());
+		if (waiting_job_step_addresses.size() != 1)
+		{
+			return std::unexpected(CompatibilityError{
+				.capability = "Job.DataModelAccessor",
+				.failure = waiting_job_step_addresses.empty()
+					? CompatibilityFailure::missing_signature
+					: CompatibilityFailure::ambiguous_evidence,
+			});
+		}
 		LOG_INFO("Resolving Roblox internals: job layout");
 		auto job_layout = resolve_job_layout(
-			code, text_address, runtime_function_table, module_base, job_vfts);
+			code,
+			text_address,
+			runtime_function_table,
+			module_base,
+			job_vfts,
+			waiting_job_step_addresses.front(),
+			datamodel_instance_base_offsets.front());
 		if (!job_layout)
 			return std::unexpected(job_layout.error());
 		LOG_INFO("Resolved Roblox internals: job layout");
 		JobCapabilities job_caps(
-			job_layout->waiting_scripts_job_script_context_offset);
+			job_layout->waiting_scripts_job_script_context_offset,
+			reinterpret_cast<JobCapabilities::DataModelAccessor>(
+				job_layout->waiting_scripts_job_data_model_accessor));
 
 		auto reflection_layout = reflection_future
 			? reflection_future->get()

@@ -588,24 +588,33 @@ int main()
 			return 14;
 		}
 	}
-	// 15. JobCapabilities only owns WaitingHybridScriptsJob context access.
+	// 15. JobCapabilities owns WaitingHybridScriptsJob context and DataModel access.
 	{
-		rml::roblox::internals::JobCapabilities job_caps(0x1F8);
+		const auto data_model_accessor = +[](RBX::ScriptContext* script_context) -> RBX::DataModel* {
+			return reinterpret_cast<RBX::DataModel*>(
+				reinterpret_cast<std::uint8_t*>(script_context) + 0x10);
+		};
+		rml::roblox::internals::JobCapabilities job_caps(0x1F8, data_model_accessor);
 
 		alignas(16) std::uint8_t dummy_job_buffer[0x200]{};
 		*reinterpret_cast<void**>(dummy_job_buffer + 0x1F8) = dummy_job_buffer + 0x20;
 
 		const auto* waiting_job = reinterpret_cast<const RBX::ScriptContextFacets::WaitingHybridScriptsJob*>(dummy_job_buffer);
 		const auto derived_ctx = job_caps.get_script_context(waiting_job);
-		if (derived_ctx != reinterpret_cast<RBX::ScriptContext*>(dummy_job_buffer + 0x20))
+		const auto derived_data_model = job_caps.get_data_model(waiting_job);
+		if (derived_ctx != reinterpret_cast<RBX::ScriptContext*>(dummy_job_buffer + 0x20) ||
+			derived_data_model != reinterpret_cast<RBX::DataModel*>(dummy_job_buffer + 0x30))
 		{
-			std::cerr << "Test 15 failed: WaitingHybridScriptsJob context access\n";
+			std::cerr << "Test 15 failed: WaitingHybridScriptsJob capability access\n";
 			return 18;
 		}
 
-		if (job_caps.get_script_context(nullptr) != nullptr)
+		rml::roblox::internals::JobCapabilities no_accessor(0x1F8, nullptr);
+		if (job_caps.get_script_context(nullptr) != nullptr ||
+			job_caps.get_data_model(nullptr) != nullptr ||
+			no_accessor.get_data_model(waiting_job) != nullptr)
 		{
-			std::cerr << "Test 15 failed: null WaitingHybridScriptsJob did not return nullptr\n";
+			std::cerr << "Test 15 failed: unavailable WaitingHybridScriptsJob capability did not return nullptr\n";
 			return 18;
 		}
 	}

@@ -16,7 +16,8 @@ namespace rml::jobs {
     }
 
     bool LuauWaitingScriptJob::should_execute_impl(const JobExecutionContext &context) noexcept {
-        const auto data_model = RBX::DataModel::from_job(context.job_as<RBX::DataModelJob>());
+        const auto data_model = RBX::DataModel::from_job(
+            context.job_as<RBX::ScriptContextFacets::WaitingHybridScriptsJob>());
         if (!data_model) {
             return false;
         }

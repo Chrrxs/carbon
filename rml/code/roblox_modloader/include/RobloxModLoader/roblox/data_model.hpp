@@ -8,8 +8,8 @@
 #include "job_types.hpp"
 
 
-namespace RBX {
-    class DataModelJob;
+namespace RBX::ScriptContextFacets {
+    class WaitingHybridScriptsJob;
 }
 
 namespace RBX {
@@ -30,6 +30,6 @@ namespace RBX {
         // than this Instance address.
         std::expected<void*, rml::roblox::internals::CompatibilityError> get_task_context() const noexcept;
 
-        static DataModel *from_job(const DataModelJob *job, const rml::roblox::internals::RobloxInternalsProfile* profile = nullptr);
+        static DataModel *from_job(const ScriptContextFacets::WaitingHybridScriptsJob *job, const rml::roblox::internals::RobloxInternalsProfile* profile = nullptr);
     };
 }
