@@ -476,6 +476,10 @@ namespace
 			return rtti_index;
 
 		std::unordered_map<std::uint64_t, OfflineRTTILocatorInfo> locator_infos;
+		std::size_t locator_reserve = 0;
+		for (const auto* sec : rdata_secs)
+			locator_reserve += sec->virtual_size / 96;
+		locator_infos.reserve(locator_reserve);
 		std::uint64_t minimum_locator_address =
 			(std::numeric_limits<std::uint64_t>::max)();
 		std::uint64_t maximum_locator_address = 0;
