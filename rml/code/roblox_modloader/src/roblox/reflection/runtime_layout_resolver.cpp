@@ -640,16 +640,22 @@ namespace rml::roblox::internals
 		add_family(vft_sets.callback_vfts, callback_family);
 		add_family(vft_sets.class_descriptor_vfts, class_family);
 
-
+		const auto* code_bytes = reinterpret_cast<const std::uint8_t*>(executable_code.data());
 		std::size_t cursor = 0;
 		while (cursor + 7 <= executable_code.size())
 		{
-			const auto* bytes = reinterpret_cast<const std::uint8_t*>(executable_code.data() + cursor);
-			if ((bytes[0] & 0xF8) != 0x48 ||
-				bytes[1] != 0x8D ||
-				(bytes[2] & 0xC7) != 0x05)
+			const auto* opcode = static_cast<const std::uint8_t*>(
+				std::memchr(code_bytes + cursor + 1, 0x8D, executable_code.size() - cursor - 1));
+			if (opcode == nullptr)
+				break;
+			const auto opcode_offset = static_cast<std::size_t>(opcode - code_bytes);
+			if (executable_code.size() - opcode_offset < 6)
+				break;
+			cursor = opcode_offset - 1;
+			const auto* bytes = code_bytes + cursor;
+			if ((bytes[0] & 0xF8) != 0x48 || (bytes[2] & 0xC7) != 0x05)
 			{
-				++cursor;
+				cursor += 2;
 				continue;
 			}
 			std::int32_t displacement = 0;
