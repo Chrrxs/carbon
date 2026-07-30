@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -475,6 +476,9 @@ namespace
 			return rtti_index;
 
 		std::unordered_map<std::uint64_t, OfflineRTTILocatorInfo> locator_infos;
+		std::uint64_t minimum_locator_address =
+			(std::numeric_limits<std::uint64_t>::max)();
+		std::uint64_t maximum_locator_address = 0;
 		for (const auto* sec : rdata_secs)
 		{
 			if (sec->virtual_size < sizeof(CompleteObjectLocator))
@@ -540,9 +544,18 @@ namespace
 					}
 				}
 
-				locator_infos.emplace(pe.image_base + rva, std::move(info));
+				const auto locator_address = pe.image_base + rva;
+				if (locator_infos.emplace(locator_address, std::move(info)).second)
+				{
+					minimum_locator_address = (std::min)(
+						minimum_locator_address, locator_address);
+					maximum_locator_address = (std::max)(
+						maximum_locator_address, locator_address);
+				}
 			}
 		}
+		if (locator_infos.empty())
+			return rtti_index;
 
 		for (const auto* sec : rdata_secs)
 		{
@@ -554,6 +567,12 @@ namespace
 			{
 				std::uint64_t value = 0;
 				std::memcpy(&value, pe.rva_to_ptr(rva), sizeof(value));
+				if (value < minimum_locator_address ||
+					value > maximum_locator_address ||
+					(value & 0x3) != 0)
+				{
+					continue;
+				}
 				const auto locator = locator_infos.find(value);
 				if (locator != locator_infos.end())
 				{
