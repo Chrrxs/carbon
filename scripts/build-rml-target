@@ -13,6 +13,9 @@ fi
 target="$1"
 build_dir="$CARBON_RML_CMAKE_BUILD_DIR"
 
+if [[ "$build_dir" =~ ^/mnt/[A-Za-z]/ ]]; then
+	build_dir="$(wslpath -w "$build_dir")"
+fi
 if [[ "$build_dir" =~ ^[A-Za-z]:[\\/] ]]; then
 	windows_script="$(wslpath -w "${BASH_SOURCE[0]}.ps1")"
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$windows_script" -BuildDir "$build_dir" -Target "$target"

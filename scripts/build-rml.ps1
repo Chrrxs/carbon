@@ -178,27 +178,80 @@ function Resolve-Ninja {
     throw "Ninja was not found in Visual Studio or on PATH"
 }
 
-function ConvertTo-LocalDrivePath {
+function Normalize-WindowsPathSpelling {
     param(
         [Parameter(Mandatory = $true)]
         [string] $Path
     )
 
+    $normalized = [IO.Path]::GetFullPath($Path.Replace('/', '\')).TrimEnd('\')
+    if ($normalized -match '^\\\\wsl(?:\.localhost|\$)\\([^\\]+)(.*)$') {
+        return "\\wsl.localhost\$($Matches[1].ToLowerInvariant())$($Matches[2])"
+    }
+    return $normalized
+}
+
+function ConvertTo-CanonicalWindowsPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Role
+    )
+
+    if ($Path -match '^/') {
+        throw "$Role must be a Windows path, not a WSL path: $Path"
+    }
     $resolved = if (Test-Path -LiteralPath $Path) {
         (Resolve-Path -LiteralPath $Path).ProviderPath
     } else {
-        $Path
+        [IO.Path]::GetFullPath($Path)
     }
-    foreach ($drive in Get-PSDrive -PSProvider FileSystem) {
-        if ([string]::IsNullOrWhiteSpace($drive.DisplayRoot)) {
-            continue
-        }
-        $root = $drive.DisplayRoot.TrimEnd('\')
-        if ($resolved.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-            return (Join-Path $drive.Root $resolved.Substring($root.Length).TrimStart('\'))
-        }
+    return Normalize-WindowsPathSpelling $resolved
+}
+
+function Get-CMakeCacheValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Cache,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Key
+    )
+
+    $prefix = "${Key}:"
+    $line = [IO.File]::ReadLines($Cache) |
+        Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) } |
+        Select-Object -First 1
+    if ($null -eq $line) {
+        throw "CMake cache is missing $Key`: $Cache"
     }
-    return $resolved
+    return $line.Substring($line.IndexOf('=') + 1)
+}
+
+function Assert-CMakeCacheIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $BuildDir,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SourceDir
+    )
+
+    $cache = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache -PathType Leaf)) {
+        return
+    }
+    $generator = Get-CMakeCacheValue -Cache $cache -Key "CMAKE_GENERATOR"
+    if ($generator -ne "Ninja") {
+        throw "persistent RML CMake cache uses '$generator', expected Ninja: $cache"
+    }
+    $cachedSource = Normalize-WindowsPathSpelling (
+        Get-CMakeCacheValue -Cache $cache -Key "CMAKE_HOME_DIRECTORY")
+    if (-not $cachedSource.Equals($SourceDir, [StringComparison]::Ordinal)) {
+        throw "persistent RML CMake cache source mismatch: cached '$cachedSource', expected '$SourceDir'. Configure a fresh build directory."
+    }
 }
 
 function Find-OneBuildFile {
@@ -225,9 +278,9 @@ function Find-OneBuildFile {
     return $files[0].FullName
 }
 
-$SourceDir = ConvertTo-LocalDrivePath $SourceDir
-$BuildDir = ConvertTo-LocalDrivePath $BuildDir
-$PackageDir = ConvertTo-LocalDrivePath $PackageDir
+$SourceDir = ConvertTo-CanonicalWindowsPath -Path $SourceDir -Role "SourceDir"
+$BuildDir = ConvertTo-CanonicalWindowsPath -Path $BuildDir -Role "BuildDir"
+$PackageDir = ConvertTo-CanonicalWindowsPath -Path $PackageDir -Role "PackageDir"
 if ($BuildVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$') {
     throw "invalid automatic build version: $BuildVersion"
 }
@@ -239,6 +292,7 @@ if ($NativeOnly -and -not (Test-Path -LiteralPath $BuildDir -PathType Container)
     throw "BuildDir does not exist for native-only mode: $BuildDir. Run full mode first."
 }
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+Assert-CMakeCacheIdentity -BuildDir $BuildDir -SourceDir $SourceDir
 
 $stage = Join-Path $BuildDir "qualification-stage"
 $stageRml = Join-Path $stage "RobloxModLoader"

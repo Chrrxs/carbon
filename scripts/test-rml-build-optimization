@@ -29,6 +29,24 @@ if grep -Eq -- '(^|[[:space:]])(-S|-B|--fresh|--clean-first)([[:space:]]|$)|New-
 	failure=1
 fi
 
+if ! grep -Fq -- 'CMAKE_HOME_DIRECTORY' "$TARGET_BUILDER_PS" ||
+	! grep -Fq -- "expected Ninja" "$TARGET_BUILDER_PS" ||
+	! grep -Fq -- "source mismatch" "$TARGET_BUILDER_PS" ||
+	! grep -Fq -- '[IO.Path]::GetFullPath' "$TARGET_BUILDER_PS" ||
+	! grep -Fq -- 'VsDevCmd.bat' "$TARGET_BUILDER_PS" ||
+	! grep -Fq -- '$env:INCLUDE' "$TARGET_BUILDER_PS" ||
+	! grep -Fq -- 'Resolve-CMake' "$TARGET_BUILDER_PS" ||
+	! grep -Fq -- 'wslpath -w "$build_dir"' "$TARGET_BUILDER"; then
+	echo "FAIL: incremental RML target builder does not normalize WSL paths, validate its Ninja cache, and initialize MSVC/CMake" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'ConvertTo-CanonicalWindowsPath' "$BUILD_SCRIPT" ||
+	! grep -Fq -- 'Assert-CMakeCacheIdentity' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML configure entrypoint does not canonicalize Windows paths and guard cache identity" >&2
+	failure=1
+fi
+
 if CARBON_RML_CMAKE_BUILD_DIR="${SCRIPT_DIR}/definitely-missing-cmake-build" \
 	"$TARGET_BUILDER" roblox_modloader >/dev/null 2>&1; then
 	echo "FAIL: incremental RML target builder accepted a directory without CMakeCache.txt" >&2
