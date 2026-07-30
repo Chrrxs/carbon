@@ -130,43 +130,44 @@ namespace rml::roblox::internals
 			}
 			const auto xref_rva = static_cast<std::uint32_t>(xref_address - module_address);
 
-			std::optional<FunctionBounds> matched;
-			for (std::size_t offset = 0;
-				 offset < runtime_function_table.size();
-				 offset += sizeof(RuntimeFunctionEntry))
+			const auto entries = std::span(
+				reinterpret_cast<const RuntimeFunctionEntry*>(runtime_function_table.data()),
+				runtime_function_table.size() / sizeof(RuntimeFunctionEntry));
+			std::size_t first = 0;
+			std::size_t last = entries.size();
+			while (first < last)
 			{
-				RuntimeFunctionEntry entry{};
-				std::memcpy(&entry, runtime_function_table.data() + offset, sizeof(entry));
-				if (entry.begin_address == 0 && entry.end_address == 0 && entry.unwind_info_address == 0)
-					continue;
-				if (entry.begin_address >= entry.end_address)
-					return std::unexpected(CompatibilityFailure::invalid_address_range);
-				if (xref_rva < entry.begin_address || xref_rva >= entry.end_address)
-					continue;
-
-				std::uintptr_t function_begin = 0;
-				std::uintptr_t function_end = 0;
-				if (!checked_add(module_address, entry.begin_address, function_begin) ||
-					!checked_add(module_address, entry.end_address, function_end) ||
-					function_begin < code_address ||
-					function_end > code_address + code.size() ||
-					function_begin >= function_end)
-				{
-					return std::unexpected(CompatibilityFailure::invalid_address_range);
-				}
-
-				const FunctionBounds candidate{
-					.begin = static_cast<std::size_t>(function_begin - code_address),
-					.end = static_cast<std::size_t>(function_end - code_address),
-				};
-				if (matched && *matched != candidate)
-					return std::unexpected(CompatibilityFailure::ambiguous_evidence);
-				matched = candidate;
+				const auto middle = first + (last - first) / 2;
+				if (entries[middle].begin_address <= xref_rva)
+					first = middle + 1;
+				else
+					last = middle;
 			}
-
-			if (!matched)
+			if (first == 0)
 				return std::unexpected(CompatibilityFailure::missing_signature);
-			return *matched;
+
+			const auto& entry = entries[first - 1];
+			if (entry.begin_address == 0 && entry.end_address == 0 && entry.unwind_info_address == 0)
+				return std::unexpected(CompatibilityFailure::missing_signature);
+			if (entry.begin_address >= entry.end_address)
+				return std::unexpected(CompatibilityFailure::invalid_address_range);
+			if (xref_rva < entry.begin_address || xref_rva >= entry.end_address)
+				return std::unexpected(CompatibilityFailure::missing_signature);
+
+			std::uintptr_t function_begin = 0;
+			std::uintptr_t function_end = 0;
+			if (!checked_add(module_address, entry.begin_address, function_begin) ||
+				!checked_add(module_address, entry.end_address, function_end) ||
+				function_begin < code_address ||
+				function_end > code_address + code.size() ||
+				function_begin >= function_end)
+			{
+				return std::unexpected(CompatibilityFailure::invalid_address_range);
+			}
+			return FunctionBounds{
+				.begin = static_cast<std::size_t>(function_begin - code_address),
+				.end = static_cast<std::size_t>(function_end - code_address),
+			};
 		}
 
 		struct PatternByte
@@ -641,12 +642,21 @@ namespace rml::roblox::internals
 
 
 		std::size_t cursor = 0;
-		while (cursor + 5 <= executable_code.size())
+		while (cursor + 7 <= executable_code.size())
 		{
 			const auto* bytes = reinterpret_cast<const std::uint8_t*>(executable_code.data() + cursor);
 			if ((bytes[0] & 0xF8) != 0x48 ||
 				bytes[1] != 0x8D ||
 				(bytes[2] & 0xC7) != 0x05)
+			{
+				++cursor;
+				continue;
+			}
+			std::int32_t displacement = 0;
+			std::memcpy(&displacement, bytes + 3, sizeof(displacement));
+			std::uintptr_t target = 0;
+			if (!checked_add(code_address + cursor + 7, displacement, target) ||
+				!vft_families.contains(target))
 			{
 				++cursor;
 				continue;
@@ -1820,12 +1830,22 @@ namespace rml::roblox::internals
 		}
 
 		std::size_t cursor = 0;
-		while (cursor + 5 <= executable_code.size())
+		while (cursor + 7 <= executable_code.size())
 		{
 			const auto* bytes = reinterpret_cast<const std::uint8_t*>(executable_code.data() + cursor);
 			if ((bytes[0] & 0xF8) != 0x48 ||
 				bytes[1] != 0x8D ||
 				(bytes[2] & 0xC7) != 0x05)
+			{
+				++cursor;
+				continue;
+			}
+			std::int32_t displacement = 0;
+			std::memcpy(&displacement, bytes + 3, sizeof(displacement));
+			std::uintptr_t target = 0;
+			if (!checked_add(code_address + cursor + 7, displacement, target) ||
+				std::find(instance_vft_addresses.begin(), instance_vft_addresses.end(), target) ==
+					instance_vft_addresses.end())
 			{
 				++cursor;
 				continue;

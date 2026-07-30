@@ -314,6 +314,16 @@ namespace rml::roblox::internals
 				++cursor;
 				continue;
 			}
+			std::int32_t displacement = 0;
+			std::memcpy(&displacement, bytes + 3, sizeof(displacement));
+			std::uintptr_t target = 0;
+			if (!checked_add(code_address + cursor + 7, displacement, target) ||
+				std::find(datamodel_vft_addresses.begin(), datamodel_vft_addresses.end(), target) ==
+					datamodel_vft_addresses.end())
+			{
+				++cursor;
+				continue;
+			}
 			ZydisDecodedInstruction instruction{};
 			ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
 			if (!decode_at(
