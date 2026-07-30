@@ -597,9 +597,9 @@ namespace rml::roblox::internals
 		DerivedField field_func_this_delta;
 		DerivedField field_callback_sig;
 		DerivedField field_callback_async;
-		DerivedField field_event_signal;
 
 		std::optional<std::array<std::ptrdiff_t, 5>> class_containers;
+		DerivedField field_container_storage;
 		DerivedField field_base_class;
 		DerivedField field_class_func;
 		std::size_t class_decoded_candidates = 0;
@@ -1226,62 +1226,10 @@ namespace rml::roblox::internals
 				}
 			}
 
-			// 6. EventDescriptor fields:
-			if (is_event_vft)
-			{
-				std::size_t event_vft_store_index = func_instructions.size();
-				ZydisRegister event_vft_register = ZYDIS_REGISTER_NONE;
-				for (std::size_t i = 0; i < func_instructions.size(); ++i)
-				{
-					const auto& dinst = func_instructions[i];
-					if (win_ops_has_strict_vft_lea(
-							dinst.inst, dinst.operands.data(), code_address + dinst.offset,
-							vft_sets.event_vfts))
-					{
-						event_vft_register = dinst.operands[0].reg.value;
-						continue;
-					}
-					if (event_vft_register != ZYDIS_REGISTER_NONE &&
-						dinst.inst.mnemonic == ZYDIS_MNEMONIC_MOV &&
-						dinst.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-						dinst.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-						dinst.operands[1].reg.value == event_vft_register)
-					{
-						event_vft_store_index = i;
-						break;
-					}
-				}
-
-				std::vector<std::ptrdiff_t> constructed_signals;
-				for (std::size_t i = event_vft_store_index + 1;
-					 i < func_instructions.size() && event_vft_store_index < func_instructions.size();
-					 ++i)
-				{
-					const auto& dinst = func_instructions[i];
-					if (dinst.inst.mnemonic != ZYDIS_MNEMONIC_LEA ||
-						dinst.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-						dinst.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
-						dinst.operands[1].mem.base != this_reg ||
-						!dinst.operands[1].mem.disp.has_displacement)
-					{
-						continue;
-					}
-
-					const auto disp = static_cast<std::ptrdiff_t>(dinst.operands[1].mem.disp.value);
-					if (disp > 0)
-						constructed_signals.push_back(disp);
-				}
-				std::sort(constructed_signals.begin(), constructed_signals.end());
-				constructed_signals.erase(
-					std::unique(constructed_signals.begin(), constructed_signals.end()),
-					constructed_signals.end());
-				if (constructed_signals.size() == 1)
-					field_event_signal.add_candidate(constructed_signals.front());
-			}
 			// 7. ClassDescriptor fields:
 			if (is_class_vft)
 			{
-				std::vector<std::ptrdiff_t> raw_vector_offsets;
+				std::vector<std::pair<std::ptrdiff_t, std::ptrdiff_t>> raw_container_candidates;
 
 				std::vector<std::vector<ZydisRegister>> zero_state_at_inst(func_instructions.size());
 				{
@@ -1293,10 +1241,27 @@ namespace rml::roblox::internals
 						bool is_zero_producer = false;
 						ZydisRegister zero_producer_reg = ZYDIS_REGISTER_NONE;
 
+						if (dinst.inst.mnemonic == ZYDIS_MNEMONIC_CALL)
+						{
+							constexpr std::array volatile_registers{
+								ZYDIS_REGISTER_RAX,
+								ZYDIS_REGISTER_RCX,
+								ZYDIS_REGISTER_RDX,
+								ZYDIS_REGISTER_R8,
+								ZYDIS_REGISTER_R9,
+								ZYDIS_REGISTER_R10,
+								ZYDIS_REGISTER_R11,
+							};
+							for (const auto reg : volatile_registers)
+								std::erase(active_zero_regs, reg);
+						}
+
 						if ((dinst.inst.mnemonic == ZYDIS_MNEMONIC_XOR || dinst.inst.mnemonic == ZYDIS_MNEMONIC_SUB) &&
 							dinst.inst.operand_count >= 2 &&
 							dinst.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-							dinst.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+							dinst.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+							dinst.operands[0].size >= 32 &&
+							dinst.operands[1].size >= 32)
 						{
 							const auto r0 = to_gpr32(dinst.operands[0].reg.value);
 							const auto r1 = to_gpr32(dinst.operands[1].reg.value);
@@ -1310,7 +1275,8 @@ namespace rml::roblox::internals
 								 dinst.inst.operand_count >= 2 &&
 								 dinst.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 								 dinst.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-								 dinst.operands[1].imm.value.u == 0)
+								 dinst.operands[1].imm.value.u == 0 &&
+								 dinst.operands[0].size >= 32)
 						{
 							const auto r0 = to_gpr32(dinst.operands[0].reg.value);
 							if (r0 != ZYDIS_REGISTER_NONE)
@@ -1365,8 +1331,20 @@ namespace rml::roblox::internals
 
 					if (temp_reg != ZYDIS_REGISTER_NONE && cand_disp > 0)
 					{
-						bool store_0 = false, store_8 = false, store_10 = false;
+						std::vector<std::ptrdiff_t> zero_store_offsets;
 						const std::size_t lookahead_limit = std::min(func_instructions.size(), i + 32);
+
+						auto source_is_zero = [&](const DecodedInst& candidate, const std::size_t index) {
+							if (candidate.operands[0].size != 64)
+								return false;
+							if (candidate.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+								return candidate.operands[1].imm.value.u == 0;
+							if (candidate.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+								return false;
+							const auto value_reg = to_gpr32(candidate.operands[1].reg.value);
+							const auto& valid_zeros = zero_state_at_inst[index];
+							return std::find(valid_zeros.begin(), valid_zeros.end(), value_reg) != valid_zeros.end();
+						};
 
 						for (std::size_t j = i + 1; j < lookahead_limit; ++j)
 						{
@@ -1381,44 +1359,96 @@ namespace rml::roblox::internals
 
 							if (sub_inst.inst.mnemonic == ZYDIS_MNEMONIC_MOV &&
 								sub_inst.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-								sub_inst.operands[0].mem.base == temp_reg)
+								sub_inst.operands[0].mem.base == temp_reg &&
+								source_is_zero(sub_inst, j))
 							{
-								const auto off = sub_inst.operands[0].mem.disp.has_displacement ? sub_inst.operands[0].mem.disp.value : 0;
-								bool is_zero_store = false;
+								zero_store_offsets.push_back(
+									sub_inst.operands[0].mem.disp.has_displacement
+										? static_cast<std::ptrdiff_t>(sub_inst.operands[0].mem.disp.value)
+										: 0);
+							}
 
-								if (sub_inst.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && sub_inst.operands[1].imm.value.u == 0)
-								{
-									is_zero_store = true;
-								}
-								else if (sub_inst.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
-								{
-									const auto val_reg = to_gpr32(sub_inst.operands[1].reg.value);
-									const auto& valid_zeros = zero_state_at_inst[j];
-									if (std::find(valid_zeros.begin(), valid_zeros.end(), val_reg) != valid_zeros.end())
-									{
-										is_zero_store = true;
-									}
-								}
+							if (sub_inst.inst.mnemonic != ZYDIS_MNEMONIC_LEA ||
+								sub_inst.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+								sub_inst.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
+								sub_inst.operands[1].mem.base != temp_reg ||
+								!sub_inst.operands[1].mem.disp.has_displacement)
+							{
+								continue;
+							}
 
-								if (is_zero_store || sub_inst.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY)
+							const auto alias_reg = sub_inst.operands[0].reg.value;
+							const auto alias_disp =
+								static_cast<std::ptrdiff_t>(sub_inst.operands[1].mem.disp.value);
+							const auto alias_limit = std::min(lookahead_limit, j + 8);
+							for (std::size_t k = j + 1; k < alias_limit; ++k)
+							{
+								const auto& alias_inst = func_instructions[k];
+								if (alias_inst.inst.mnemonic == ZYDIS_MNEMONIC_MOV &&
+									alias_inst.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+									alias_inst.operands[0].mem.base == alias_reg &&
+									source_is_zero(alias_inst, k))
 								{
-									if (off == 0) store_0 = true;
-									else if (off == 8) store_8 = true;
-									else if (off == 0x10) store_10 = true;
+									const auto alias_store_disp =
+										alias_inst.operands[0].mem.disp.has_displacement
+											? static_cast<std::ptrdiff_t>(alias_inst.operands[0].mem.disp.value)
+											: 0;
+									zero_store_offsets.push_back(alias_disp + alias_store_disp);
+									break;
+								}
+								if (alias_inst.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+									alias_inst.operands[0].reg.value == alias_reg)
+								{
+									break;
 								}
 							}
 						}
 
-						if (store_0 && store_8 && store_10)
+						std::sort(zero_store_offsets.begin(), zero_store_offsets.end());
+						zero_store_offsets.erase(
+							std::unique(zero_store_offsets.begin(), zero_store_offsets.end()),
+							zero_store_offsets.end());
+						const auto has_store = [&](const std::ptrdiff_t offset) {
+							return std::binary_search(
+								zero_store_offsets.begin(),
+								zero_store_offsets.end(),
+								offset);
+						};
+						std::ptrdiff_t storage_offset = -1;
+						if (has_store(0) && has_store(8) && has_store(0x10))
 						{
-							raw_vector_offsets.push_back(cand_disp);
+							for (const auto offset : zero_store_offsets)
+							{
+								if (offset > 0x10 && has_store(offset + 8) && has_store(offset + 0x10))
+								{
+									storage_offset = offset;
+									break;
+								}
+							}
 						}
+						if (storage_offset > 0)
+							raw_container_candidates.emplace_back(cand_disp, storage_offset);
 					}
 				}
 
-				std::sort(raw_vector_offsets.begin(), raw_vector_offsets.end());
-				raw_vector_offsets.erase(std::unique(raw_vector_offsets.begin(), raw_vector_offsets.end()), raw_vector_offsets.end());
-				class_decoded_candidates += raw_vector_offsets.size();
+				std::sort(raw_container_candidates.begin(), raw_container_candidates.end());
+				raw_container_candidates.erase(
+					std::unique(raw_container_candidates.begin(), raw_container_candidates.end()),
+					raw_container_candidates.end());
+				std::vector<std::ptrdiff_t> raw_vector_offsets;
+				for (const auto& [container_offset, storage_offset] : raw_container_candidates)
+				{
+					if (!raw_vector_offsets.empty() && raw_vector_offsets.back() == container_offset)
+					{
+						return std::unexpected(CompatibilityError{
+							.capability = "Reflection.MemberTable.Storage",
+							.failure = CompatibilityFailure::ambiguous_evidence,
+							.matched_calls = matched_calls,
+						});
+					}
+					raw_vector_offsets.push_back(container_offset);
+				}
+				class_decoded_candidates += raw_container_candidates.size();
 
 				std::vector<std::array<std::ptrdiff_t, 5>> valid_runs;
 				if (raw_vector_offsets.size() >= 5)
@@ -1463,6 +1493,25 @@ namespace rml::roblox::internals
 						});
 					}
 					class_containers = valid_runs[0];
+					std::ptrdiff_t storage_offset = -1;
+					for (const auto container_offset : valid_runs[0])
+					{
+						const auto candidate = std::find_if(
+							raw_container_candidates.begin(),
+							raw_container_candidates.end(),
+							[&](const auto& entry) { return entry.first == container_offset; });
+						if (candidate == raw_container_candidates.end() ||
+							(storage_offset != -1 && storage_offset != candidate->second))
+						{
+							return std::unexpected(CompatibilityError{
+								.capability = "Reflection.MemberTable.Storage",
+								.failure = CompatibilityFailure::ambiguous_evidence,
+								.matched_calls = matched_calls,
+							});
+						}
+						storage_offset = candidate->second;
+					}
+					field_container_storage.add_candidate(storage_offset);
 				}
 				else if (valid_runs.size() > 1)
 				{
@@ -1585,7 +1634,7 @@ namespace rml::roblox::internals
 
 		if (class_only)
 		{
-			if (field_base_class.has_conflict || field_class_func.has_conflict)
+			if (field_base_class.has_conflict || field_class_func.has_conflict || field_container_storage.has_conflict)
 			{
 				return std::unexpected(CompatibilityError{
 					.capability = capability_name,
@@ -1600,6 +1649,14 @@ namespace rml::roblox::internals
 					.failure = CompatibilityFailure::insufficient_evidence,
 					.matched_calls = matched_calls,
 					.decoded_candidates = class_decoded_candidates,
+				});
+			}
+			if (field_container_storage.val <= 0)
+			{
+				return std::unexpected(CompatibilityError{
+					.capability = "Reflection.MemberTable.Storage",
+					.failure = CompatibilityFailure::insufficient_evidence,
+					.matched_calls = matched_calls,
 				});
 			}
 			if (field_base_class.val == -1)
@@ -1618,8 +1675,11 @@ namespace rml::roblox::internals
 					.matched_calls = matched_calls,
 				});
 			}
+			auto container_offsets = *class_containers;
+			for (auto& offset : container_offsets)
+				offset += field_container_storage.val;
 			return ReflectionLayoutEvidence{
-				.descriptor_container_offsets = *class_containers,
+				.descriptor_container_offsets = container_offsets,
 				.base_class_offset = field_base_class.val,
 				.functionality_offset = field_class_func.val,
 				.supporting_calls = matched_calls,
@@ -1658,9 +1718,12 @@ namespace rml::roblox::internals
 		check_field(field_func_this_delta.has_conflict, field_func_this_delta.val == -1, "Reflection.Function.ThisDelta");
 		check_field(field_callback_sig.has_conflict, field_callback_sig.val == -1, "Reflection.Callback.Signature");
 		check_field(field_callback_async.has_conflict, field_callback_async.val == -1, "Reflection.Callback.Async");
-		check_field(field_event_signal.has_conflict, field_event_signal.val == -1, "Reflection.Event.Signal");
 		check_field(field_base_class.has_conflict, field_base_class.val == -1, "Reflection.Class.Base");
 		check_field(field_class_func.has_conflict, field_class_func.val == -1, "Reflection.Class.Functionality");
+		check_field(
+			field_container_storage.has_conflict,
+			field_container_storage.val <= 0,
+			"Reflection.MemberTable.Storage");
 		if (!class_containers)
 		{
 			collected_errors.push_back(CompatibilityError{
@@ -1679,9 +1742,12 @@ namespace rml::roblox::internals
 			return std::unexpected(collected_errors.front());
 		}
 
+		auto container_offsets = *class_containers;
+		for (auto& offset : container_offsets)
+			offset += field_container_storage.val;
 		return ReflectionLayoutEvidence{
 			.name_offset = field_name.val,
-			.descriptor_container_offsets = *class_containers,
+			.descriptor_container_offsets = container_offsets,
 			.base_class_offset = field_base_class.val,
 			.functionality_offset = field_class_func.val,
 			.owner_offset = field_owner.val,
@@ -1694,7 +1760,6 @@ namespace rml::roblox::internals
 			.function_bound_this_delta_offset = field_func_this_delta.val,
 			.callback_signature_offset = field_callback_sig.val,
 			.callback_async_flag_offset = field_callback_async.val,
-			.event_signal_offset = field_event_signal.val,
 			.supporting_calls = matched_calls,
 			.matched_calls = matched_calls,
 		};
@@ -2490,7 +2555,7 @@ namespace rml::roblox::internals
 			std::vector<std::ptrdiff_t> one_dwords;
 			std::vector<std::ptrdiff_t> weak_increments;
 			auto finish_candidate = [&]() {
-				if (!has_allocation)
+				if (!has_allocation || candidate.event_signal <= 0)
 					return;
 				if (candidate.insert_helper == 0 || candidate.source <= 0 ||
 					candidate.wrapper < 0 ||
@@ -2511,6 +2576,7 @@ namespace rml::roblox::internals
 				candidate.weak = weak_candidates.front();
 				connect_candidates.push_back(candidate);
 			};
+			std::ptrdiff_t pending_event_signal{-1};
 			ZydisRegister pending_wrapper_base = ZYDIS_REGISTER_NONE;
 			ZydisRegister pending_wrapper_dest = ZYDIS_REGISTER_NONE;
 			std::size_t position = function_bounds->begin;
@@ -2530,7 +2596,8 @@ namespace rml::roblox::internals
 				}
 
 				if ((inst.mnemonic == ZYDIS_MNEMONIC_MOV ||
-					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSX) &&
+					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSX ||
+					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSXD) &&
 					inst.operand_count >= 2 &&
 					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
@@ -2549,7 +2616,8 @@ namespace rml::roblox::internals
 					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 					operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 					tracker.get_role(operands[0].reg.value) == RegRole::EventSignalField &&
-					tracker.get_role(operands[1].reg.value) == RegRole::Arg1)
+					(tracker.get_role(operands[1].reg.value) == RegRole::Arg1 ||
+					 tracker.get_role(operands[1].reg.value) == RegRole::Arg2))
 				{
 					const auto disp = tracker.get_imm(operands[0].reg.value);
 					tracker.set_role(operands[0].reg.value, RegRole::SignalAddress, disp);
@@ -2564,6 +2632,23 @@ namespace rml::roblox::internals
 					tracker.get_role(operands[1].mem.base) == RegRole::SignalAddress &&
 					(!operands[1].mem.disp.has_displacement || operands[1].mem.disp.value == 0))
 				{
+					const auto event_signal =
+						static_cast<std::ptrdiff_t>(tracker.get_imm(operands[1].mem.base));
+					if (pending_event_signal != -1 && pending_event_signal != event_signal)
+					{
+						decode_failed = true;
+						break;
+					}
+					pending_event_signal = event_signal;
+					if (has_allocation)
+					{
+						if (candidate.event_signal != -1 && candidate.event_signal != event_signal)
+						{
+							decode_failed = true;
+							break;
+						}
+						candidate.event_signal = event_signal;
+					}
 					tracker.set_role(
 						operands[0].reg.value,
 						RegRole::SignalObject,
@@ -2618,7 +2703,10 @@ namespace rml::roblox::internals
 						finish_candidate();
 						tracker.handle_call();
 						tracker.set_role(ZYDIS_REGISTER_RAX, RegRole::AllocatedSlot);
-						candidate = ConnectCandidate{.allocation_size = pending_allocation_size};
+						candidate = ConnectCandidate{
+							.event_signal = pending_event_signal,
+							.allocation_size = pending_allocation_size,
+						};
 						has_allocation = true;
 						insertion_seen = false;
 						one_dwords.clear();
@@ -2670,7 +2758,8 @@ namespace rml::roblox::internals
 								append_unique(one_dwords, disp);
 							if (operands[0].size == 64 && zero)
 								append_unique(candidate.zero_qwords, disp);
-							if (operands[0].size == 64 && !zero &&
+							if (operands[0].size == 64 &&
+								source_role == RegRole::SignalObject &&
 								disp == unlink_topology.source)
 							{
 								candidate.source = disp;
@@ -2814,6 +2903,7 @@ namespace rml::roblox::internals
 
 		struct CompleteCandidate
 		{
+			std::ptrdiff_t event_signal{-1};
 			std::ptrdiff_t head{-1};
 			std::ptrdiff_t strong{-1};
 			std::ptrdiff_t weak{-1};
@@ -2840,6 +2930,7 @@ namespace rml::roblox::internals
 				continue;
 			}
 			complete_candidates.push_back(CompleteCandidate{
+				.event_signal = connect.event_signal,
 				.head = insert->head,
 				.strong = insert->strong,
 				.weak = connect.weak,
@@ -2859,6 +2950,7 @@ namespace rml::roblox::internals
 		}
 
 		return SignalLayoutEvidence{
+			.event_signal_offset = resolved.event_signal,
 			.signal_head_offset = resolved.head,
 			.slot_strong_offset = resolved.strong,
 			.slot_weak_offset = resolved.weak,

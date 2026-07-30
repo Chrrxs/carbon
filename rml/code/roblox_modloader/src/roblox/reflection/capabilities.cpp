@@ -160,6 +160,43 @@ namespace
 			return std::nullopt;
 		return std::string_view{data, static_cast<std::size_t>(value.size)};
 	}
+
+	constexpr std::size_t descriptor_collection_entry_size = sizeof(std::uintptr_t) * 2;
+	constexpr std::size_t maximum_descriptor_collection_entries = 100000;
+
+	struct DescriptorCollectionView
+	{
+		std::uintptr_t entries;
+		std::size_t count;
+	};
+
+	std::optional<DescriptorCollectionView> descriptor_collection(
+		const void* descriptor,
+		const std::ptrdiff_t storage_offset) noexcept
+	{
+		const auto storage = field_address(
+			descriptor,
+			storage_offset,
+			sizeof(std::uintptr_t) * 3);
+		if (!storage)
+			return std::nullopt;
+
+		std::array<std::uintptr_t, 3> words{};
+		std::memcpy(words.data(), reinterpret_cast<const void*>(*storage), sizeof(words));
+		const auto entries = words[0];
+		const auto count = words[1];
+		const auto capacity = words[2];
+		if (count > capacity || count > maximum_descriptor_collection_entries)
+			return std::nullopt;
+		if (count == 0)
+			return DescriptorCollectionView{entries, 0};
+		if (!entries || (entries % alignof(void*)) != 0)
+			return std::nullopt;
+		const auto bytes = static_cast<std::size_t>(count) * descriptor_collection_entry_size;
+		if (!is_readable(reinterpret_cast<const void*>(entries), bytes))
+			return std::nullopt;
+		return DescriptorCollectionView{entries, static_cast<std::size_t>(count)};
+	}
 }
 
 namespace rml::roblox::internals
@@ -424,32 +461,23 @@ namespace rml::roblox::internals
 					return nullptr;
 			visited[depth++] = current;
 
-			const auto container = field_address(
-				current, m_descriptor_container_offsets[family_index], sizeof(std::uintptr_t) * 2);
-			if (container)
+			const auto collection = descriptor_collection(
+				current,
+				m_descriptor_container_offsets[family_index]);
+			if (collection)
 			{
-				std::uintptr_t first{};
-				std::uintptr_t last{};
-				std::memcpy(&first, reinterpret_cast<const void*>(*container), sizeof(first));
-				std::memcpy(&last, reinterpret_cast<const void*>(*container + sizeof(first)), sizeof(last));
-				constexpr std::size_t entry_size = sizeof(std::uintptr_t) * 2;
-				constexpr std::size_t maximum_entries = 10000;
-				if (first && last >= first && (first % alignof(void*)) == 0 && (last % alignof(void*)) == 0)
+				for (std::size_t index = 0; index < collection->count; ++index)
 				{
-					const auto bytes = last - first;
-					if ((bytes % entry_size) == 0 && bytes / entry_size <= maximum_entries &&
-						(bytes == 0 || is_readable(reinterpret_cast<const void*>(first), bytes)))
+					std::uintptr_t member{};
+					std::memcpy(
+						&member,
+						reinterpret_cast<const void*>(
+							collection->entries + index * descriptor_collection_entry_size),
+						sizeof(member));
+					if (member && (member % alignof(void*)) == 0 &&
+						descriptor_name(reinterpret_cast<const RBX::Reflection::Descriptor*>(member)) == target_atom)
 					{
-						for (std::size_t index = 0; index < bytes / entry_size; ++index)
-						{
-							std::uintptr_t member{};
-							std::memcpy(&member, reinterpret_cast<const void*>(first + index * entry_size), sizeof(member));
-							if (member && (member % alignof(void*)) == 0 &&
-								descriptor_name(reinterpret_cast<const RBX::Reflection::Descriptor*>(member)) == target_atom)
-							{
-								return reinterpret_cast<void*>(member);
-							}
-						}
+						return reinterpret_cast<void*>(member);
 					}
 				}
 			}
@@ -490,24 +518,14 @@ namespace rml::roblox::internals
 	std::optional<PropertyDescriptorSpanView> ReflectionCapabilities::property_descriptors(
 		const RBX::Reflection::ClassDescriptor* descriptor) const noexcept
 	{
-		const auto container = field_address(descriptor, m_descriptor_container_offsets[0], sizeof(std::uintptr_t) * 2);
-		if (!container)
+		const auto collection = descriptor_collection(
+			descriptor,
+			m_descriptor_container_offsets[0]);
+		if (!collection)
 			return std::nullopt;
-		std::uintptr_t first{};
-		std::uintptr_t last{};
-		std::memcpy(&first, reinterpret_cast<const void*>(*container), sizeof(first));
-		std::memcpy(&last, reinterpret_cast<const void*>(*container + sizeof(first)), sizeof(last));
-		if (first == 0 && last == 0)
-			return PropertyDescriptorSpanView{nullptr, 0};
-		if (!first || last < first || (first % alignof(void*)) != 0 || (last % alignof(void*)) != 0)
-			return std::nullopt;
-		const auto bytes = last - first;
-		if ((bytes % sizeof(PropertyDescriptorCollectionEntry)) != 0)
-			return std::nullopt;
-		const auto count = bytes / sizeof(PropertyDescriptorCollectionEntry);
-		if (count > 100000 || (count && !is_readable(reinterpret_cast<const void*>(first), bytes)))
-			return std::nullopt;
-		return PropertyDescriptorSpanView{reinterpret_cast<const PropertyDescriptorCollectionEntry*>(first), count};
+		return PropertyDescriptorSpanView{
+			reinterpret_cast<const PropertyDescriptorCollectionEntry*>(collection->entries),
+			collection->count};
 	}
 
 }

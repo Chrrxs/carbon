@@ -282,6 +282,7 @@ namespace rml::dotnet
 #endif
 	}
 
+
 	[[nodiscard]] bool try_read_property_name(
 	    const RBX::Reflection::PropertyDescriptor* descriptor,
 	    const char*& out_data,
@@ -554,11 +555,9 @@ namespace rml::dotnet
 		// DescribedBase has cleared its descriptor during destruction. Never enter
 		// Roblox's descriptor lookup with that tombstoned handle: the lookup treats
 		// descriptor + 0x250 as its table and would dereference address 0x250.
-		if (!utils::memory::is_valid_pointer(
-		        reinterpret_cast<uintptr_t>(instance->try_get_descriptor())))
-		{
+		const auto raw_descriptor = instance->try_get_descriptor();
+		if (!utils::memory::is_valid_pointer(reinterpret_cast<uintptr_t>(raw_descriptor)))
 			return nullptr;
-		}
 
 		return instance;
 	}
@@ -626,7 +625,8 @@ namespace rml::dotnet
 				if (!instance || !function_name)
 					return;
 
-				const auto* descriptor = instance->get_descriptor().find_function(function_name);
+				const auto* class_descriptor = instance->try_get_descriptor();
+				const auto* descriptor = class_descriptor->find_function(function_name);
 				if (!descriptor)
 					return;
 
@@ -755,11 +755,29 @@ namespace rml::dotnet
 
 				auto* instance = as_instance(instance_ptr);
 				if (!instance || !event_name)
+				{
+					RML_WARN(
+						"event_connect('{}') rejected handle 0x{:X}; handle_valid={} raw_descriptor=0x{:X}",
+						event_name ? event_name : "?",
+						instance_ptr,
+						utils::memory::is_valid_pointer(instance_ptr),
+						utils::memory::is_valid_pointer(instance_ptr)
+							? reinterpret_cast<std::uintptr_t>(
+								reinterpret_cast<RBX::Instance*>(instance_ptr)->try_get_descriptor())
+							: 0);
 					return 0;
+				}
 
-				const auto* event_descriptor = instance->get_descriptor().find_event(event_name);
+				const auto* class_descriptor = instance->try_get_descriptor();
+				const auto* event_descriptor = class_descriptor->find_event(event_name);
 				if (!event_descriptor)
+				{
+					RML_WARN(
+						"event_connect('{}') missed descriptor on class descriptor 0x{:X}",
+						event_name,
+						reinterpret_cast<std::uintptr_t>(class_descriptor));
 					return 0;
+				}
 
 				const auto slot = std::make_shared<ManagedEventSlot>(callback, state);
 

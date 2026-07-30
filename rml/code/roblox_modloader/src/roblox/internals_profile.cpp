@@ -467,6 +467,7 @@ namespace rml::roblox::internals
 				if (std::ranges::find(instance_type_descriptors, type_descriptor) ==
 						instance_type_descriptors.end() ||
 					descriptor->member_displacement[1] != -1 ||
+					descriptor->member_displacement[2] != 0 ||
 					descriptor->member_displacement[0] < 0)
 				{
 					continue;
@@ -660,7 +661,8 @@ namespace rml::roblox::internals
 		LOG_INFO("Resolved Roblox internals: job layout");
 		JobCapabilities job_caps(
 			job_layout->waiting_scripts_job_script_context_offset,
-			reinterpret_cast<JobCapabilities::DataModelAccessor>(
+			datamodel_instance_base_offsets.front(),
+			reinterpret_cast<JobCapabilities::CompleteDataModelAccessor>(
 				job_layout->waiting_scripts_job_data_model_accessor));
 
 		auto reflection_layout = reflection_future
@@ -693,7 +695,7 @@ namespace rml::roblox::internals
 				reflection_layout->function_bound_this_delta_offset,
 				reflection_layout->callback_signature_offset,
 				reflection_layout->callback_async_flag_offset,
-				reflection_layout->event_signal_offset,
+				signal_layout->event_signal_offset,
 			},
 			datamodel_caps,
 			instance_caps,

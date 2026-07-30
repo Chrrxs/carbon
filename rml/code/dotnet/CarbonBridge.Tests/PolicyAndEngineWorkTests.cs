@@ -20,10 +20,10 @@ public sealed class PolicyAndEngineWorkTests
     [InlineData((int)DataModelType.Edit, true)]
     [InlineData((int)DataModelType.Client, false)]
     [InlineData((int)DataModelType.Server, false)]
-    [InlineData((int)DataModelType.Standalone, false)]
+    [InlineData((int)DataModelType.Standalone, true)]
     [InlineData((int)DataModelType.Null, false)]
     [InlineData(1_097_167_477, true)]
-    public void UnknownNativeDataModelTypeRemainsAnAuthenticatedEditCandidate(
+    public void StudioEditCandidateIncludesStandaloneAndUnknownNativeTypes(
         int rawDataModelType,
         bool expected)
     {
@@ -36,8 +36,10 @@ public sealed class PolicyAndEngineWorkTests
     [InlineData((int)DataModelType.Edit, false, true)]
     [InlineData((int)DataModelType.Edit, true, false)]
     [InlineData((int)DataModelType.Client, false, false)]
+    [InlineData((int)DataModelType.Standalone, false, true)]
     [InlineData(1_097_167_477, false, true)]
     [InlineData(1_097_167_477, true, false)]
+    [InlineData((int)DataModelType.Standalone, true, false)]
     public void AuthenticatedEditRouteRejectsReplacementDataModels(
         int rawDataModelType,
         bool hasAuthenticatedEditDataModel,

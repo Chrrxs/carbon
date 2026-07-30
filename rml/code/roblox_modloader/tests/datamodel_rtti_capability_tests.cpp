@@ -590,11 +590,16 @@ int main()
 	}
 	// 15. JobCapabilities owns WaitingHybridScriptsJob context and DataModel access.
 	{
-		const auto data_model_accessor = +[](RBX::ScriptContext* script_context) -> RBX::DataModel* {
-			return reinterpret_cast<RBX::DataModel*>(
-				reinterpret_cast<std::uint8_t*>(script_context) + 0x10);
+		const auto data_model_accessor = +[](RBX::ScriptContext* script_context) -> void* {
+			return reinterpret_cast<std::uint8_t*>(script_context) + 0x10;
 		};
-		rml::roblox::internals::JobCapabilities job_caps(0x1F8, data_model_accessor);
+		const auto null_data_model_accessor = +[](RBX::ScriptContext*) -> void* {
+			return nullptr;
+		};
+		const auto unaligned_data_model_accessor = +[](RBX::ScriptContext* script_context) -> void* {
+			return reinterpret_cast<std::uint8_t*>(script_context) + 1;
+		};
+		rml::roblox::internals::JobCapabilities job_caps(0x1F8, 0x40, data_model_accessor);
 
 		alignas(16) std::uint8_t dummy_job_buffer[0x200]{};
 		*reinterpret_cast<void**>(dummy_job_buffer + 0x1F8) = dummy_job_buffer + 0x20;
@@ -603,16 +608,20 @@ int main()
 		const auto derived_ctx = job_caps.get_script_context(waiting_job);
 		const auto derived_data_model = job_caps.get_data_model(waiting_job);
 		if (derived_ctx != reinterpret_cast<RBX::ScriptContext*>(dummy_job_buffer + 0x20) ||
-			derived_data_model != reinterpret_cast<RBX::DataModel*>(dummy_job_buffer + 0x30))
+			derived_data_model != reinterpret_cast<RBX::DataModel*>(dummy_job_buffer + 0x70))
 		{
 			std::cerr << "Test 15 failed: WaitingHybridScriptsJob capability access\n";
 			return 18;
 		}
 
-		rml::roblox::internals::JobCapabilities no_accessor(0x1F8, nullptr);
+		rml::roblox::internals::JobCapabilities no_accessor(0x1F8, 0x40, nullptr);
+		rml::roblox::internals::JobCapabilities null_result(0x1F8, 0x40, null_data_model_accessor);
+		rml::roblox::internals::JobCapabilities unaligned_result(0x1F8, 0x40, unaligned_data_model_accessor);
 		if (job_caps.get_script_context(nullptr) != nullptr ||
 			job_caps.get_data_model(nullptr) != nullptr ||
-			no_accessor.get_data_model(waiting_job) != nullptr)
+			no_accessor.get_data_model(waiting_job) != nullptr ||
+			null_result.get_data_model(waiting_job) != nullptr ||
+			unaligned_result.get_data_model(waiting_job) != nullptr)
 		{
 			std::cerr << "Test 15 failed: unavailable WaitingHybridScriptsJob capability did not return nullptr\n";
 			return 18;

@@ -1208,7 +1208,6 @@ int main(const int argc, char** argv)
 						  << ", function_bound_this_delta_offset=" << ev.function_bound_this_delta_offset
 						  << ", callback_signature_offset=" << ev.callback_signature_offset
 						  << ", callback_async_flag_offset=" << ev.callback_async_flag_offset
-						  << ", event_signal_offset=" << ev.event_signal_offset
 						  << "}\n";
 			}
 			else
@@ -1289,6 +1288,8 @@ int main(const int argc, char** argv)
 						  << " matched_calls=" << ev.matched_calls
 						  << " supporting_calls=" << ev.supporting_calls
 						  << "fields={"
+						  << "event_signal_offset=" << ev.event_signal_offset
+						  << ", "
 						  << "signal_head_offset=" << ev.signal_head_offset
 						  << ", slot_strong_offset=" << ev.slot_strong_offset
 						  << ", slot_weak_offset=" << ev.slot_weak_offset

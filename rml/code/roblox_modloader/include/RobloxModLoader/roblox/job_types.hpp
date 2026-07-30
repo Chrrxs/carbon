@@ -25,6 +25,12 @@ namespace rml {
         Custom = 1 << 7
     };
 
+    [[nodiscard]] constexpr std::size_t job_execution_step_index(const JobKind kind) noexcept {
+        return kind == JobKind::WaitingHybridScripts
+            ? JobVtable::kWaitingHybridScriptsExecutionStepIndex
+            : JobVtable::kStepIndex;
+    }
+
     constexpr JobKind operator|(JobKind lhs, JobKind rhs) noexcept {
         return static_cast<JobKind>(static_cast<std::uint8_t>(lhs) | static_cast<std::uint8_t>(rhs));
     }

@@ -35,8 +35,10 @@ namespace rml::roblox::internals
 {
 	JobCapabilities::JobCapabilities(
 		const std::ptrdiff_t waiting_scripts_job_script_context_offset,
-		const DataModelAccessor waiting_scripts_job_data_model_accessor) noexcept :
+		const std::ptrdiff_t datamodel_instance_base_offset,
+		const CompleteDataModelAccessor waiting_scripts_job_data_model_accessor) noexcept :
 		m_waiting_scripts_job_script_context_offset(waiting_scripts_job_script_context_offset),
+		m_datamodel_instance_base_offset(datamodel_instance_base_offset),
 		m_waiting_scripts_job_data_model_accessor(waiting_scripts_job_data_model_accessor)
 	{
 	}
@@ -51,8 +53,28 @@ namespace rml::roblox::internals
 		const RBX::ScriptContextFacets::WaitingHybridScriptsJob* job) const noexcept
 	{
 		const auto script_context = get_script_context(job);
-		return script_context != nullptr && m_waiting_scripts_job_data_model_accessor != nullptr
-			? m_waiting_scripts_job_data_model_accessor(script_context)
+		if (script_context == nullptr ||
+			m_waiting_scripts_job_data_model_accessor == nullptr ||
+			m_datamodel_instance_base_offset < 0)
+		{
+			return nullptr;
+		}
+
+		const auto complete_data_model = m_waiting_scripts_job_data_model_accessor(script_context);
+		if (complete_data_model == nullptr)
+			return nullptr;
+
+		const auto complete_address = reinterpret_cast<std::uintptr_t>(complete_data_model);
+		const auto displacement = static_cast<std::uintptr_t>(m_datamodel_instance_base_offset);
+		if (complete_address % alignof(void*) != 0 ||
+			complete_address > (std::numeric_limits<std::uintptr_t>::max)() - displacement)
+		{
+			return nullptr;
+		}
+
+		const auto instance_address = complete_address + displacement;
+		return instance_address % alignof(void*) == 0
+			? reinterpret_cast<RBX::DataModel*>(instance_address)
 			: nullptr;
 	}
 }

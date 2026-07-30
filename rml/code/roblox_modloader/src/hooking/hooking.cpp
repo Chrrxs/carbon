@@ -28,7 +28,7 @@ namespace rml
 			}
 
 			auto job_hook = std::make_unique<vtable_hook>(*vtable, rml::JobVtable::kSlotCount);
-			job_hook->hook(rml::JobVtable::kStepIndex, &Hooks::on_job_step);
+			job_hook->hook(rml::job_execution_step_index(kind), &Hooks::on_job_step);
 			m_jobs_hook[kind] = std::move(job_hook);
 			RML_DEBUG("Hooked job kind {} with vtable 0x{:X}", std::to_underlying(kind), reinterpret_cast<std::uintptr_t>(*vtable));
 		}

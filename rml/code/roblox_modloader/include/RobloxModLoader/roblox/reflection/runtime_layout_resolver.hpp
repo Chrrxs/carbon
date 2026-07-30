@@ -43,7 +43,6 @@ namespace rml::roblox::internals
 		std::ptrdiff_t function_bound_this_delta_offset{-1};
 		std::ptrdiff_t callback_signature_offset{-1};
 		std::ptrdiff_t callback_async_flag_offset{-1};
-		std::ptrdiff_t event_signal_offset{-1};
 		std::size_t supporting_calls{0};
 		std::size_t matched_calls{0};
 	};
@@ -88,6 +87,7 @@ namespace rml::roblox::internals
 
 	struct SignalLayoutEvidence
 	{
+		std::ptrdiff_t event_signal_offset{-1};
 		std::ptrdiff_t signal_head_offset{-1};
 		std::ptrdiff_t slot_strong_offset{-1};
 		std::ptrdiff_t slot_weak_offset{-1};

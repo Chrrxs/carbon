@@ -369,12 +369,13 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         }
         if (dataModelType != DataModelType.Edit)
         {
-            // Roblox's private DataModel layout can move before the loader's
-            // next offset update. An out-of-domain value is allowed to attach
-            // provisionally until the unique CoreGui route authenticates it.
+            // Studio 0.732 reports its editable place as Standalone. Attach
+            // provisionally until the unique CoreGui route authenticates it;
+            // the same route check also protects the existing unknown-value
+            // fallback from binding Carbon to a playtest DataModel.
             Logger.Info(
-                $"RML reported unknown DataModel type {(int)dataModelType}; " +
-                "probing it as an edit candidate until Studio routing is established");
+                $"RML reported provisional edit DataModel type {(int)dataModelType}; " +
+                "probing it until Studio routing is established");
         }
 
         var dataModelHandle = InstanceHierarchy.RuntimeHandle(dataModel);
@@ -394,7 +395,15 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         // reaches the cache through the hierarchy observation callbacks.
         // Register it explicitly so full-place capture can hydrate the source
         // root without treating the live edit DataModel as unavailable.
-        _instances[dataModel.GetDebugId(128)] = dataModel;
+        var dataModelDebugId = dataModel.GetDebugId(128);
+        if (!string.IsNullOrEmpty(dataModelDebugId))
+        {
+            _instances[dataModelDebugId] = dataModel;
+        }
+        else
+        {
+            Logger.Warn("DataModel debug identity is unavailable during early attachment; deferring root cache");
+        }
         RememberEditCamera(dataModel);
         ResetChanges();
         _captureDirtyPages.Reset();
@@ -1519,7 +1528,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     }
 
     internal static bool IsEditDataModelCandidate(DataModelType dataModelType) =>
-        dataModelType == DataModelType.Edit
+        dataModelType is DataModelType.Edit or DataModelType.Standalone
         || !System.Enum.IsDefined(typeof(DataModelType), dataModelType);
 
     internal static bool ShouldAttachEditDataModelCandidate(
@@ -2245,6 +2254,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
     private void DrainEngineWork()
     {
+
         if (Interlocked.Exchange(ref _engineDrainActive, 1) != 0)
         {
             return;

@@ -317,12 +317,13 @@ namespace rml::roblox::internals
 	class RML_EXPORT JobCapabilities final
 	{
 	public:
-		using DataModelAccessor = RBX::DataModel* (*)(RBX::ScriptContext*);
+		using CompleteDataModelAccessor = void* (*)(RBX::ScriptContext*);
 
 		JobCapabilities() noexcept = default;
 		JobCapabilities(
 			std::ptrdiff_t waiting_scripts_job_script_context_offset,
-			DataModelAccessor waiting_scripts_job_data_model_accessor) noexcept;
+			std::ptrdiff_t datamodel_instance_base_offset,
+			CompleteDataModelAccessor waiting_scripts_job_data_model_accessor) noexcept;
 
 		[[nodiscard]] RBX::ScriptContext* get_script_context(
 			const RBX::ScriptContextFacets::WaitingHybridScriptsJob* job) const noexcept;
@@ -334,7 +335,8 @@ namespace rml::roblox::internals
 		friend class RobloxInternalsProfile;
 
 		std::ptrdiff_t m_waiting_scripts_job_script_context_offset{-1};
-		DataModelAccessor m_waiting_scripts_job_data_model_accessor{};
+		std::ptrdiff_t m_datamodel_instance_base_offset{-1};
+		CompleteDataModelAccessor m_waiting_scripts_job_data_model_accessor{};
 	};
 
 	class RML_EXPORT RobloxInternalsProfile final

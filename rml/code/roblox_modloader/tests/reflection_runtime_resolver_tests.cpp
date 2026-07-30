@@ -66,7 +66,7 @@ namespace
 		code[size++] = std::byte{0x31};
 		code[size++] = std::byte{0xc9};
 
-		// 3. For each container offset, LEA R8, [RCX + offset], MOV [R8+0], R9, MOV [R8+8], R9, MOV [R8+0x10], R9
+		// 3. For each container offset, LEA R8, [RCX + offset], MOV [R8+0], R9, MOV [R8+8], R9, MOV [R8+0x10], R9, MOV [R8+0x18], R9, MOV [R8+0x20], R9, MOV [R8+0x28], R9
 		for (const auto offset : container_offsets)
 		{
 			// LEA R8, [RCX + offset]
@@ -91,6 +91,24 @@ namespace
 			code[size++] = std::byte{0x89};
 			code[size++] = std::byte{0x48};
 			code[size++] = std::byte{0x10};
+
+			// MOV [R8 + 0x18], R9
+			code[size++] = std::byte{0x4d};
+			code[size++] = std::byte{0x89};
+			code[size++] = std::byte{0x48};
+			code[size++] = std::byte{0x18};
+
+			// MOV [R8 + 0x20], R9
+			code[size++] = std::byte{0x4d};
+			code[size++] = std::byte{0x89};
+			code[size++] = std::byte{0x48};
+			code[size++] = std::byte{0x20};
+
+			// MOV [R8 + 0x28], R9
+			code[size++] = std::byte{0x4d};
+			code[size++] = std::byte{0x89};
+			code[size++] = std::byte{0x48};
+			code[size++] = std::byte{0x28};
 		}
 
 		// 4. Base class load & store: MOV R8, [RDX + base_class_offset] -> MOV [RCX + base_class_offset], R8
@@ -451,11 +469,11 @@ constexpr std::array<std::byte, 1465> studio_0732_constructor_fixture = {
 		std::uint64_t unk;
 	};
 
-	struct VectorTriple
+	struct RuntimeCollectionTriple
 	{
-		std::uintptr_t my_first;
-		std::uintptr_t my_last;
-		std::uintptr_t my_end;
+		std::uintptr_t entries;
+		std::size_t count;
+		std::size_t capacity;
 	};
 }
 
@@ -720,8 +738,32 @@ int main(const int argc, char** argv)
 		append_constructor_code(code, size, containers, base_off, func_off);
 	};
 
+	auto append_class_tail = [](const auto& fixture, const std::uint32_t base_offset, const std::uint32_t functionality_offset) {
+		std::pair<std::array<std::byte, 4096>, std::size_t> result{};
+		auto& [code, size] = result;
+		std::copy(fixture.begin(), fixture.end(), code.begin());
+		size = fixture.size();
+		code[size++] = std::byte{0x4c};
+		code[size++] = std::byte{0x8b};
+		code[size++] = std::byte{0x82};
+		append_u32(code, size, base_offset);
+		code[size++] = std::byte{0x4d};
+		code[size++] = std::byte{0x89};
+		code[size++] = std::byte{0x85};
+		append_u32(code, size, base_offset);
+		code[size++] = std::byte{0x41};
+		code[size++] = std::byte{0xf7};
+		code[size++] = std::byte{0x85};
+		append_u32(code, size, functionality_offset);
+		append_u32(code, size, 0x08);
+		code[size++] = std::byte{0xc3};
+		return result;
+	};
+
 	const std::array<std::uint32_t, 5> layout_0731_containers = {0x28, 0x88, 0xe8, 0x148, 0x1a8};
 	const std::array<std::uint32_t, 5> layout_0732_containers = {0x28, 0x70, 0xb8, 0x100, 0x148};
+	const std::array<std::uint32_t, 5> layout_0731_storage = {0x40, 0xa0, 0x100, 0x160, 0x1c0};
+	const std::array<std::uint32_t, 5> layout_0732_storage = {0x40, 0x88, 0xd0, 0x118, 0x160};
 
 	// 1. 0.731 positive encoded body test across all 8 families
 	std::array<std::byte, 4096> code_0731{};
@@ -731,7 +773,7 @@ int main(const int argc, char** argv)
 	auto layout_0731 = resolve_all(code_0731, size_0731, full_vft_sets);
 	if (!layout_0731 ||
 		layout_0731->name_offset != 0x8 ||
-		layout_0731->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x28, 0x88, 0xe8, 0x148, 0x1a8} ||
+		layout_0731->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0xA0, 0x100, 0x160, 0x1C0} ||
 		layout_0731->base_class_offset != 0x228 ||
 		layout_0731->functionality_offset != 0x220 ||
 		layout_0731->owner_offset != 0x30 ||
@@ -743,8 +785,7 @@ int main(const int argc, char** argv)
 		layout_0731->function_invoke_func_ptr_offset != 0x80 ||
 		layout_0731->function_bound_this_delta_offset != 0x88 ||
 		layout_0731->callback_signature_offset != 0x40 ||
-		layout_0731->callback_async_flag_offset != 0x78 ||
-		layout_0731->event_signal_offset != 0x78)
+		layout_0731->callback_async_flag_offset != 0x78)
 	{
 		if (!layout_0731)
 		{
@@ -767,9 +808,28 @@ int main(const int argc, char** argv)
 				<< " invoke=" << layout_0731->function_invoke_func_ptr_offset
 				<< " this_delta=" << layout_0731->function_bound_this_delta_offset
 				<< " callback_signature=" << layout_0731->callback_signature_offset
-				<< " callback_async=" << layout_0731->callback_async_flag_offset
-				<< " event_signal=" << layout_0731->event_signal_offset << '\n';
+				<< " callback_async=" << layout_0731->callback_async_flag_offset << '\n';
 		}
+		return 1;
+	}
+	const std::array<std::uintptr_t, 1> desc_0731_vfts{0x1437e31d8};
+	auto [exact_0731_code, exact_0731_size] =
+		append_class_tail(studio_0731_constructor_fixture, 0x228, 0x220);
+	auto layout_exact_0731 = resolve(exact_0731_code, exact_0731_size, desc_0731_vfts[0]);
+	if (!layout_exact_0731 ||
+		layout_exact_0731->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0xA0, 0x100, 0x160, 0x1C0})
+	{
+		if (!layout_exact_0731)
+			std::cerr << "Test 1b failed: " << layout_exact_0731.error().capability
+				<< " error=" << static_cast<int>(layout_exact_0731.error().failure)
+				<< " candidates=" << layout_exact_0731.error().decoded_candidates << '\n';
+		else
+			std::cerr << "Test 1b failed: exact 0.731 constructor fixture resolved offsets "
+				<< layout_exact_0731->descriptor_container_offsets[0] << ','
+				<< layout_exact_0731->descriptor_container_offsets[1] << ','
+				<< layout_exact_0731->descriptor_container_offsets[2] << ','
+				<< layout_exact_0731->descriptor_container_offsets[3] << ','
+				<< layout_exact_0731->descriptor_container_offsets[4] << '\n';
 		return 1;
 	}
 
@@ -781,7 +841,7 @@ int main(const int argc, char** argv)
 	auto layout_0732 = resolve_all(code_0732, size_0732, full_vft_sets);
 	if (!layout_0732 ||
 		layout_0732->name_offset != 0x8 ||
-		layout_0732->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x28, 0x70, 0xb8, 0x100, 0x148} ||
+		layout_0732->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0x88, 0xD0, 0x118, 0x160} ||
 		layout_0732->base_class_offset != 0x1a8 ||
 		layout_0732->functionality_offset != 0x1bc ||
 		layout_0732->owner_offset != 0x30 ||
@@ -793,10 +853,29 @@ int main(const int argc, char** argv)
 		layout_0732->function_invoke_func_ptr_offset != 0x80 ||
 		layout_0732->function_bound_this_delta_offset != 0x88 ||
 		layout_0732->callback_signature_offset != 0x40 ||
-		layout_0732->callback_async_flag_offset != 0x78 ||
-		layout_0732->event_signal_offset != 0x78)
+		layout_0732->callback_async_flag_offset != 0x78)
 	{
 		std::cerr << "Test 2 failed: 0.732 layout mismatch\n";
+		return 2;
+	}
+	const std::array<std::uintptr_t, 1> desc_0732_vfts{0x1437eecd8};
+	auto [exact_0732_code, exact_0732_size] =
+		append_class_tail(studio_0732_constructor_fixture, 0x1A8, 0x1BC);
+	auto layout_exact_0732 = resolve(exact_0732_code, exact_0732_size, desc_0732_vfts[0]);
+	if (!layout_exact_0732 ||
+		layout_exact_0732->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0x88, 0xD0, 0x118, 0x160})
+	{
+		if (!layout_exact_0732)
+			std::cerr << "Test 2c failed: " << layout_exact_0732.error().capability
+				<< " error=" << static_cast<int>(layout_exact_0732.error().failure)
+				<< " candidates=" << layout_exact_0732.error().decoded_candidates << '\n';
+		else
+			std::cerr << "Test 2c failed: exact 0.732 constructor fixture resolved offsets "
+				<< layout_exact_0732->descriptor_container_offsets[0] << ','
+				<< layout_exact_0732->descriptor_container_offsets[1] << ','
+				<< layout_exact_0732->descriptor_container_offsets[2] << ','
+				<< layout_exact_0732->descriptor_container_offsets[3] << ','
+				<< layout_exact_0732->descriptor_container_offsets[4] << '\n';
 		return 2;
 	}
 	// 2b. MSVC PE encoded body test across all 8 families
@@ -811,8 +890,7 @@ int main(const int argc, char** argv)
 		layout_msvc->function_invoke_func_ptr_offset != 0x60 ||
 		layout_msvc->function_bound_this_delta_offset != 0x68 ||
 		layout_msvc->callback_signature_offset != 0x48 ||
-		layout_msvc->callback_async_flag_offset != 0x78 ||
-		layout_msvc->event_signal_offset != 0x48)
+		layout_msvc->callback_async_flag_offset != 0x78)
 	{
 		if (!layout_msvc)
 		{
@@ -828,8 +906,7 @@ int main(const int argc, char** argv)
 				<< " invoke=" << layout_msvc->function_invoke_func_ptr_offset << " (exp 0x60)"
 				<< " this_delta=" << layout_msvc->function_bound_this_delta_offset << " (exp 0x68)"
 				<< " callback_sig=" << layout_msvc->callback_signature_offset << " (exp 0x48)"
-				<< " callback_async=" << layout_msvc->callback_async_flag_offset << " (exp 0x78)"
-				<< " event_sig=" << layout_msvc->event_signal_offset << " (exp 0x48)\n";
+				<< " callback_async=" << layout_msvc->callback_async_flag_offset << " (exp 0x78)\n";
 		}
 		return 2;
 	}
@@ -914,20 +991,20 @@ int main(const int argc, char** argv)
 	CollectionEntry yield_entries[1] = {{&mock_yield, 0}};
 	CollectionEntry callback_entries[1] = {{&mock_callback, 0}};
 
-	VectorTriple prop_vec{reinterpret_cast<std::uintptr_t>(&prop_entries[0]), reinterpret_cast<std::uintptr_t>(&prop_entries[1]), reinterpret_cast<std::uintptr_t>(&prop_entries[1])};
-	VectorTriple event_vec{reinterpret_cast<std::uintptr_t>(&event_entries[0]), reinterpret_cast<std::uintptr_t>(&event_entries[1]), reinterpret_cast<std::uintptr_t>(&event_entries[1])};
-	VectorTriple func_vec{reinterpret_cast<std::uintptr_t>(&func_entries[0]), reinterpret_cast<std::uintptr_t>(&func_entries[1]), reinterpret_cast<std::uintptr_t>(&func_entries[1])};
-	VectorTriple yield_vec{reinterpret_cast<std::uintptr_t>(&yield_entries[0]), reinterpret_cast<std::uintptr_t>(&yield_entries[1]), reinterpret_cast<std::uintptr_t>(&yield_entries[1])};
-	VectorTriple callback_vec{reinterpret_cast<std::uintptr_t>(&callback_entries[0]), reinterpret_cast<std::uintptr_t>(&callback_entries[1]), reinterpret_cast<std::uintptr_t>(&callback_entries[1])};
+	RuntimeCollectionTriple prop_triple{reinterpret_cast<std::uintptr_t>(&prop_entries[0]), 1, 1};
+	RuntimeCollectionTriple event_triple{reinterpret_cast<std::uintptr_t>(&event_entries[0]), 1, 1};
+	RuntimeCollectionTriple func_triple{reinterpret_cast<std::uintptr_t>(&func_entries[0]), 1, 1};
+	RuntimeCollectionTriple yield_triple{reinterpret_cast<std::uintptr_t>(&yield_entries[0]), 1, 1};
+	RuntimeCollectionTriple callback_triple{reinterpret_cast<std::uintptr_t>(&callback_entries[0]), 1, 1};
 
 	std::vector<std::byte> class_buf(0x400, std::byte{0});
 
-	std::array<std::ptrdiff_t, 5> test_offsets = {0x28, 0x88, 0xe8, 0x148, 0x1a8};
-	std::memcpy(class_buf.data() + test_offsets[0], &prop_vec, sizeof(prop_vec));
-	std::memcpy(class_buf.data() + test_offsets[1], &event_vec, sizeof(event_vec));
-	std::memcpy(class_buf.data() + test_offsets[2], &func_vec, sizeof(func_vec));
-	std::memcpy(class_buf.data() + test_offsets[3], &yield_vec, sizeof(yield_vec));
-	std::memcpy(class_buf.data() + test_offsets[4], &callback_vec, sizeof(callback_vec));
+	std::array<std::ptrdiff_t, 5> test_offsets = {0x40, 0xa0, 0x100, 0x160, 0x1c0};
+	std::memcpy(class_buf.data() + test_offsets[0], &prop_triple, sizeof(prop_triple));
+	std::memcpy(class_buf.data() + test_offsets[1], &event_triple, sizeof(event_triple));
+	std::memcpy(class_buf.data() + test_offsets[2], &func_triple, sizeof(func_triple));
+	std::memcpy(class_buf.data() + test_offsets[3], &yield_triple, sizeof(yield_triple));
+	std::memcpy(class_buf.data() + test_offsets[4], &callback_triple, sizeof(callback_triple));
 
 	const auto functionality_offset = 0x220;
 	std::uint32_t functionality_flags = 0x8;
@@ -952,6 +1029,25 @@ int main(const int argc, char** argv)
 	const auto* caps = &caps_storage;
 	const auto* class_desc =
 		reinterpret_cast<const RBX::Reflection::ClassDescriptor*>(class_buf.data());
+
+	std::array<std::byte, 0x100> event_descriptor_buf{};
+	std::array<std::byte, 0x40> event_source_buf{};
+	std::array<std::byte, 0x10> signal_buf{};
+	const std::int32_t event_signal_displacement = 0x20;
+	const auto signal_address = reinterpret_cast<std::uintptr_t>(signal_buf.data());
+	std::memcpy(
+		event_descriptor_buf.data() + 0x78,
+		&event_signal_displacement,
+		sizeof(event_signal_displacement));
+	std::memcpy(event_source_buf.data() + event_signal_displacement, &signal_address, sizeof(signal_address));
+	if (caps->event_signal(
+			reinterpret_cast<const RBX::Reflection::EventDescriptor*>(event_descriptor_buf.data()),
+			event_source_buf.data()) !=
+		reinterpret_cast<RBX::Signals::Signal*>(signal_buf.data()))
+	{
+		std::cerr << "Test 6 failed: event signal displacement access\n";
+		return 6;
+	}
 	if (!caps->find_property(class_desc, "TestProperty"))
 	{
 		std::cerr << "Test 6a failed: find_property direct lookup\n";
@@ -1060,22 +1156,32 @@ int main(const int argc, char** argv)
 	std::vector<std::byte> malformed_class_buf(0x400, std::byte{0});
 
 	// Unaligned my_first
-	VectorTriple unaligned_vec{0x1, 0x100, 0x100};
-	std::memcpy(malformed_class_buf.data() + test_offsets[0], &unaligned_vec, sizeof(unaligned_vec));
+	// Unaligned entries pointer
+	RuntimeCollectionTriple unaligned_triple{0x1, 1, 1};
+	std::memcpy(malformed_class_buf.data() + test_offsets[0], &unaligned_triple, sizeof(unaligned_triple));
 	const auto* malformed_desc = reinterpret_cast<const RBX::Reflection::ClassDescriptor*>(malformed_class_buf.data());
 
 	if (caps->find_property(malformed_desc, "TestProperty"))
 	{
-		std::cerr << "Test 9a failed: malformed unaligned vector returned non-null\n";
+		std::cerr << "Test 9a failed: malformed unaligned collection entries pointer returned non-null\n";
 		return 9;
 	}
 
-	// Reversed vector pointers (my_last < my_first)
-	VectorTriple reversed_vec{0x200, 0x100, 0x200};
-	std::memcpy(malformed_class_buf.data() + test_offsets[0], &reversed_vec, sizeof(reversed_vec));
+	// Count > capacity
+	RuntimeCollectionTriple count_gt_cap_triple{reinterpret_cast<std::uintptr_t>(&prop_entries[0]), 10, 1};
+	std::memcpy(malformed_class_buf.data() + test_offsets[0], &count_gt_cap_triple, sizeof(count_gt_cap_triple));
 	if (caps->find_property(malformed_desc, "TestProperty"))
 	{
-		std::cerr << "Test 9b failed: malformed reversed vector returned non-null\n";
+		std::cerr << "Test 9b failed: malformed count > capacity collection returned non-null\n";
+		return 9;
+	}
+
+	// Null entries address with non-zero count
+	RuntimeCollectionTriple null_entries_triple{0, 1, 1};
+	std::memcpy(malformed_class_buf.data() + test_offsets[0], &null_entries_triple, sizeof(null_entries_triple));
+	if (caps->find_property(malformed_desc, "TestProperty"))
+	{
+		std::cerr << "Test 9c failed: malformed null entries pointer with non-zero count returned non-null\n";
 		return 9;
 	}
 
@@ -1116,6 +1222,18 @@ int main(const int argc, char** argv)
 		large_code[large_size++] = std::byte{0x89};
 		large_code[large_size++] = std::byte{0x48};
 		large_code[large_size++] = std::byte{0x10};
+		large_code[large_size++] = std::byte{0x4d};
+		large_code[large_size++] = std::byte{0x89};
+		large_code[large_size++] = std::byte{0x48};
+		large_code[large_size++] = std::byte{0x18};
+		large_code[large_size++] = std::byte{0x4d};
+		large_code[large_size++] = std::byte{0x89};
+		large_code[large_size++] = std::byte{0x48};
+		large_code[large_size++] = std::byte{0x20};
+		large_code[large_size++] = std::byte{0x4d};
+		large_code[large_size++] = std::byte{0x89};
+		large_code[large_size++] = std::byte{0x48};
+		large_code[large_size++] = std::byte{0x28};
 	}
 	large_code[large_size++] = std::byte{0x4c};
 	large_code[large_size++] = std::byte{0x8b};
@@ -1134,7 +1252,7 @@ int main(const int argc, char** argv)
 	const auto large_layout = resolve(large_code, large_size);
 	if (!large_layout ||
 		large_layout->descriptor_container_offsets !=
-			std::array<std::ptrdiff_t, 5>{0x28, 0x70, 0xb8, 0x100, 0x148} ||
+			std::array<std::ptrdiff_t, 5>{0x40, 0x88, 0xD0, 0x118, 0x160} ||
 		large_layout->base_class_offset != 0x1a8 ||
 		large_layout->functionality_offset != 0x1bc)
 	{
@@ -1195,6 +1313,24 @@ int main(const int argc, char** argv)
 		adv_code[adv_size++] = std::byte{0x89};
 		adv_code[adv_size++] = std::byte{0x41};
 		adv_code[adv_size++] = std::byte{0x10};
+
+		// MOV [R9 + 0x18], R8
+		adv_code[adv_size++] = std::byte{0x4d};
+		adv_code[adv_size++] = std::byte{0x89};
+		adv_code[adv_size++] = std::byte{0x41};
+		adv_code[adv_size++] = std::byte{0x18};
+
+		// MOV [R9 + 0x20], R8
+		adv_code[adv_size++] = std::byte{0x4d};
+		adv_code[adv_size++] = std::byte{0x89};
+		adv_code[adv_size++] = std::byte{0x41};
+		adv_code[adv_size++] = std::byte{0x20};
+
+		// MOV [R9 + 0x28], R8
+		adv_code[adv_size++] = std::byte{0x4d};
+		adv_code[adv_size++] = std::byte{0x89};
+		adv_code[adv_size++] = std::byte{0x41};
+		adv_code[adv_size++] = std::byte{0x28};
 	}
 
 	// Unrelated bitmask 0x8 operation on RAX (not stored to RCX)
@@ -1225,7 +1361,7 @@ int main(const int argc, char** argv)
 
 	auto adv_layout = resolve(adv_code, adv_size);
 	if (!adv_layout ||
-		adv_layout->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x28, 0x88, 0xe8, 0x148, 0x1a8} ||
+		adv_layout->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0xA0, 0x100, 0x160, 0x1C0} ||
 		adv_layout->base_class_offset != 0x228 ||
 		adv_layout->functionality_offset != 0x220)
 	{
@@ -1303,6 +1439,24 @@ int main(const int argc, char** argv)
 		zero_after_code[zero_after_size++] = std::byte{0x89};
 		zero_after_code[zero_after_size++] = std::byte{0x48};
 		zero_after_code[zero_after_size++] = std::byte{0x10};
+
+		// MOV [R8 + 0x18], R9
+		zero_after_code[zero_after_size++] = std::byte{0x4d};
+		zero_after_code[zero_after_size++] = std::byte{0x89};
+		zero_after_code[zero_after_size++] = std::byte{0x48};
+		zero_after_code[zero_after_size++] = std::byte{0x18};
+
+		// MOV [R8 + 0x20], R9
+		zero_after_code[zero_after_size++] = std::byte{0x4d};
+		zero_after_code[zero_after_size++] = std::byte{0x89};
+		zero_after_code[zero_after_size++] = std::byte{0x48};
+		zero_after_code[zero_after_size++] = std::byte{0x20};
+
+		// MOV [R8 + 0x28], R9
+		zero_after_code[zero_after_size++] = std::byte{0x4d};
+		zero_after_code[zero_after_size++] = std::byte{0x89};
+		zero_after_code[zero_after_size++] = std::byte{0x48};
+		zero_after_code[zero_after_size++] = std::byte{0x28};
 	}
 
 	// XOR R9, R9 (zero reg AFTER stores)
@@ -1389,6 +1543,24 @@ int main(const int argc, char** argv)
 		clobbered_code[clobbered_size++] = std::byte{0x89};
 		clobbered_code[clobbered_size++] = std::byte{0x48};
 		clobbered_code[clobbered_size++] = std::byte{0x10};
+
+		// MOV [R8 + 0x18], R9
+		clobbered_code[clobbered_size++] = std::byte{0x4d};
+		clobbered_code[clobbered_size++] = std::byte{0x89};
+		clobbered_code[clobbered_size++] = std::byte{0x48};
+		clobbered_code[clobbered_size++] = std::byte{0x18};
+
+		// MOV [R8 + 0x20], R9
+		clobbered_code[clobbered_size++] = std::byte{0x4d};
+		clobbered_code[clobbered_size++] = std::byte{0x89};
+		clobbered_code[clobbered_size++] = std::byte{0x48};
+		clobbered_code[clobbered_size++] = std::byte{0x20};
+
+		// MOV [R8 + 0x28], R9
+		clobbered_code[clobbered_size++] = std::byte{0x4d};
+		clobbered_code[clobbered_size++] = std::byte{0x89};
+		clobbered_code[clobbered_size++] = std::byte{0x48};
+		clobbered_code[clobbered_size++] = std::byte{0x28};
 	}
 
 	// Base class load & store: MOV R8, [RDX + 0x228] -> MOV [RCX + 0x228], R8
@@ -1466,6 +1638,24 @@ int main(const int argc, char** argv)
 		mov_zero_code[mov_zero_size++] = std::byte{0x89};
 		mov_zero_code[mov_zero_size++] = std::byte{0x48};
 		mov_zero_code[mov_zero_size++] = std::byte{0x10};
+
+		// MOV [R8 + 0x18], R9
+		mov_zero_code[mov_zero_size++] = std::byte{0x4d};
+		mov_zero_code[mov_zero_size++] = std::byte{0x89};
+		mov_zero_code[mov_zero_size++] = std::byte{0x48};
+		mov_zero_code[mov_zero_size++] = std::byte{0x18};
+
+		// MOV [R8 + 0x20], R9
+		mov_zero_code[mov_zero_size++] = std::byte{0x4d};
+		mov_zero_code[mov_zero_size++] = std::byte{0x89};
+		mov_zero_code[mov_zero_size++] = std::byte{0x48};
+		mov_zero_code[mov_zero_size++] = std::byte{0x20};
+
+		// MOV [R8 + 0x28], R9
+		mov_zero_code[mov_zero_size++] = std::byte{0x4d};
+		mov_zero_code[mov_zero_size++] = std::byte{0x89};
+		mov_zero_code[mov_zero_size++] = std::byte{0x48};
+		mov_zero_code[mov_zero_size++] = std::byte{0x28};
 	}
 
 	// Base class load & store: MOV R8, [RDX + 0x228] -> MOV [RCX + 0x228], R8
@@ -1490,7 +1680,7 @@ int main(const int argc, char** argv)
 
 	auto mov_zero_res = resolve(mov_zero_code, mov_zero_size);
 	if (!mov_zero_res ||
-		!std::equal(mov_zero_res->descriptor_container_offsets.begin(), mov_zero_res->descriptor_container_offsets.end(), layout_0731_containers.begin(), layout_0731_containers.end()) ||
+		!std::equal(mov_zero_res->descriptor_container_offsets.begin(), mov_zero_res->descriptor_container_offsets.end(), layout_0731_storage.begin(), layout_0731_storage.end()) ||
 		mov_zero_res->base_class_offset != 0x228 ||
 		mov_zero_res->functionality_offset != 0x220)
 	{
@@ -1817,14 +2007,20 @@ int main(const int argc, char** argv)
 
 		// Function 4: Connect function
 		const std::size_t off_connect_fn = sig_pos_code.size();
+		// Preserve the sret-adjusted source argument and derive its Signal* field address.
+		append_bytes({0x49, 0x8B, 0xE8});
+		const auto event_signal_evidence_offset = sig_pos_code.size();
+		append_bytes({0x4C, 0x63, 0x79, 0x78});
+		append_bytes({0x4C, 0x03, 0xFD});
 		// MOV ECX, 0x40 (allocation size = 64)
 		append_bytes({0xB9, 0x40, 0x00, 0x00, 0x00});
 		// CALL allocator (dummy target: disconnect_fn)
 		append_rel32_call(off_disconnect);
 		// MOV RBX, RAX (preserve AllocatedSlot role in non-volatile RBX across calls)
 		append_bytes({0x48, 0x89, 0xC3});
-		// MOV [RBX + 0x20], RDX (source = 32)
-		append_bytes({0x48, 0x89, 0x53, 0x20});
+		// MOV RAX, [R15]; MOV [RBX + 0x20], RAX (source = 32)
+		append_bytes({0x49, 0x8B, 0x07});
+		append_bytes({0x48, 0x89, 0x43, 0x20});
 		// MOV dword ptr [RBX + 0x00], 0 (strong = 0)
 		append_bytes({0xC7, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00});
 		// MOV qword ptr [RBX + 0x10], 0 (next = 16)
@@ -1889,12 +2085,26 @@ int main(const int argc, char** argv)
 				<< ", decoded=" << sig_pos_res.error().decoded_candidates << '\n';
 			return 16;
 		}
-		if (sig_pos_res->signal_head_offset != 8 ||
-			sig_pos_res->slot_strong_offset != 0 || sig_pos_res->slot_weak_offset != 4 ||
-			sig_pos_res->slot_next_offset != 16 || sig_pos_res->slot_source_offset != 32 ||
-			sig_pos_res->slot_wrapper_ptr_offset != 48)
+		if (sig_pos_res->event_signal_offset != 0x78 ||
+			sig_pos_res->signal_head_offset != 8 || sig_pos_res->slot_strong_offset != 0 ||
+			sig_pos_res->slot_weak_offset != 4 || sig_pos_res->slot_next_offset != 16 ||
+			sig_pos_res->slot_source_offset != 32 || sig_pos_res->slot_wrapper_ptr_offset != 48)
 		{
 			std::cerr << "Test 16 failed: Signal dynamic layout resolution\n";
+			return 16;
+		}
+
+		auto sig_missing_event = sig_pos_code;
+		std::fill_n(sig_missing_event.begin() + event_signal_evidence_offset, 7, 0x90);
+		if (rml::roblox::internals::resolve_signal_layout(
+				std::as_bytes(std::span{sig_missing_event}),
+				code_addr,
+				std::as_bytes(std::span{sig_pos_pdata}),
+				base_addr,
+				code_addr + off_disconnect,
+				code_addr + off_disconnect))
+		{
+			std::cerr << "Test 16 failed: Signal layout accepted missing event displacement evidence\n";
 			return 16;
 		}
 
@@ -2023,6 +2233,113 @@ int main(const int argc, char** argv)
 		}
 	}
 
+	// 18-21. Collection storage evidence must be complete, qword-wide, and call-safe.
+	{
+		auto build_collection_evidence = [&](
+			const bool initialize_storage_pointer,
+			const bool narrow_stores,
+			const bool narrow_zero_producer,
+			const bool clobber_zero_at_call) {
+			std::pair<std::array<std::byte, 1024>, std::size_t> result{};
+			auto& [code, size] = result;
+
+			code[size++] = std::byte{0x48};
+			code[size++] = std::byte{0x8d};
+			code[size++] = std::byte{0x05};
+			const auto instruction_address = image_base + size - 3;
+			const auto displacement =
+				static_cast<std::int32_t>(vft_target - (instruction_address + 7));
+			append_u32(code, size, static_cast<std::uint32_t>(displacement));
+			code[size++] = std::byte{0x48};
+			code[size++] = std::byte{0x89};
+			code[size++] = std::byte{0x01};
+
+			code[size++] = std::byte{0x45};
+			code[size++] = narrow_zero_producer ? std::byte{0x30} : std::byte{0x33};
+			code[size++] = std::byte{0xc9};
+			if (clobber_zero_at_call)
+			{
+				code[size++] = std::byte{0xe8};
+				append_u32(code, size, 0);
+			}
+
+			auto append_zero_store = [&](const std::uint8_t offset) {
+				code[size++] = narrow_stores ? std::byte{0x45} : std::byte{0x4d};
+				code[size++] = std::byte{0x89};
+				code[size++] = std::byte{0x48};
+				code[size++] = std::byte{offset};
+			};
+			for (const auto offset : layout_0731_containers)
+			{
+				code[size++] = std::byte{0x4c};
+				code[size++] = std::byte{0x8d};
+				code[size++] = std::byte{0x81};
+				append_u32(code, size, offset);
+				append_zero_store(0);
+				append_zero_store(0x08);
+				append_zero_store(0x10);
+				append_zero_store(0x18);
+				append_zero_store(0x20);
+
+				code[size++] = std::byte{0x49};
+				code[size++] = std::byte{0x8d};
+				code[size++] = std::byte{0x78};
+				code[size++] = std::byte{0x28};
+				if (initialize_storage_pointer)
+				{
+					code[size++] = narrow_stores ? std::byte{0x44} : std::byte{0x4c};
+					code[size++] = std::byte{0x89};
+					code[size++] = std::byte{0x0f};
+				}
+			}
+
+			code[size++] = std::byte{0x4c};
+			code[size++] = std::byte{0x8b};
+			code[size++] = std::byte{0x82};
+			append_u32(code, size, 0x228);
+			code[size++] = std::byte{0x4c};
+			code[size++] = std::byte{0x89};
+			code[size++] = std::byte{0x81};
+			append_u32(code, size, 0x228);
+			code[size++] = std::byte{0xf7};
+			code[size++] = std::byte{0x81};
+			append_u32(code, size, 0x220);
+			append_u32(code, size, 0x08);
+			code[size++] = std::byte{0xc3};
+			return result;
+		};
+
+		auto expect_rejected = [&](const auto& fixture, const int code, const char* reason) {
+			const auto& [bytes, size] = fixture;
+			if (resolve(bytes, size))
+			{
+				std::cerr << "Test " << code << " failed: " << reason << " was incorrectly accepted\n";
+				return false;
+			}
+			return true;
+		};
+
+		if (!expect_rejected(
+				build_collection_evidence(false, false, false, false),
+				18,
+				"uninitialized storage pointer"))
+			return 18;
+		if (!expect_rejected(
+				build_collection_evidence(true, true, false, false),
+				19,
+				"32-bit collection stores"))
+			return 19;
+		if (!expect_rejected(
+				build_collection_evidence(true, false, true, false),
+				20,
+				"8-bit zero producer"))
+			return 20;
+		if (!expect_rejected(
+				build_collection_evidence(true, false, false, true),
+				21,
+				"volatile zero register used after call"))
+			return 21;
+	}
 	std::cout << "All reflection layout resolver and capabilities tests passed successfully.\n";
 	return 0;
 }

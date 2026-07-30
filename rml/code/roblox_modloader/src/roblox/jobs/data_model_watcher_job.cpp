@@ -5,6 +5,7 @@
 #include "RobloxModLoader/luau/script_manager.hpp"
 #include "RobloxModLoader/roblox/data_model.hpp"
 #include "RobloxModLoader/roblox/script_context.hpp"
+#include "RobloxModLoader/roblox/internals_profile.hpp"
 #include "RobloxModLoader/roblox/task_scheduler.hpp"
 #include "RobloxModLoader/roblox/waiting_hybrid_scripts_job.hpp"
 #include "pointers.hpp"
@@ -94,6 +95,10 @@ namespace rml::jobs
 		}
 
 		const auto data_model_type = *type_res;
+		LOG_INFO(
+			"Resolved DataModel type {} from capability offset 0x{:X}",
+			static_cast<int>(data_model_type),
+			static_cast<std::uintptr_t>(get_roblox_internals_profile().datamodel().type_offset()));
 
 		LOG_INFO("DataModel changed from 0x{:X} to 0x{:X} by {}",
 		    old_data_model ? reinterpret_cast<uintptr_t>(old_data_model) : 0,
