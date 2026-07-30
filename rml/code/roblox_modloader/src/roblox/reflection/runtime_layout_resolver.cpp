@@ -2906,14 +2906,24 @@ namespace rml::roblox::internals
 		waiting_vfts.erase(std::ranges::unique(waiting_vfts).begin(), waiting_vfts.end());
 
 		const auto* code_bytes = reinterpret_cast<const std::uint8_t*>(executable_code.data());
-		for (std::size_t cursor = 0; cursor + 7 <= executable_code.size(); ++cursor)
+		std::size_t search_from = 1;
+		while (search_from < executable_code.size())
 		{
-			// MSVC materializes vft addresses as a canonical seven-byte
-			// REX.W LEA/MOV from RIP. Resolve that cheap fixed-width form
-			// before invoking Zydis; decoding every instruction in Studio's
-			// full .text section made bootstrap exceed the bridge deadline.
+			const auto remaining = executable_code.size() - search_from;
+			const auto* lea_opcode = static_cast<const std::uint8_t*>(
+				std::memchr(code_bytes + search_from, 0x8D, remaining));
+			const auto* mov_opcode = static_cast<const std::uint8_t*>(
+				std::memchr(code_bytes + search_from, 0x8B, remaining));
+			const auto* opcode = lea_opcode == nullptr ? mov_opcode :
+				(mov_opcode == nullptr || lea_opcode < mov_opcode ? lea_opcode : mov_opcode);
+			if (opcode == nullptr)
+				break;
+			const auto opcode_offset = static_cast<std::size_t>(opcode - code_bytes);
+			search_from = opcode_offset + 1;
+			if (executable_code.size() - opcode_offset < 6)
+				break;
+			const auto cursor = opcode_offset - 1;
 			if ((code_bytes[cursor] & 0xF8) != 0x48 ||
-				(code_bytes[cursor + 1] != 0x8D && code_bytes[cursor + 1] != 0x8B) ||
 				(code_bytes[cursor + 2] & 0xC7) != 0x05)
 			{
 				continue;
