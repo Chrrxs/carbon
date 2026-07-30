@@ -12,7 +12,8 @@ namespace RBX {
 namespace rml {
     struct JobVtable {
         static constexpr std::size_t kStepIndex = 6;
-        static constexpr std::size_t kSlotCount = 7;
+        static constexpr std::size_t kSlotCount = 9;
+        static constexpr std::size_t kWaitingHybridScriptsExecutionStepIndex = 8;
     };
 
     enum class JobKind : std::uint8_t {

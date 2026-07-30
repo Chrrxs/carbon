@@ -275,6 +275,7 @@ namespace rml::roblox::internals
 		{
 			Unknown,
 			This,
+			RelatedThis,
 			Arg1,
 			Arg2,
 			Arg3,
@@ -2875,6 +2876,8 @@ namespace rml::roblox::internals
 		const std::span<const std::byte> runtime_function_table,
 		const std::uintptr_t module_address,
 		const std::span<const std::uintptr_t> waiting_scripts_job_vft_addresses,
+		const std::uintptr_t waiting_scripts_job_step_address,
+		const std::ptrdiff_t datamodel_instance_base_offset,
 		std::vector<CompatibilityError>* diagnostics) noexcept
 	{
 		auto emit = [diagnostics](CompatibilityError err) {
@@ -2883,10 +2886,13 @@ namespace rml::roblox::internals
 			return err;
 		};
 
-		if (executable_code.empty() || waiting_scripts_job_vft_addresses.empty() || runtime_function_table.empty())
+		if (executable_code.empty() || waiting_scripts_job_vft_addresses.empty() ||
+			runtime_function_table.empty() || datamodel_instance_base_offset <= 0 ||
+			waiting_scripts_job_step_address < code_address ||
+			waiting_scripts_job_step_address - code_address >= executable_code.size())
 		{
 			return std::unexpected(emit(CompatibilityError{
-				.capability = "Job.Layout",
+				.capability = "Job.DataModelAccessor",
 				.failure = CompatibilityFailure::missing_signature,
 			}));
 		}
@@ -3047,8 +3053,271 @@ namespace rml::roblox::internals
 				.failure = CompatibilityFailure::insufficient_evidence,
 			}));
 		}
+		const auto direct_call_target = [&](const ZydisDecodedInstruction& inst,
+			const ZydisDecodedOperand* operands, const std::size_t position) -> std::optional<std::uintptr_t> {
+			if (inst.mnemonic != ZYDIS_MNEMONIC_CALL || inst.operand_count < 1 ||
+				operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE || !operands[0].imm.is_relative)
+				return std::nullopt;
+			std::uintptr_t target = 0;
+			if (!checked_add(code_address + position + inst.length, operands[0].imm.value.s, target) ||
+				target < code_address || target - code_address >= executable_code.size())
+				return std::nullopt;
+			return target;
+		};
+
+		const auto is_data_model_accessor = [&](const std::uintptr_t target) {
+			const auto target_offset = static_cast<std::size_t>(target - code_address);
+			const auto target_bounds = find_function_bounds(
+				executable_code, code_address, runtime_function_table, module_address, target_offset);
+			if (!target_bounds || target_bounds->begin != target_offset)
+				return false;
+			auto target_end = target_bounds->end;
+			std::size_t contiguous_fragments = 1;
+
+			RegTracker tracker;
+			bool reads_this = false;
+			bool adjusted_return = false;
+			bool falls_through_fragment = false;
+			for (std::size_t pos = target_bounds->begin;;)
+			{
+				if (pos == target_end)
+				{
+					if (!falls_through_fragment || contiguous_fragments >= 3 ||
+						target_end - target_bounds->begin >= 0x400)
+						return false;
+					const auto next_bounds = find_function_bounds(
+						executable_code, code_address, runtime_function_table, module_address, target_end);
+					if (!next_bounds || next_bounds->begin != target_end)
+						return false;
+					target_end = next_bounds->end;
+					++contiguous_fragments;
+				}
+				const auto* bytes = reinterpret_cast<const std::uint8_t*>(executable_code.data() + pos);
+				ZydisDecodedInstruction inst;
+				ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+				if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+						&decoder, bytes, target_end - pos, &inst, operands)) || inst.length == 0)
+					return false;
+
+				for (std::uint8_t index = 0; index < inst.operand_count; ++index)
+				{
+					if (operands[index].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+						tracker.get_role(operands[index].mem.base) == RegRole::This)
+						reads_this = true;
+				}
+
+				const bool is_adjustment =
+					inst.mnemonic == ZYDIS_MNEMONIC_LEA && inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					to_gpr32(operands[0].reg.value) == ZYDIS_REGISTER_RAX &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+					(tracker.get_role(operands[1].mem.base) == RegRole::This ||
+						tracker.get_role(operands[1].mem.base) == RegRole::RelatedThis) &&
+					operands[1].mem.disp.has_displacement &&
+					static_cast<std::ptrdiff_t>(operands[1].mem.disp.value) ==
+						-datamodel_instance_base_offset;
+				const bool preserves_adjusted_or_null =
+					adjusted_return && inst.mnemonic == ZYDIS_MNEMONIC_CMOVNBE &&
+					inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					to_gpr32(operands[0].reg.value) == ZYDIS_REGISTER_RAX &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					tracker.get_role(operands[1].reg.value) == RegRole::Zero;
+				if (is_adjustment)
+					adjusted_return = true;
+				else if (!preserves_adjusted_or_null && adjusted_return && inst.operand_count >= 1 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					to_gpr32(operands[0].reg.value) == ZYDIS_REGISTER_RAX &&
+					(operands[0].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE))
+					adjusted_return = false;
+				if (inst.mnemonic == ZYDIS_MNEMONIC_RET)
+					return reads_this && adjusted_return;
+
+				const bool loads_related_this =
+					inst.mnemonic == ZYDIS_MNEMONIC_MOV && inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+					operands[0].size == sizeof(void*) * 8 &&
+					operands[1].size == sizeof(void*) * 8 &&
+					(tracker.get_role(operands[1].mem.base) == RegRole::This ||
+						tracker.get_role(operands[1].mem.base) == RegRole::RelatedThis);
+				const bool returns_related_this =
+					inst.mnemonic == ZYDIS_MNEMONIC_CALL &&
+					(tracker.get_role(ZYDIS_REGISTER_RCX) == RegRole::This ||
+						tracker.get_role(ZYDIS_REGISTER_RCX) == RegRole::RelatedThis);
+				tracker.update(inst, operands, code_address + pos);
+				if (loads_related_this)
+					tracker.set_role(operands[0].reg.value, RegRole::RelatedThis);
+				if (returns_related_this)
+					tracker.set_role(ZYDIS_REGISTER_RAX, RegRole::RelatedThis);
+				falls_through_fragment =
+					inst.mnemonic != ZYDIS_MNEMONIC_JMP &&
+					inst.mnemonic != ZYDIS_MNEMONIC_INT3;
+				pos += inst.length;
+			}
+			return false;
+		};
+
+		const auto step_offset = static_cast<std::size_t>(
+			waiting_scripts_job_step_address - code_address);
+		const auto step_bounds = find_function_bounds(
+			executable_code, code_address, runtime_function_table, module_address, step_offset);
+		if (!step_bounds || step_bounds->begin != step_offset)
+		{
+			return std::unexpected(emit(CompatibilityError{
+				.capability = "Job.DataModelAccessor",
+				.failure = CompatibilityFailure::missing_signature,
+			}));
+		}
+
+		RegTracker step_tracker;
+		std::array<std::ptrdiff_t, ZYDIS_REGISTER_MAX_VALUE + 1> member_register_offsets;
+		member_register_offsets.fill(-1);
+		std::vector<std::pair<std::ptrdiff_t, std::ptrdiff_t>> member_stack_offsets;
+		std::vector<std::ptrdiff_t> member_loads;
+		std::vector<std::uintptr_t> accessor_candidates;
+		std::size_t accessor_callers_matched = 0;
+		std::size_t accessor_targets_checked = 0;
+		const auto register_index = [](const ZydisRegister reg) {
+			return ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+		};
+		const auto get_member_offset = [&](const ZydisRegister reg) {
+			const auto index = register_index(reg);
+			return index == ZYDIS_REGISTER_NONE ? -1 : member_register_offsets[index];
+		};
+		const auto set_member_offset = [&](const ZydisRegister reg, const std::ptrdiff_t offset) {
+			const auto index = register_index(reg);
+			if (index != ZYDIS_REGISTER_NONE)
+				member_register_offsets[index] = offset;
+		};
+		const auto get_stack_member_offset = [&](const std::ptrdiff_t displacement) {
+			for (const auto& [stack_displacement, member_offset] : member_stack_offsets)
+			{
+				if (stack_displacement == displacement)
+					return member_offset;
+			}
+			return static_cast<std::ptrdiff_t>(-1);
+		};
+		const auto set_stack_member_offset = [&](const std::ptrdiff_t displacement,
+			const std::ptrdiff_t member_offset) {
+			for (auto& [stack_displacement, stored_member_offset] : member_stack_offsets)
+			{
+				if (stack_displacement == displacement)
+				{
+					stored_member_offset = member_offset;
+					return;
+				}
+			}
+			member_stack_offsets.push_back({displacement, member_offset});
+		};
+
+		for (std::size_t pos = step_bounds->begin; pos < step_bounds->end;)
+		{
+			const auto* bytes = reinterpret_cast<const std::uint8_t*>(executable_code.data() + pos);
+			ZydisDecodedInstruction inst;
+			ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+			if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+					&decoder, bytes, step_bounds->end - pos, &inst, operands)) || inst.length == 0)
+			{
+				return std::unexpected(emit(CompatibilityError{
+					.capability = "Job.DataModelAccessor",
+					.failure = CompatibilityFailure::unsupported_instruction_form,
+				}));
+			}
+
+			if (const auto target = direct_call_target(inst, operands, pos);
+				target && get_member_offset(ZYDIS_REGISTER_RCX) >= 0)
+			{
+				++accessor_callers_matched;
+				const auto member_offset = get_member_offset(ZYDIS_REGISTER_RCX);
+				const bool has_control =
+					std::ranges::find(
+						member_loads,
+						member_offset + static_cast<std::ptrdiff_t>(sizeof(void*))) != member_loads.end();
+				if (has_control)
+					++accessor_targets_checked;
+				if (has_control && is_data_model_accessor(*target) &&
+					std::ranges::find(accessor_candidates, *target) == accessor_candidates.end())
+					accessor_candidates.push_back(*target);
+			}
+
+			bool propagated_member = false;
+			if (inst.mnemonic == ZYDIS_MNEMONIC_MOV && inst.operand_count >= 2)
+			{
+				if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[0].mem.disp.has_displacement &&
+					(to_gpr32(operands[0].mem.base) == ZYDIS_REGISTER_RSP ||
+						to_gpr32(operands[0].mem.base) == ZYDIS_REGISTER_RBP))
+				{
+					set_stack_member_offset(
+						static_cast<std::ptrdiff_t>(operands[0].mem.disp.value),
+						get_member_offset(operands[1].reg.value));
+				}
+				else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+				{
+					std::ptrdiff_t member_offset = -1;
+					if (operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+					{
+						member_offset = get_member_offset(operands[1].reg.value);
+					}
+					else if (operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+						operands[1].mem.disp.has_displacement)
+					{
+						const auto memory_base = to_gpr32(operands[1].mem.base);
+						if (memory_base == ZYDIS_REGISTER_RSP || memory_base == ZYDIS_REGISTER_RBP)
+						{
+							member_offset = get_stack_member_offset(
+								static_cast<std::ptrdiff_t>(operands[1].mem.disp.value));
+						}
+						else if (step_tracker.get_role(operands[1].mem.base) == RegRole::This)
+						{
+							member_offset = static_cast<std::ptrdiff_t>(operands[1].mem.disp.value);
+							if (member_offset >= 0x30 && member_offset <= 0x400 &&
+								std::ranges::find(member_loads, member_offset) == member_loads.end())
+								member_loads.push_back(member_offset);
+						}
+					}
+					set_member_offset(operands[0].reg.value, member_offset);
+					propagated_member = true;
+				}
+			}
+
+			if (inst.mnemonic == ZYDIS_MNEMONIC_CALL)
+			{
+				static constexpr ZydisRegister volatile_registers[] = {
+					ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX,
+					ZYDIS_REGISTER_R8, ZYDIS_REGISTER_R9, ZYDIS_REGISTER_R10, ZYDIS_REGISTER_R11,
+				};
+				for (const auto reg : volatile_registers)
+					set_member_offset(reg, -1);
+			}
+			else if (!propagated_member && inst.operand_count >= 1 &&
+				operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+				(operands[0].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE))
+			{
+				set_member_offset(operands[0].reg.value, -1);
+			}
+
+			step_tracker.update(inst, operands, code_address + pos);
+			pos += inst.length;
+		}
+
+		if (accessor_candidates.size() != 1)
+		{
+			return std::unexpected(emit(CompatibilityError{
+				.capability = "Job.DataModelAccessor",
+				.failure = accessor_candidates.empty()
+					? CompatibilityFailure::missing_signature
+					: CompatibilityFailure::ambiguous_evidence,
+				.matched_calls = accessor_callers_matched,
+				.decoded_candidates = accessor_targets_checked,
+			}));
+		}
+
 		return JobLayoutEvidence{
 			.waiting_scripts_job_script_context_offset = derived_script_ctx,
+			.waiting_scripts_job_data_model_accessor = accessor_candidates.front(),
 			.supporting_calls = matched_calls,
 			.matched_calls = matched_calls,
 		};

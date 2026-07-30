@@ -1617,8 +1617,31 @@ int main(const int argc, char** argv)
 		job_code.insert(job_code.end(), {0x48, 0x89, 0x91, 0xF8, 0x01, 0x00, 0x00});
 		// RET
 		job_code.push_back(0xC3);
+		const auto fn2_end = job_code.size();
 
-		const std::array<TestRuntimeFunction, 2> job_pdata{
+		const auto accessor_begin = job_code.size();
+		job_code.insert(job_code.end(), {0x48, 0x8B, 0xD9});
+		job_code.insert(job_code.end(), {0x48, 0x8B, 0x4B, 0x68});
+		job_code.insert(job_code.end(), {0x48, 0x8D, 0x83, 0x38, 0xFE, 0xFF, 0xFF});
+		job_code.push_back(0xC3);
+		const auto accessor_end = job_code.size();
+
+		const auto step_begin = job_code.size();
+		job_code.insert(job_code.end(), {0x48, 0x8B, 0xD9});
+		job_code.insert(job_code.end(), {0x48, 0x8B, 0x53, 0x48});
+		job_code.insert(job_code.end(), {0x48, 0x8B, 0x43, 0x40});
+		job_code.insert(job_code.end(), {0x48, 0x89, 0x44, 0x24, 0x20});
+		job_code.insert(job_code.end(), {0x48, 0x8B, 0x4C, 0x24, 0x20});
+		const auto accessor_call_offset = job_code.size();
+		job_code.push_back(0xE8);
+		const auto accessor_call_disp = static_cast<std::int32_t>(
+			(code_addr + accessor_begin) - (code_addr + accessor_call_offset + 5));
+		const auto* accessor_call_disp_bytes =
+			reinterpret_cast<const std::uint8_t*>(&accessor_call_disp);
+		job_code.insert(job_code.end(), accessor_call_disp_bytes, accessor_call_disp_bytes + 4);
+		job_code.push_back(0xC3);
+
+		const std::array<TestRuntimeFunction, 4> job_pdata{
 			TestRuntimeFunction{
 				.begin_address = 0x1000,
 				.end_address = static_cast<std::uint32_t>(0x1000 + fn1_end),
@@ -1626,6 +1649,16 @@ int main(const int argc, char** argv)
 			},
 			TestRuntimeFunction{
 				.begin_address = static_cast<std::uint32_t>(0x1000 + fn1_end),
+				.end_address = static_cast<std::uint32_t>(0x1000 + fn2_end),
+				.unwind_info_address = 1,
+			},
+			TestRuntimeFunction{
+				.begin_address = static_cast<std::uint32_t>(0x1000 + accessor_begin),
+				.end_address = static_cast<std::uint32_t>(0x1000 + accessor_end),
+				.unwind_info_address = 1,
+			},
+			TestRuntimeFunction{
+				.begin_address = static_cast<std::uint32_t>(0x1000 + step_begin),
 				.end_address = static_cast<std::uint32_t>(0x1000 + job_code.size()),
 				.unwind_info_address = 1,
 			},
@@ -1635,9 +1668,13 @@ int main(const int argc, char** argv)
 			code_addr,
 			std::as_bytes(std::span{job_pdata}),
 			base_addr,
-			waiting_job_vfts_span);
+			waiting_job_vfts_span,
+			code_addr + step_begin,
+			0x1C8);
 
-		if (!job_res || job_res->waiting_scripts_job_script_context_offset != 0x1F8)
+		if (!job_res ||
+			job_res->waiting_scripts_job_script_context_offset != 0x1F8 ||
+			job_res->waiting_scripts_job_data_model_accessor != code_addr + accessor_begin)
 		{
 			std::cerr << "Test 16 failed: Job dynamic layout resolution\n";
 			return 16;
@@ -1665,7 +1702,9 @@ int main(const int argc, char** argv)
 			.unwind_info_address = 1,
 		};
 		const auto job_clobber_res = rml::roblox::internals::resolve_job_layout(
-			std::as_bytes(std::span{job_clobber_code}), code_addr, std::as_bytes(std::span{&job_clobber_pdata, 1}), base_addr, waiting_job_vfts_span);
+			std::as_bytes(std::span{job_clobber_code}), code_addr,
+			std::as_bytes(std::span{&job_clobber_pdata, 1}), base_addr,
+			waiting_job_vfts_span, code_addr, 0x1C8);
 		if (job_clobber_res)
 		{
 			std::cerr << "Test 16 failed: Job register clobber did not fail closed\n";
@@ -1692,7 +1731,8 @@ int main(const int argc, char** argv)
 		};
 		const auto job_arg3_res = rml::roblox::internals::resolve_job_layout(
 			std::as_bytes(std::span{job_arg3_code}), code_addr,
-			std::as_bytes(std::span{&job_arg3_pdata, 1}), base_addr, waiting_job_vfts_span);
+			std::as_bytes(std::span{&job_arg3_pdata, 1}), base_addr,
+			waiting_job_vfts_span, code_addr, 0x1C8);
 		if (job_arg3_res)
 		{
 			std::cerr << "Test 16 failed: Job unrelated argument did not fail closed\n";

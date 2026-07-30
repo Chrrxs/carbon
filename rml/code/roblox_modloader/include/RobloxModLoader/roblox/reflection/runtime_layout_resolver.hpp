@@ -110,6 +110,7 @@ namespace rml::roblox::internals
 	struct JobLayoutEvidence
 	{
 		std::ptrdiff_t waiting_scripts_job_script_context_offset{-1};
+		std::uintptr_t waiting_scripts_job_data_model_accessor{};
 		std::size_t supporting_calls{};
 		std::size_t matched_calls{};
 	};
@@ -120,5 +121,7 @@ namespace rml::roblox::internals
 		std::span<const std::byte> runtime_function_table,
 		std::uintptr_t module_address,
 		std::span<const std::uintptr_t> waiting_scripts_job_vft_addresses,
+		std::uintptr_t waiting_scripts_job_step_address,
+		std::ptrdiff_t datamodel_instance_base_offset,
 		std::vector<CompatibilityError>* diagnostics = nullptr) noexcept;
 }

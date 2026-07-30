@@ -2,6 +2,7 @@
 #include "RobloxModLoader/roblox/reflection/event.hpp"
 #include "RobloxModLoader/roblox/reflection/runtime_layout_resolver.hpp"
 #include "RobloxModLoader/roblox/internals_profile.hpp"
+#include "RobloxModLoader/roblox/job_types.hpp"
 #include "RobloxModLoader/memory/symbol_resolver.hpp"
 
 #include <algorithm>
@@ -131,6 +132,7 @@ namespace
 		std::string demangled_name;
 		std::uint32_t type_descriptor_rva;
 		std::vector<std::uint32_t> base_type_descriptor_rvas;
+		std::vector<std::pair<std::string, std::ptrdiff_t>> base_class_offsets;
 	};
 
 	struct OfflineRTTIIndex
@@ -512,6 +514,7 @@ namespace
 								if (!pe.is_valid_rva(bcd_rva, sizeof(BaseClassDescriptor)))
 								{
 									info.base_type_descriptor_rvas.clear();
+									info.base_class_offsets.clear();
 									break;
 								}
 								const auto* bcd = reinterpret_cast<const BaseClassDescriptor*>(pe.rva_to_ptr(bcd_rva));
@@ -519,9 +522,19 @@ namespace
 								if (!pe.is_valid_rva(base_td_rva, 17))
 								{
 									info.base_type_descriptor_rvas.clear();
+									info.base_class_offsets.clear();
 									break;
 								}
 								info.base_type_descriptor_rvas.push_back(base_td_rva);
+								if (bcd->member_displacement[1] == -1 &&
+									bcd->member_displacement[2] == 0)
+								{
+									const auto base_name = demangle_type_descriptor_name(
+										reinterpret_cast<const char*>(pe.rva_to_ptr(base_td_rva) + 16));
+									if (!base_name.empty())
+										info.base_class_offsets.push_back(
+											{base_name, bcd->member_displacement[0]});
+								}
 							}
 						}
 					}
@@ -979,6 +992,24 @@ int main(const int argc, char** argv)
 			std::cout << "[RUN] exe=" << exe_path << " stage=RTTIExtraction" << std::endl;
 		}
 		const auto rtti_index = scan_msvc_x64_rtti_vfts(pe);
+		const auto gather_base_offset = [&](const std::string_view derived_name,
+			const std::string_view base_name) -> std::optional<std::ptrdiff_t> {
+			std::vector<std::ptrdiff_t> offsets;
+			for (const auto& [vft, info] : rtti_index.vft_entries)
+			{
+				if (!name_matches(info.demangled_name, derived_name))
+					continue;
+				for (const auto& [candidate_base_name, offset] : info.base_class_offsets)
+				{
+					if (offset >= 0 && name_matches(candidate_base_name, base_name))
+						offsets.push_back(offset);
+				}
+			}
+			std::ranges::sort(offsets);
+			offsets.erase(std::ranges::unique(offsets).begin(), offsets.end());
+			return offsets.size() == 1
+				? std::optional<std::ptrdiff_t>(offsets.front()) : std::nullopt;
+		};
 		const auto& class_vft_map = rtti_index.class_vft_map;
 
 		const auto descriptor_vfts = gather_rtti_vfts(class_vft_map, "RBX::Reflection::Descriptor", "class RBX::Reflection::Descriptor");
@@ -995,6 +1026,25 @@ int main(const int argc, char** argv)
 		const auto instance_vfts = gather_rtti_vfts(class_vft_map, "RBX::Instance", "class RBX::Instance");
 		const auto dm_job_vfts = gather_rtti_vfts(class_vft_map, "RBX::DataModelJob", "class RBX::DataModelJob");
 		const auto waiting_job_vfts = gather_rtti_vfts(class_vft_map, "RBX::ScriptContextFacets::WaitingHybridScriptsJob", "class RBX::ScriptContextFacets::WaitingHybridScriptsJob");
+		const auto datamodel_instance_base_offset =
+			gather_base_offset("RBX::DataModel", "RBX::Instance");
+		std::vector<std::uintptr_t> waiting_job_step_addresses;
+		for (const auto vft : waiting_job_vfts)
+		{
+			const auto entry_rva = static_cast<std::uint32_t>(
+				vft - module_base +
+				rml::JobVtable::kWaitingHybridScriptsExecutionStepIndex * sizeof(std::uint64_t));
+			if (!pe.is_valid_rva(entry_rva, sizeof(std::uint64_t)))
+				continue;
+			std::uint64_t step_address = 0;
+			std::memcpy(&step_address, pe.rva_to_ptr(entry_rva), sizeof(step_address));
+			if (step_address >= code_address && step_address < code_address + code.size() &&
+				std::ranges::find(waiting_job_step_addresses, step_address) ==
+					waiting_job_step_addresses.end())
+			{
+				waiting_job_step_addresses.push_back(static_cast<std::uintptr_t>(step_address));
+			}
+		}
 		if (has_stage(opts.selected_stages, Stage::RTTI))
 		{
 			std::cout << "[EXTRACT] exe=" << exe_path
@@ -1237,8 +1287,25 @@ int main(const int argc, char** argv)
 		{
 			std::vector<CompatibilityError> job_diag;
 			std::cout << "[RUN] exe=" << exe_path << " stage=JobLayout" << std::endl;
-			auto res = rml::roblox::internals::resolve_job_layout(
-				code, code_address, runtime_function_table, module_base, waiting_job_vfts, &job_diag);
+			std::cout << "[EVIDENCE] waiting_step=0x" << std::hex
+					  << (waiting_job_step_addresses.empty() ? 0 : waiting_job_step_addresses.front())
+					  << " datamodel_instance_base_offset=0x"
+					  << (datamodel_instance_base_offset ? *datamodel_instance_base_offset : -1)
+					  << std::dec << std::endl;
+			auto res = datamodel_instance_base_offset && waiting_job_step_addresses.size() == 1
+				? rml::roblox::internals::resolve_job_layout(
+					code,
+					code_address,
+					runtime_function_table,
+					module_base,
+					waiting_job_vfts,
+					waiting_job_step_addresses.front(),
+					*datamodel_instance_base_offset,
+					&job_diag)
+				: std::unexpected(CompatibilityError{
+					.capability = "Job.DataModelAccessor",
+					.failure = CompatibilityFailure::missing_signature,
+				});
 			if (res.has_value())
 			{
 				const auto& ev = res.value();
@@ -1248,6 +1315,8 @@ int main(const int argc, char** argv)
 						  << " supporting_calls=" << ev.supporting_calls
 						  << " fields={"
 						  << "waiting_scripts_job_script_context_offset=" << ev.waiting_scripts_job_script_context_offset
+						  << ",waiting_scripts_job_data_model_accessor=0x" << std::hex
+						  << ev.waiting_scripts_job_data_model_accessor << std::dec
 						  << "}\n";
 			}
 			else
