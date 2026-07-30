@@ -304,6 +304,16 @@ namespace rml::roblox::internals
 		std::size_t cursor = 0;
 		while (cursor < executable_code.size())
 		{
+			const auto* bytes =
+				reinterpret_cast<const std::uint8_t*>(executable_code.data() + cursor);
+			if (cursor + 7 > executable_code.size() ||
+				(bytes[0] & 0xF8) != 0x48 ||
+				(bytes[1] != 0x8D && bytes[1] != 0x8B) ||
+				(bytes[2] & 0xC7) != 0x05)
+			{
+				++cursor;
+				continue;
+			}
 			ZydisDecodedInstruction instruction{};
 			ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
 			if (!decode_at(
