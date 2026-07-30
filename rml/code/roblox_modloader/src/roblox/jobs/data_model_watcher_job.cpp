@@ -25,11 +25,16 @@ namespace rml::jobs
 			return false;
 		}
 
-		const auto type = data_model->get_type();
+		const auto type_res = data_model->get_type();
+		if (!type_res)
+		{
+			LOG_ERROR("DataModelWatcherJob: Failed to resolve DataModel type");
+			return false;
+		}
 
+		const auto type = *type_res;
 		m_data_models[type]                  = data_model;
 		m_data_model_last_time_stepped[type] = std::chrono::high_resolution_clock::now();
-
 		return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - m_last_check)
 		           .count()
 		    > 16;
@@ -46,15 +51,21 @@ namespace rml::jobs
 			return;
 		}
 
-		const auto old_data_model = rml::task_scheduler().get_data_model_by_type(new_data_model->get_type());
+		const auto new_type_res = new_data_model->get_type();
+		if (!new_type_res)
+		{
+			LOG_ERROR("DataModelWatcherJob: Failed to resolve new DataModel type");
+			return;
+		}
+
+		const auto old_data_model = rml::task_scheduler().get_data_model_by_type(*new_type_res);
 		if (old_data_model == new_data_model)
 		{
 			return;
 		}
-
 		check_and_cleanup_stale_data_models();
 
-		on_data_model_changed(old_data_model, new_data_model, job->script_context);
+		on_data_model_changed(old_data_model, new_data_model, job->get_script_context());
 	}
 
 	void DataModelWatcherJob::destroy_impl() noexcept
@@ -74,20 +85,26 @@ namespace rml::jobs
 			return;
 		}
 
+		const auto type_res = new_data_model->get_type();
+		if (!type_res)
+		{
+			LOG_ERROR("DataModelWatcherJob: Failed to resolve DataModel type during change notification");
+			return;
+		}
+
+		const auto data_model_type = *type_res;
+
 		LOG_INFO("DataModel changed from 0x{:X} to 0x{:X} by {}",
 		    old_data_model ? reinterpret_cast<uintptr_t>(old_data_model) : 0,
 		    new_data_model ? reinterpret_cast<uintptr_t>(new_data_model) : 0,
-		    new_data_model ? std::to_underlying(new_data_model->get_type()) : 0);
+		    std::to_underlying(data_model_type));
 
-		rml::task_scheduler().set_data_model(new_data_model->get_type(), new_data_model, script_context);
-
-		const auto data_model_type = new_data_model->get_type();
+		rml::task_scheduler().set_data_model(data_model_type, new_data_model, script_context);
 
 		LOG_INFO("New DataModel type: {}, notifying mods and scripts", static_cast<int>(data_model_type));
 
 		events::DataModelChangedEvent ev(reinterpret_cast<uint64_t>(old_data_model), reinterpret_cast<uint64_t>(new_data_model), static_cast<int>(data_model_type));
 		events::event_manager().emit(ev);
-
 		// Notify managed (.NET) mods about the change if the bridge is initialized
 		if (rml::dotnet::g_dotnet_mod_loader)
 		{

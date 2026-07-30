@@ -39,56 +39,15 @@ namespace RBX::Reflection
 			PUBLIC_REPLICATE = 1 + 2 + 0 + 0 + 0,       // isPublic, canReplicate
 		};
 
-	private:
-		char padding[0x28];
-
 	public:
-		const Type& type;
-		const bool m_is_enum;
-
-	private:
-		unsigned m_is_public : 1;
-		unsigned m_is_editable : 1;
-		unsigned m_can_replicate : 1;
-		unsigned m_can_xml_read : 1;
-		unsigned m_can_xml_write : 1;
-		unsigned m_is_scriptable : 1;
-		unsigned m_always_clone : 1;
-
-	public:
-		[[nodiscard]] bool is_public() const
-		{
-			return m_is_public != 0;
-		}
-
-		[[nodiscard]] bool is_editable() const
-		{
-			return m_is_editable != 0;
-		}
-		[[nodiscard]] bool can_replicate() const
-		{
-			return m_can_replicate != 0;
-		}
-
-		[[nodiscard]] bool can_xml_read() const
-		{
-			return m_can_xml_read != 0;
-		}
-
-		[[nodiscard]] bool can_xml_write() const
-		{
-			return m_can_xml_write != 0;
-		}
-
-		[[nodiscard]] bool is_scriptable() const
-		{
-			return m_is_scriptable != 0;
-		}
-
-		[[nodiscard]] bool always_clone() const
-		{
-			return m_always_clone != 0;
-		}
+		[[nodiscard]] const Type* type() const noexcept;
+		[[nodiscard]] bool is_public() const noexcept;
+		[[nodiscard]] bool is_editable() const noexcept;
+		[[nodiscard]] bool can_replicate() const noexcept;
+		[[nodiscard]] bool can_xml_read() const noexcept;
+		[[nodiscard]] bool can_xml_write() const noexcept;
+		[[nodiscard]] bool is_scriptable() const noexcept;
+		[[nodiscard]] bool always_clone() const noexcept;
 
 		bool operator==(const PropertyDescriptor& other) const
 		{
@@ -143,12 +102,6 @@ namespace RBX::Reflection
 		virtual void lua_get(lua_State* L, const DescribedBase* instance) const = 0;
 		virtual void lua_set(lua_State* L, DescribedBase* instance) const = 0;
 
-	private:
-		RML_LAYOUT_GUARD_BEGIN()
-			RML_ASSERT_LAYOUT_SIZE(PropertyDescriptor, 0x78);
-			RML_ASSERT_LAYOUT_OFFSET(PropertyDescriptor, padding, 0x40);
-			RML_ASSERT_LAYOUT_OFFSET(PropertyDescriptor, m_is_enum, 0x70);
-		RML_LAYOUT_GUARD_END()
 	};
 
 	template<typename V>
@@ -187,10 +140,6 @@ namespace RBX::Reflection
 			virtual void serialize(DescribedBase* instance, unsigned fmt, void* ctx) const = 0;
 		};
 
-	private:
-		char padding[0x18];
-
-	protected:
 		std::unique_ptr<GetSet> get_set;
 		std::unique_ptr<VariantAccessor> m_variant_accessor;
 		std::unique_ptr<XmlLuaAccessor> m_xml_accessor;
@@ -253,9 +202,9 @@ namespace RBX::Reflection
 			return (this->descriptor == other.descriptor) && (this->instance == other.instance);
 		}
 
-		[[nodiscard]] const Name& name() const
+		[[nodiscard]] const Name* name() const noexcept
 		{
-			return descriptor->name;
+			return descriptor ? descriptor->name() : nullptr;
 		}
 
 		template<typename V>
@@ -352,7 +301,8 @@ namespace RBX::Reflection
 
 		static bool is_ref_property_descriptor(const PropertyDescriptor& descriptor)
 		{
-			return is_ref_property_descriptor(descriptor.type);
+			const auto* t = descriptor.type();
+			return t != nullptr && is_ref_property_descriptor(*t);
 		}
 	};
 

@@ -15,6 +15,46 @@ if ! grep -Fq -- '@("--build", $BuildDir, "--parallel", "--target", "roblox_modl
 	echo "FAIL: RML package build does not scope CMake to roblox_modloader" >&2
 	failure=1
 fi
+CONTRIBUTING="${SCRIPT_DIR}/../CONTRIBUTING.md"
+TARGET_BUILDER="${SCRIPT_DIR}/build-rml-target"
+TARGET_BUILDER_PS="${TARGET_BUILDER}.ps1"
+if [[ ! -x "$TARGET_BUILDER" || ! -f "$TARGET_BUILDER_PS" ]]; then
+	echo "FAIL: guarded incremental RML target builders are missing" >&2
+	failure=1
+fi
+
+if grep -Eq -- '(^|[[:space:]])(-S|-B|--fresh|--clean-first)([[:space:]]|$)|New-PSDrive|subst[.]exe' \
+	"$TARGET_BUILDER" "$TARGET_BUILDER_PS"; then
+	echo "FAIL: incremental RML target builder reconfigures, cleans, or remaps the persistent build" >&2
+	failure=1
+fi
+
+if CARBON_RML_CMAKE_BUILD_DIR="${SCRIPT_DIR}/definitely-missing-cmake-build" \
+	"$TARGET_BUILDER" roblox_modloader >/dev/null 2>&1; then
+	echo "FAIL: incremental RML target builder accepted a directory without CMakeCache.txt" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'CARBON_RML_CMAKE_BUILD_DIR' "$CONTRIBUTING"; then
+	echo "FAIL: contributor workflow does not define one persistent RML CMake build directory" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'cmake --build $env:CARBON_RML_CMAKE_BUILD_DIR --config Release --target <target>' "$CONTRIBUTING"; then
+	echo "FAIL: contributor workflow does not require incremental target-only RML builds" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Do not reconfigure, clean, remap, or replace that build directory' "$CONTRIBUTING"; then
+	echo "FAIL: contributor workflow does not preserve the configured RML build cache" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Run the clean package build only once' "$CONTRIBUTING"; then
+	echo "FAIL: contributor workflow does not reserve clean packaging for final qualification" >&2
+	failure=1
+fi
+
 
 if ! grep -Fq -- 'Microsoft Visual Studio\Installer\vswhere.exe' "$BUILD_SCRIPT"; then
 	echo "FAIL: RML package build does not discover Visual Studio with vswhere" >&2
@@ -39,11 +79,40 @@ if ! grep -Fq -- '(Join-Path $stage "carbon-studio-helper.exe")' "$BUILD_SCRIPT"
 	echo "FAIL: RML package build does not require carbon-studio-helper.exe" >&2
 	failure=1
 fi
+if ! grep -Fq -- '[switch] $NativeOnly' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not define -NativeOnly switch" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Validating cached .NET SDK in native-only mode' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not validate cached .NET SDK in native-only mode" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'cached managed artifact is missing in $BuildDir' "$BUILD_SCRIPT"; then
+	echo "FAIL: RML package build does not validate cached managed outputs in native-only mode" >&2
+	failure=1
+fi
 
 HELPER_SOURCE="${SCRIPT_DIR}/carbon-studio-helper.cpp"
+if ! grep -Fq -- 'GetExitCodeThread(hThread.get(), &loadResult)' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper does not verify the remote LoadLibraryW result" >&2
+	failure=1
+fi
 
-if ! grep -Fq -- 'Usage: carbon-studio-helper <launch|inject|terminate|focus> [args...]' "$HELPER_SOURCE"; then
-	echo "FAIL: Carbon studio helper usage does not mention focus command" >&2
+if ! grep -Fq -- 'LoadLibraryW failed in the Roblox Studio process' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper does not report a rejected remote DLL load" >&2
+	failure=1
+fi
+
+
+if ! grep -Fq -- 'Usage: carbon-studio-helper <launch|inject|terminate|focus|bridge-request> [args...]' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper usage does not mention bridge-request command" >&2
+	failure=1
+fi
+
+if ! grep -Fq -- 'Usage: carbon-studio-helper bridge-request <port> <method> <path_b64> <content_type_or_dash> <range_or_dash> <timeout_ms>' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper bridge-request usage is missing" >&2
 	failure=1
 fi
 

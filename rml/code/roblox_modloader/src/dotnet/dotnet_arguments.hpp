@@ -180,7 +180,8 @@ namespace rml::dotnet
 			static const void* string_ops[3] = {nullptr, nullptr, reinterpret_cast<void*>(destroy_string)};
 			static const void* trivial_ops[3] = {nullptr, nullptr, reinterpret_cast<void*>(destroy_trivial)};
 
-			return type && type->name == "string" ? string_ops : trivial_ops;
+			const auto* type_name = type ? type->name() : nullptr;
+			return type_name && *type_name == "string" ? string_ops : trivial_ops;
 		}
 
 		template<typename T>

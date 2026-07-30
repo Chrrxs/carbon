@@ -7,12 +7,50 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <winhttp.h>
+#include <io.h>
+#include <fcntl.h>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <climits>
 #include <algorithm>
+
+class SafeWinHttpHandle {
+    HINTERNET handle_;
+public:
+    explicit SafeWinHttpHandle(HINTERNET h = NULL) : handle_(h) {}
+    ~SafeWinHttpHandle() {
+        close();
+    }
+    SafeWinHttpHandle(const SafeWinHttpHandle&) = delete;
+    SafeWinHttpHandle& operator=(const SafeWinHttpHandle&) = delete;
+    SafeWinHttpHandle(SafeWinHttpHandle&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = NULL;
+    }
+    SafeWinHttpHandle& operator=(SafeWinHttpHandle&& other) noexcept {
+        if (this != &other) {
+            close();
+            handle_ = other.handle_;
+            other.handle_ = NULL;
+        }
+        return *this;
+    }
+    HINTERNET get() const { return handle_; }
+    void reset(HINTERNET h = NULL) {
+        close();
+        handle_ = h;
+    }
+    void close() {
+        if (handle_) {
+            WinHttpCloseHandle(handle_);
+            handle_ = NULL;
+        }
+    }
+    bool is_valid() const { return handle_ != NULL; }
+    operator bool() const { return is_valid(); }
+};
 
 class SafeHandle {
     HANDLE handle_;
@@ -100,6 +138,400 @@ static bool parse_uint64(const std::string& str, uint64_t& out) {
         return false;
     }
 }
+static bool parse_uint64_allow_zero(const std::string& str, uint64_t& out) {
+    if (str.empty()) return false;
+    for (char c : str) {
+        if (c < '0' || c > '9') return false;
+    }
+    try {
+        size_t idx = 0;
+        unsigned long long val = std::stoull(str, &idx, 10);
+        if (idx != str.length()) {
+            return false;
+        }
+        out = static_cast<uint64_t>(val);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool read_exact(HANDLE hFile, void* buffer, DWORD bytesToRead) {
+    BYTE* ptr = reinterpret_cast<BYTE*>(buffer);
+    DWORD totalRead = 0;
+    while (totalRead < bytesToRead) {
+        DWORD read = 0;
+        if (!ReadFile(hFile, ptr + totalRead, bytesToRead - totalRead, &read, NULL) || read == 0) {
+            return false;
+        }
+        totalRead += read;
+    }
+    return true;
+}
+
+static bool write_exact(HANDLE hFile, const void* buffer, DWORD bytesToWrite) {
+    const BYTE* ptr = reinterpret_cast<const BYTE*>(buffer);
+    DWORD totalWritten = 0;
+    while (totalWritten < bytesToWrite) {
+        DWORD written = 0;
+        if (!WriteFile(hFile, ptr + totalWritten, bytesToWrite - totalWritten, &written, NULL) || written == 0) {
+            return false;
+        }
+        totalWritten += written;
+    }
+    return true;
+}
+
+static bool decode_base64(const std::string& input, std::vector<uint8_t>& out);
+static bool utf8_to_wstring(const std::vector<uint8_t>& bytes, std::wstring& out);
+
+static int cmd_bridge_request(
+    const std::string& port_str,
+    const std::string& method,
+    const std::string& path_b64,
+    const std::string& content_type_str,
+    const std::string& range_str,
+    const std::string& timeout_str
+) {
+    uint32_t port_val = 0;
+    if (!parse_uint32(port_str, port_val) || port_val < 1 || port_val > 65535) {
+        std::cerr << "Invalid port\n";
+        return 1;
+    }
+
+    if (method != "GET" && method != "POST" && method != "DELETE") {
+        std::cerr << "Invalid HTTP method\n";
+        return 1;
+    }
+
+    std::vector<uint8_t> path_bytes;
+    if (!decode_base64(path_b64, path_bytes) || path_bytes.empty()) {
+        std::cerr << "Invalid path base64\n";
+        return 1;
+    }
+
+    if (path_bytes[0] != '/') {
+        std::cerr << "Path must begin with '/'\n";
+        return 1;
+    }
+
+    if (path_bytes.size() >= 2 && path_bytes[1] == '/') {
+        std::cerr << "Path must not supply a host\n";
+        return 1;
+    }
+
+    for (uint8_t b : path_bytes) {
+        if (b == '\r' || b == '\n' || b == '\0') {
+            std::cerr << "Path must not contain CR, LF, or NUL\n";
+            return 1;
+        }
+    }
+
+    std::wstring wpath;
+    if (!utf8_to_wstring(path_bytes, wpath)) {
+        std::cerr << "Path is not valid UTF-8\n";
+        return 1;
+    }
+
+    std::wstring wcontent_type;
+    bool send_content_type = false;
+    if (content_type_str == "-") {
+        send_content_type = false;
+    } else if (content_type_str == "application/json") {
+        send_content_type = true;
+        wcontent_type = L"application/json";
+    } else if (content_type_str == "application/octet-stream") {
+        send_content_type = true;
+        wcontent_type = L"application/octet-stream";
+    } else {
+        std::cerr << "Invalid content type\n";
+        return 1;
+    }
+
+    std::wstring wrange;
+    bool send_range = false;
+    if (range_str == "-") {
+        send_range = false;
+    } else {
+        if (range_str.rfind("bytes=", 0) != 0) {
+            std::cerr << "Invalid range specifier\n";
+            return 1;
+        }
+        std::string spec = range_str.substr(6);
+        size_t dash_pos = spec.find('-');
+        if (dash_pos == std::string::npos || dash_pos == 0 || dash_pos == spec.length() - 1) {
+            std::cerr << "Invalid range specifier format\n";
+            return 1;
+        }
+        std::string start_str = spec.substr(0, dash_pos);
+        std::string end_str = spec.substr(dash_pos + 1);
+        uint64_t start_val = 0, end_val = 0;
+        if (!parse_uint64_allow_zero(start_str, start_val) || !parse_uint64_allow_zero(end_str, end_val) || start_val > end_val) {
+            std::cerr << "Invalid range byte bounds\n";
+            return 1;
+        }
+        send_range = true;
+        wrange = std::wstring(range_str.begin(), range_str.end());
+    }
+
+    uint32_t timeout_val = 0;
+    if (!parse_uint32(timeout_str, timeout_val) || timeout_val == 0) {
+        std::cerr << "Invalid timeout\n";
+        return 1;
+    }
+
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    char magic_req[8] = {0};
+    if (!read_exact(hStdin, magic_req, 8) || memcmp(magic_req, "CBRQ0001", 8) != 0) {
+        std::cerr << "Invalid request magic\n";
+        return 1;
+    }
+
+    uint8_t token_len_bytes[4] = {0};
+    if (!read_exact(hStdin, token_len_bytes, 4)) {
+        std::cerr << "Failed to read token length\n";
+        return 1;
+    }
+    uint32_t token_len = static_cast<uint32_t>(token_len_bytes[0]) |
+                        (static_cast<uint32_t>(token_len_bytes[1]) << 8) |
+                        (static_cast<uint32_t>(token_len_bytes[2]) << 16) |
+                        (static_cast<uint32_t>(token_len_bytes[3]) << 24);
+
+    if (token_len == 0 || token_len > 65536) {
+        std::cerr << "Invalid token length\n";
+        return 1;
+    }
+
+    std::vector<uint8_t> token_bytes(token_len);
+    if (!read_exact(hStdin, token_bytes.data(), token_len)) {
+        std::cerr << "Failed to read token bytes\n";
+        return 1;
+    }
+
+    std::wstring wtoken;
+    if (!utf8_to_wstring(token_bytes, wtoken)) {
+        std::cerr << "Token is not valid UTF-8\n";
+        return 1;
+    }
+
+    std::vector<uint8_t> request_body;
+    BYTE chunk[8192];
+    DWORD bytes_read = 0;
+    const size_t MAX_REQUEST_BODY = 100 * 1024 * 1024;
+    while (true) {
+        if (!ReadFile(hStdin, chunk, sizeof(chunk), &bytes_read, NULL) || bytes_read == 0) {
+            break;
+        }
+        if (request_body.size() + bytes_read > MAX_REQUEST_BODY) {
+            std::cerr << "Request body exceeds maximum allowed size\n";
+            return 1;
+        }
+        request_body.insert(request_body.end(), chunk, chunk + bytes_read);
+    }
+
+    SafeWinHttpHandle hSession(WinHttpOpen(
+        L"Carbon-Studio-Helper/1.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0
+    ));
+    if (!hSession) {
+        std::cerr << "WinHttpOpen failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    int timeout_int = (timeout_val > static_cast<uint32_t>(INT_MAX)) ? INT_MAX : static_cast<int>(timeout_val);
+    if (!WinHttpSetTimeouts(hSession.get(), timeout_int, timeout_int, timeout_int, timeout_int)) {
+        std::cerr << "WinHttpSetTimeouts failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    SafeWinHttpHandle hConnect(WinHttpConnect(
+        hSession.get(),
+        L"127.0.0.1",
+        static_cast<INTERNET_PORT>(port_val),
+        0
+    ));
+    if (!hConnect) {
+        std::cerr << "WinHttpConnect failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    std::wstring wmethod(method.begin(), method.end());
+    SafeWinHttpHandle hRequest(WinHttpOpenRequest(
+        hConnect.get(),
+        wmethod.c_str(),
+        wpath.c_str(),
+        NULL,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        0
+    ));
+    if (!hRequest) {
+        std::cerr << "WinHttpOpenRequest failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    std::wstring headers = L"Authorization: Bearer " + wtoken + L"\r\n";
+    if (send_content_type) {
+        headers += L"Content-Type: " + wcontent_type + L"\r\n";
+    }
+    if (send_range) {
+        headers += L"Range: " + wrange + L"\r\n";
+    }
+
+    if (!WinHttpAddRequestHeaders(
+            hRequest.get(),
+            headers.c_str(),
+            static_cast<DWORD>(-1L),
+            WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
+        std::cerr << "WinHttpAddRequestHeaders failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    DWORD body_size = static_cast<DWORD>(request_body.size());
+    if (!WinHttpSendRequest(
+            hRequest.get(),
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0,
+            WINHTTP_NO_REQUEST_DATA,
+            0,
+            body_size,
+            0)) {
+        std::cerr << "WinHttpSendRequest failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    if (body_size > 0) {
+        DWORD total_written = 0;
+        while (total_written < body_size) {
+            DWORD chunk_to_write = std::min<DWORD>(body_size - total_written, 65536);
+            DWORD written = 0;
+            if (!WinHttpWriteData(hRequest.get(), request_body.data() + total_written, chunk_to_write, &written) || written == 0) {
+                std::cerr << "WinHttpWriteData failed: " << GetLastError() << "\n";
+                return 1;
+            }
+            total_written += written;
+        }
+    }
+
+    if (!WinHttpReceiveResponse(hRequest.get(), NULL)) {
+        std::cerr << "WinHttpReceiveResponse failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    DWORD status_code = 0;
+    DWORD status_code_size = sizeof(status_code);
+    if (!WinHttpQueryHeaders(
+            hRequest.get(),
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status_code,
+            &status_code_size,
+            WINHTTP_NO_HEADER_INDEX)) {
+        std::cerr << "WinHttpQueryHeaders status code failed: " << GetLastError() << "\n";
+        return 1;
+    }
+
+    uint64_t declared_content_length = UINT64_MAX;
+    wchar_t cl_buf[64] = {0};
+    DWORD cl_buf_size = sizeof(cl_buf);
+    if (WinHttpQueryHeaders(
+            hRequest.get(),
+            WINHTTP_QUERY_CONTENT_LENGTH,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            cl_buf,
+            &cl_buf_size,
+            WINHTTP_NO_HEADER_INDEX)) {
+        wchar_t* endptr = nullptr;
+        unsigned long long val = wcstoull(cl_buf, &endptr, 10);
+        if (endptr != cl_buf && *endptr == L'\0') {
+            declared_content_length = static_cast<uint64_t>(val);
+        }
+    }
+
+    std::vector<uint8_t> content_range_utf8;
+    DWORD cr_buf_size = 0;
+    WinHttpQueryHeaders(
+        hRequest.get(),
+        WINHTTP_QUERY_CUSTOM,
+        L"Content-Range",
+        WINHTTP_NO_OUTPUT_BUFFER,
+        &cr_buf_size,
+        WINHTTP_NO_HEADER_INDEX
+    );
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && cr_buf_size > 0) {
+        std::vector<wchar_t> cr_buf(cr_buf_size / sizeof(wchar_t) + 1);
+        if (WinHttpQueryHeaders(
+                hRequest.get(),
+                WINHTTP_QUERY_CUSTOM,
+                L"Content-Range",
+                cr_buf.data(),
+                &cr_buf_size,
+                WINHTTP_NO_HEADER_INDEX)) {
+            std::wstring cr_wstr(cr_buf.data());
+            if (!cr_wstr.empty()) {
+                int ulen = WideCharToMultiByte(CP_UTF8, 0, cr_wstr.c_str(), static_cast<int>(cr_wstr.size()), NULL, 0, NULL, NULL);
+                if (ulen > 0) {
+                    content_range_utf8.resize(ulen);
+                    WideCharToMultiByte(CP_UTF8, 0, cr_wstr.c_str(), static_cast<int>(cr_wstr.size()), reinterpret_cast<char*>(content_range_utf8.data()), ulen, NULL, NULL);
+                }
+            }
+        }
+    }
+
+    std::vector<uint8_t> frame;
+    const char magic_resp[8] = {'C', 'B', 'R', 'S', '0', '0', '0', '1'};
+    frame.insert(frame.end(), magic_resp, magic_resp + 8);
+
+    uint32_t status_u32 = static_cast<uint32_t>(status_code);
+    frame.push_back(static_cast<uint8_t>(status_u32 & 0xFF));
+    frame.push_back(static_cast<uint8_t>((status_u32 >> 8) & 0xFF));
+    frame.push_back(static_cast<uint8_t>((status_u32 >> 16) & 0xFF));
+    frame.push_back(static_cast<uint8_t>((status_u32 >> 24) & 0xFF));
+
+    uint64_t cl_u64 = declared_content_length;
+    for (int i = 0; i < 8; ++i) {
+        frame.push_back(static_cast<uint8_t>((cl_u64 >> (i * 8)) & 0xFF));
+    }
+
+    uint32_t cr_len = static_cast<uint32_t>(content_range_utf8.size());
+    frame.push_back(static_cast<uint8_t>(cr_len & 0xFF));
+    frame.push_back(static_cast<uint8_t>((cr_len >> 8) & 0xFF));
+    frame.push_back(static_cast<uint8_t>((cr_len >> 16) & 0xFF));
+    frame.push_back(static_cast<uint8_t>((cr_len >> 24) & 0xFF));
+
+    if (cr_len > 0) {
+        frame.insert(frame.end(), content_range_utf8.begin(), content_range_utf8.end());
+    }
+
+    if (!write_exact(hStdout, frame.data(), static_cast<DWORD>(frame.size()))) {
+        return 1;
+    }
+
+    BYTE resp_buf[8192];
+    while (true) {
+        DWORD read_bytes = 0;
+        if (!WinHttpReadData(hRequest.get(), resp_buf, sizeof(resp_buf), &read_bytes)) {
+            return 1;
+        }
+        if (read_bytes == 0) {
+            break;
+        }
+        if (!write_exact(hStdout, resp_buf, read_bytes)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 
 static bool decode_base64(const std::string& input, std::vector<uint8_t>& out) {
     out.clear();
@@ -970,7 +1402,7 @@ static int cmd_focus(
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: carbon-studio-helper <launch|inject|terminate|focus> [args...]\n";
+        std::cerr << "Usage: carbon-studio-helper <launch|inject|terminate|focus|bridge-request> [args...]\n";
         return 1;
     }
 
@@ -1000,8 +1432,13 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return cmd_focus(argv[2], argv[3], argv[4], argv[5]);
+    } else if (cmd == "bridge-request") {
+        if (argc != 8) {
+            std::cerr << "Usage: carbon-studio-helper bridge-request <port> <method> <path_b64> <content_type_or_dash> <range_or_dash> <timeout_ms>\n";
+            return 1;
+        }
+        return cmd_bridge_request(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
     }
-
     std::cerr << "Unknown command: " << cmd << "\n";
     return 1;
 }

@@ -45,10 +45,6 @@ namespace RBX::Reflection
 		typedef Event ConstMember;
 		typedef Event Member;
 
-	protected:
-		char _unk_0x40[0x8];
-		SignatureDescriptor signature;
-
 		bool operator==(const EventDescriptor& other) const
 		{
 			return this == &other;
@@ -59,10 +55,7 @@ namespace RBX::Reflection
 		}
 
 	public:
-		const SignatureDescriptor& get_signature() const
-		{
-			return signature;
-		}
+		[[nodiscard]] const SignatureDescriptor* get_signature() const noexcept;
 
 		virtual Signals::Connection connect(EventSource* source, std::shared_ptr<GenericSlotWrapper> wrapper) const = 0;
 
@@ -94,21 +87,9 @@ namespace RBX::Reflection
 		[[nodiscard]] Signals::Signal* get_signal(EventSource* source) const;
 		[[nodiscard]] std::vector<Signals::Connection> snapshot_connections(EventSource* source) const;
 
-	private:
-		RML_LAYOUT_GUARD_BEGIN()
-			RML_ASSERT_LAYOUT_SIZE(EventDescriptor, 0x78);
-			RML_ASSERT_LAYOUT_OFFSET(EventDescriptor, signature, 0x48);
-		RML_LAYOUT_GUARD_END()
 	};
 	
 	class EventDesc : public EventDescriptor
 	{
-	public:
-		std::int32_t signal;
-
-	private:
-		RML_LAYOUT_GUARD_BEGIN()
-			RML_ASSERT_LAYOUT_OFFSET(EventDesc, signal, 0x78);
-		RML_LAYOUT_GUARD_END()
 	};
 }

@@ -28,16 +28,8 @@ namespace RBX::Reflection
 
 		static bool locked_down;
 
-		const Name& name;
-		std::unique_ptr<bool> is_replicable;
-		std::unique_ptr<bool> is_outdated;
+		virtual ~Descriptor() = default;
 
-		const Attributes attributes;
-
-		virtual ~Descriptor()
-		{
-		}
+		[[nodiscard]] const Name* name() const noexcept;
 	};
-
-	static_assert(sizeof(Descriptor) == 0x28, "Descriptor binary layout mismatch: expected 40 bytes.");
 }

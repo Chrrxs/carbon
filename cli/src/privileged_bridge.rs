@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::prelude::*;
 use bytes::Bytes;
 use directories::BaseDirs;
 use rbx_dom_weak::types::Variant;
@@ -7,10 +8,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
 	collections::{HashMap, HashSet},
 	env, fs,
-	io::{self, Write},
+	io::{self, Read, Write},
 	net::Ipv4Addr,
 	path::{Path, PathBuf},
-	sync::mpsc,
+	process::{Command, Stdio},
+	sync::{mpsc, Arc},
 	thread,
 	time::{Duration, SystemTime},
 };
@@ -263,11 +265,237 @@ pub struct LiveSessionStatus {
 	pub engine_generation: u64,
 }
 
+struct HelperExecutionRequest<'a> {
+	port: u16,
+	method: &'a str,
+	path_b64: &'a str,
+	content_type: &'a str,
+	range: &'a str,
+	timeout_ms: u64,
+	stdin_payload: &'a [u8],
+	process_id: u32,
+}
+
+trait HelperExecutor: Send + Sync + std::fmt::Debug {
+	fn execute(&self, request: HelperExecutionRequest<'_>, writer: &mut dyn Write) -> Result<HelperExecutionResult>;
+}
+
+#[derive(Debug)]
+struct HelperExecutionResult {
+	status: u32,
+	content_length: Option<u64>,
+	content_range: Option<String>,
+	copied_bytes: u64,
+	error_body: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct ProcessHelperExecutor;
+
+impl HelperExecutor for ProcessHelperExecutor {
+	fn execute(&self, request: HelperExecutionRequest<'_>, writer: &mut dyn Write) -> Result<HelperExecutionResult> {
+		let HelperExecutionRequest {
+			port,
+			method,
+			path_b64,
+			content_type,
+			range,
+			timeout_ms,
+			stdin_payload,
+			process_id,
+		} = request;
+		let helper_path = crate::rml::helper_path()
+			.with_context(|| format!("failed to find RML helper for bridge process {process_id}"))?;
+
+		let mut child = Command::new(&helper_path)
+			.args([
+				"bridge-request",
+				&port.to_string(),
+				method,
+				path_b64,
+				content_type,
+				range,
+				&timeout_ms.to_string(),
+			])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.with_context(|| {
+				format!(
+					"failed to spawn RML helper process for bridge process {process_id} ({})",
+					helper_path.display()
+				)
+			})?;
+
+		if let Some(mut stdin) = child.stdin.take() {
+			stdin.write_all(stdin_payload).with_context(|| {
+				format!("failed to write request framing to RML helper process for bridge process {process_id}")
+			})?;
+		}
+
+		let stderr_pipe = child.stderr.take();
+		let stderr_handle = thread::spawn(move || {
+			let mut buf = Vec::new();
+			if let Some(mut r) = stderr_pipe {
+				let _ = io::copy(&mut r, &mut buf);
+			}
+			buf
+		});
+
+		let mut stdout = child
+			.stdout
+			.take()
+			.with_context(|| format!("RML helper process stdout is unavailable for bridge process {process_id}"))?;
+
+		let result = parse_helper_stdout(&mut stdout, writer, process_id);
+
+		if result.is_err() {
+			let _ = child.kill();
+			let _ = child.wait();
+			let stderr_bytes = stderr_handle.join().unwrap_or_default();
+			if !stderr_bytes.is_empty() {
+				let stderr_msg = String::from_utf8_lossy(&stderr_bytes);
+				return result.with_context(|| format!("RML helper process stderr: {stderr_msg}"));
+			}
+			return result;
+		}
+
+		let exit_status = child
+			.wait()
+			.with_context(|| format!("failed to wait for RML helper process for bridge process {process_id}"))?;
+
+		let _stderr = stderr_handle.join().unwrap_or_default();
+
+		anyhow::ensure!(
+			exit_status.success(),
+			"RML helper process for bridge process {process_id} failed with exit status {:?}",
+			exit_status.code()
+		);
+
+		result
+	}
+}
+
+fn parse_helper_stdout(
+	stdout_read: &mut dyn Read,
+	writer: &mut dyn Write,
+	process_id: u32,
+) -> Result<HelperExecutionResult> {
+	let mut header_buf = [0_u8; 24];
+	if let Err(err) = stdout_read.read_exact(&mut header_buf) {
+		anyhow::bail!("RML helper process for bridge process {process_id} failed to return framing header: {err}");
+	}
+
+	if &header_buf[0..8] != b"CBRS0001" {
+		anyhow::bail!("RML bridge process {process_id} helper returned invalid framing magic");
+	}
+
+	let status = u32::from_le_bytes(header_buf[8..12].try_into().unwrap());
+	let raw_len = u64::from_le_bytes(header_buf[12..20].try_into().unwrap());
+	let content_length = if raw_len == u64::MAX { None } else { Some(raw_len) };
+	let range_len = u32::from_le_bytes(header_buf[20..24].try_into().unwrap()) as usize;
+
+	let content_range = if range_len > 0 {
+		let mut range_bytes = vec![0_u8; range_len];
+		if let Err(err) = stdout_read.read_exact(&mut range_bytes) {
+			anyhow::bail!("failed to read Content-Range header from RML helper for bridge process {process_id}: {err}");
+		}
+		Some(
+			String::from_utf8(range_bytes).with_context(|| {
+				format!("invalid Content-Range UTF-8 from RML helper for bridge process {process_id}")
+			})?,
+		)
+	} else {
+		None
+	};
+
+	let is_success_status = (200..=299).contains(&status);
+	if is_success_status {
+		let copied = io::copy(stdout_read, writer).with_context(|| {
+			format!("failed to stream response body from RML helper for bridge process {process_id}")
+		})?;
+		Ok(HelperExecutionResult {
+			status,
+			content_length,
+			content_range,
+			copied_bytes: copied,
+			error_body: None,
+		})
+	} else {
+		let mut err_body = Vec::new();
+		stdout_read.read_to_end(&mut err_body).with_context(|| {
+			format!("failed to read error response body from RML helper for bridge process {process_id}")
+		})?;
+		Ok(HelperExecutionResult {
+			status,
+			content_length,
+			content_range,
+			copied_bytes: 0,
+			error_body: Some(err_body),
+		})
+	}
+}
+
+fn encode_request_path(path: &str) -> Result<String> {
+	let normalized = format!("/{}", path.trim_start_matches('/'));
+	anyhow::ensure!(
+		!normalized.contains('\r') && !normalized.contains('\n') && !normalized.contains('\0'),
+		"RML bridge request path contains control characters"
+	);
+	anyhow::ensure!(
+		!normalized.starts_with("//") && !normalized.contains("://"),
+		"RML bridge request path cannot supply a host"
+	);
+	Ok(BASE64_STANDARD.encode(normalized.as_bytes()))
+}
+
+fn build_stdin_payload(token: &str, body: &[u8]) -> Vec<u8> {
+	let token_bytes = token.as_bytes();
+	let token_len = token_bytes.len() as u32;
+	let mut payload = Vec::with_capacity(8 + 4 + token_bytes.len() + body.len());
+	payload.extend_from_slice(b"CBRQ0001");
+	payload.extend_from_slice(&token_len.to_le_bytes());
+	payload.extend_from_slice(token_bytes);
+	payload.extend_from_slice(body);
+	payload
+}
+
+fn parse_loopback_port(endpoint: &str) -> Result<u16> {
+	anyhow::ensure!(
+		endpoint.starts_with("http://127.0.0.1:"),
+		"RML bridge is not loopback-only"
+	);
+	let url = reqwest::Url::parse(endpoint).context("invalid RML bridge endpoint")?;
+	anyhow::ensure!(url.scheme() == "http", "RML bridge endpoint must use HTTP");
+	anyhow::ensure!(
+		url.host_str() == Some("127.0.0.1"),
+		"RML bridge endpoint is not loopback"
+	);
+	let port = url.port().context("RML bridge endpoint has no port")?;
+	anyhow::ensure!(port >= 1, "invalid RML bridge loopback port");
+	Ok(port)
+}
+
+#[derive(Clone)]
+enum Transport {
+	Reqwest {
+		client: Client,
+	},
+	Helper {
+		port: u16,
+		token: String,
+		process_id: u32,
+		request_timeout: Duration,
+		executor: Arc<dyn HelperExecutor>,
+	},
+}
+
 #[derive(Clone)]
 pub struct Bridge {
 	discovery: Discovery,
 	endpoint: String,
-	client: Client,
+	transport: Transport,
 }
 
 impl Bridge {
@@ -486,23 +714,92 @@ impl Bridge {
 			"RML bridge is not loopback-only"
 		);
 		anyhow::ensure!(!discovery.token.is_empty(), "RML bridge discovery token is empty");
-		let endpoint = if env::var_os("WSL_DISTRO_NAME").is_some() {
-			match discovery.wsl_endpoint.as_deref() {
-				Some(endpoint) => validate_wsl_endpoint(endpoint)?,
-				None => discovery.endpoint.clone(),
-			}
+
+		let loopback_port = parse_loopback_port(&discovery.endpoint)?;
+		let is_wsl = env::var_os("WSL_DISTRO_NAME").is_some();
+		let use_helper = is_wsl;
+
+		if use_helper {
+			let endpoint = discovery.endpoint.clone();
+			let transport = Transport::Helper {
+				port: loopback_port,
+				token: discovery.token.clone(),
+				process_id: discovery.process_id,
+				request_timeout,
+				executor: Arc::new(ProcessHelperExecutor),
+			};
+			Ok(Self {
+				discovery,
+				endpoint,
+				transport,
+			})
 		} else {
-			discovery.endpoint.clone()
-		};
-		let client = Client::builder()
-			.connect_timeout(connect_timeout)
-			.timeout(request_timeout)
-			.build()?;
-		Ok(Self {
+			let endpoint = if is_wsl {
+				match discovery.wsl_endpoint.as_deref() {
+					Some(endpoint) => validate_wsl_endpoint(endpoint)?,
+					None => discovery.endpoint.clone(),
+				}
+			} else {
+				discovery.endpoint.clone()
+			};
+			let client = Client::builder()
+				.connect_timeout(connect_timeout)
+				.timeout(request_timeout)
+				.build()?;
+			let transport = Transport::Reqwest { client };
+			Ok(Self {
+				discovery,
+				endpoint,
+				transport,
+			})
+		}
+	}
+
+	#[cfg(test)]
+	fn with_test_transport(discovery: Discovery, transport: Transport) -> Self {
+		let endpoint = discovery.endpoint.clone();
+		Self {
 			discovery,
 			endpoint,
-			client,
-		})
+			transport,
+		}
+	}
+
+	fn request_helper(
+		&self,
+		method: &str,
+		path: &str,
+		content_type: &str,
+		range: &str,
+		body: &[u8],
+		writer: &mut dyn Write,
+	) -> Result<HelperExecutionResult> {
+		let Transport::Helper {
+			port,
+			token,
+			process_id,
+			request_timeout,
+			executor,
+		} = &self.transport
+		else {
+			anyhow::bail!("not using helper transport");
+		};
+		let path_b64 = encode_request_path(path)?;
+		let stdin_payload = build_stdin_payload(token, body);
+		let timeout_ms = request_timeout.as_millis() as u64;
+		executor.execute(
+			HelperExecutionRequest {
+				port: *port,
+				method,
+				path_b64: &path_b64,
+				content_type,
+				range,
+				timeout_ms,
+				stdin_payload: &stdin_payload,
+				process_id: *process_id,
+			},
+			writer,
+		)
 	}
 
 	pub fn bridge_id(&self) -> &str {
@@ -514,77 +811,192 @@ impl Bridge {
 	}
 
 	pub fn get<R: DeserializeOwned>(&self, path: &str) -> Result<R> {
-		let response = self
-			.client
-			.get(self.url(path))
-			.bearer_auth(&self.discovery.token)
-			.send()
-			.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
-		Self::ensure_success(path, response)?
-			.json()
-			.context("failed to decode RML bridge response")
+		match &self.transport {
+			Transport::Reqwest { client } => {
+				let response = client
+					.get(self.url(path))
+					.bearer_auth(&self.discovery.token)
+					.send()
+					.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
+				Self::ensure_success(path, response)?
+					.json()
+					.context("failed to decode RML bridge response")
+			}
+			Transport::Helper { .. } => {
+				let mut body_buf = Vec::new();
+				let res = self.request_helper("GET", path, "-", "-", &[], &mut body_buf)?;
+				if !(200..=299).contains(&res.status) {
+					let detail = res
+						.error_body
+						.as_deref()
+						.map(|b| String::from_utf8_lossy(b).into_owned())
+						.unwrap_or_else(String::new);
+					anyhow::bail!("RML bridge {path} returned {}: {detail}", res.status);
+				}
+				if let Some(declared) = res.content_length {
+					anyhow::ensure!(
+						res.copied_bytes == declared,
+						"RML bridge artifact length mismatch: declared {declared}, received {}",
+						res.copied_bytes
+					);
+				}
+				serde_json::from_slice(&body_buf).context("failed to decode RML bridge response")
+			}
+		}
 	}
 
 	pub fn post<T: Serialize + ?Sized, R: DeserializeOwned>(&self, path: &str, body: &T) -> Result<R> {
-		let response = self
-			.client
-			.post(self.url(path))
-			.bearer_auth(&self.discovery.token)
-			.json(body)
-			.send()
-			.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
-		Self::ensure_success(path, response)?
-			.json()
-			.context("failed to decode RML bridge response")
+		match &self.transport {
+			Transport::Reqwest { client } => {
+				let response = client
+					.post(self.url(path))
+					.bearer_auth(&self.discovery.token)
+					.json(body)
+					.send()
+					.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
+				Self::ensure_success(path, response)?
+					.json()
+					.context("failed to decode RML bridge response")
+			}
+			Transport::Helper { .. } => {
+				let req_bytes = serde_json::to_vec(body).context("failed to serialize RML bridge request body")?;
+				let mut body_buf = Vec::new();
+				let res = self.request_helper("POST", path, "application/json", "-", &req_bytes, &mut body_buf)?;
+				if !(200..=299).contains(&res.status) {
+					let detail = res
+						.error_body
+						.as_deref()
+						.map(|b| String::from_utf8_lossy(b).into_owned())
+						.unwrap_or_else(String::new);
+					anyhow::bail!("RML bridge {path} returned {}: {detail}", res.status);
+				}
+				if let Some(declared) = res.content_length {
+					anyhow::ensure!(
+						res.copied_bytes == declared,
+						"RML bridge artifact length mismatch: declared {declared}, received {}",
+						res.copied_bytes
+					);
+				}
+				serde_json::from_slice(&body_buf).context("failed to decode RML bridge response")
+			}
+		}
 	}
 
 	pub fn post_bytes<R: DeserializeOwned>(&self, path: &str, body: Bytes) -> Result<R> {
-		let response = self
-			.client
-			.post(self.url(path))
-			.bearer_auth(&self.discovery.token)
-			.header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-			.body(body)
-			.send()
-			.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
-		Self::ensure_success(path, response)?
-			.json()
-			.context("failed to decode RML bridge response")
+		match &self.transport {
+			Transport::Reqwest { client } => {
+				let response = client
+					.post(self.url(path))
+					.bearer_auth(&self.discovery.token)
+					.header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+					.body(body)
+					.send()
+					.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
+				Self::ensure_success(path, response)?
+					.json()
+					.context("failed to decode RML bridge response")
+			}
+			Transport::Helper { .. } => {
+				let mut body_buf = Vec::new();
+				let res = self.request_helper("POST", path, "application/octet-stream", "-", &body, &mut body_buf)?;
+				if !(200..=299).contains(&res.status) {
+					let detail = res
+						.error_body
+						.as_deref()
+						.map(|b| String::from_utf8_lossy(b).into_owned())
+						.unwrap_or_else(String::new);
+					anyhow::bail!("RML bridge {path} returned {}: {detail}", res.status);
+				}
+				if let Some(declared) = res.content_length {
+					anyhow::ensure!(
+						res.copied_bytes == declared,
+						"RML bridge artifact length mismatch: declared {declared}, received {}",
+						res.copied_bytes
+					);
+				}
+				serde_json::from_slice(&body_buf).context("failed to decode RML bridge response")
+			}
+		}
 	}
 
 	pub fn delete<R: DeserializeOwned>(&self, path: &str) -> Result<R> {
-		let response = self
-			.client
-			.delete(self.url(path))
-			.bearer_auth(&self.discovery.token)
-			.send()
-			.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
-		Self::ensure_success(path, response)?
-			.json()
-			.context("failed to decode RML bridge response")
+		match &self.transport {
+			Transport::Reqwest { client } => {
+				let response = client
+					.delete(self.url(path))
+					.bearer_auth(&self.discovery.token)
+					.send()
+					.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
+				Self::ensure_success(path, response)?
+					.json()
+					.context("failed to decode RML bridge response")
+			}
+			Transport::Helper { .. } => {
+				let mut body_buf = Vec::new();
+				let res = self.request_helper("DELETE", path, "-", "-", &[], &mut body_buf)?;
+				if !(200..=299).contains(&res.status) {
+					let detail = res
+						.error_body
+						.as_deref()
+						.map(|b| String::from_utf8_lossy(b).into_owned())
+						.unwrap_or_else(String::new);
+					anyhow::bail!("RML bridge {path} returned {}: {detail}", res.status);
+				}
+				if let Some(declared) = res.content_length {
+					anyhow::ensure!(
+						res.copied_bytes == declared,
+						"RML bridge artifact length mismatch: declared {declared}, received {}",
+						res.copied_bytes
+					);
+				}
+				serde_json::from_slice(&body_buf).context("failed to decode RML bridge response")
+			}
+		}
 	}
 
 	/// Stream a raw bridge artifact directly into a bounded-storage writer.
 	///
 	/// Capture payloads use this route so the RBXM never becomes a JSON/base64
 	/// string or a second complete in-memory Rust buffer.
-	pub fn get_to_writer<W: Write + ?Sized>(&self, path: &str, writer: &mut W) -> Result<u64> {
-		let response = self
-			.client
-			.get(self.url(path))
-			.bearer_auth(&self.discovery.token)
-			.send()
-			.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
-		let mut response = Self::ensure_success(path, response)?;
-		let declared = response.content_length();
-		let copied = io::copy(&mut response, writer).context("failed to stream RML bridge artifact")?;
-		if let Some(declared) = declared {
-			anyhow::ensure!(
-				copied == declared,
-				"RML bridge artifact length mismatch: declared {declared}, received {copied}"
-			);
+	pub fn get_to_writer<W: Write + ?Sized>(&self, path: &str, mut writer: &mut W) -> Result<u64> {
+		match &self.transport {
+			Transport::Reqwest { client } => {
+				let response = client
+					.get(self.url(path))
+					.bearer_auth(&self.discovery.token)
+					.send()
+					.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
+				let mut response = Self::ensure_success(path, response)?;
+				let declared = response.content_length();
+				let copied = io::copy(&mut response, writer).context("failed to stream RML bridge artifact")?;
+				if let Some(declared) = declared {
+					anyhow::ensure!(
+						copied == declared,
+						"RML bridge artifact length mismatch: declared {declared}, received {copied}"
+					);
+				}
+				Ok(copied)
+			}
+			Transport::Helper { .. } => {
+				let res = self.request_helper("GET", path, "-", "-", &[], &mut writer)?;
+				if !(200..=299).contains(&res.status) {
+					let detail = res
+						.error_body
+						.as_deref()
+						.map(|b| String::from_utf8_lossy(b).into_owned())
+						.unwrap_or_else(String::new);
+					anyhow::bail!("RML bridge {path} returned {}: {detail}", res.status);
+				}
+				if let Some(declared) = res.content_length {
+					anyhow::ensure!(
+						res.copied_bytes == declared,
+						"RML bridge artifact length mismatch: declared {declared}, received {}",
+						res.copied_bytes
+					);
+				}
+				Ok(res.copied_bytes)
+			}
 		}
-		Ok(copied)
 	}
 
 	pub fn get_range_to_writer<W: Write + ?Sized>(
@@ -592,7 +1004,7 @@ impl Bridge {
 		path: &str,
 		offset: u64,
 		length: u64,
-		writer: &mut W,
+		mut writer: &mut W,
 	) -> Result<u64> {
 		if length == 0 {
 			return Ok(0);
@@ -600,37 +1012,73 @@ impl Bridge {
 		let end = offset
 			.checked_add(length - 1)
 			.context("RML bridge artifact range overflows u64")?;
-		let response = self
-			.client
-			.get(self.url(path))
-			.bearer_auth(&self.discovery.token)
-			.header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-			.send()
-			.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
-		let mut response = Self::ensure_success(path, response)?;
-		anyhow::ensure!(
-			response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
-			"RML bridge ignored the requested artifact byte range"
-		);
-		let content_range = response
-			.headers()
-			.get(reqwest::header::CONTENT_RANGE)
-			.context("RML bridge range response has no Content-Range header")?
-			.to_str()
-			.context("RML bridge returned a non-text Content-Range header")?;
-		let expected_prefix = format!("bytes {offset}-{end}/");
-		let total = content_range
-			.strip_prefix(&expected_prefix)
-			.context("RML bridge returned the wrong artifact byte range")?
-			.parse::<u64>()
-			.context("RML bridge returned an invalid artifact range length")?;
-		anyhow::ensure!(total > end, "RML bridge artifact range exceeds its published length");
-		let copied = io::copy(&mut response, writer).context("failed to stream RML bridge artifact range")?;
-		anyhow::ensure!(
-			copied == length,
-			"RML bridge artifact range length mismatch: requested {length}, received {copied}"
-		);
-		Ok(copied)
+
+		match &self.transport {
+			Transport::Reqwest { client } => {
+				let response = client
+					.get(self.url(path))
+					.bearer_auth(&self.discovery.token)
+					.header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+					.send()
+					.with_context(|| format!("failed to contact RML bridge process {}", self.discovery.process_id))?;
+				let mut response = Self::ensure_success(path, response)?;
+				anyhow::ensure!(
+					response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+					"RML bridge ignored the requested artifact byte range"
+				);
+				let content_range = response
+					.headers()
+					.get(reqwest::header::CONTENT_RANGE)
+					.context("RML bridge range response has no Content-Range header")?
+					.to_str()
+					.context("RML bridge returned a non-text Content-Range header")?;
+				let expected_prefix = format!("bytes {offset}-{end}/");
+				let total = content_range
+					.strip_prefix(&expected_prefix)
+					.context("RML bridge returned the wrong artifact byte range")?
+					.parse::<u64>()
+					.context("RML bridge returned an invalid artifact range length")?;
+				anyhow::ensure!(total > end, "RML bridge artifact range exceeds its published length");
+				let copied = io::copy(&mut response, writer).context("failed to stream RML bridge artifact range")?;
+				anyhow::ensure!(
+					copied == length,
+					"RML bridge artifact range length mismatch: requested {length}, received {copied}"
+				);
+				Ok(copied)
+			}
+			Transport::Helper { .. } => {
+				let range_header = format!("bytes={offset}-{end}");
+				let res = self.request_helper("GET", path, "-", &range_header, &[], &mut writer)?;
+				if res.status != 206 {
+					if (200..=299).contains(&res.status) {
+						anyhow::bail!("RML bridge ignored the requested artifact byte range");
+					}
+					let detail = res
+						.error_body
+						.as_deref()
+						.map(|b| String::from_utf8_lossy(b).into_owned())
+						.unwrap_or_else(String::new);
+					anyhow::bail!("RML bridge {path} returned {}: {detail}", res.status);
+				}
+				let content_range = res
+					.content_range
+					.as_deref()
+					.context("RML bridge range response has no Content-Range header")?;
+				let expected_prefix = format!("bytes {offset}-{end}/");
+				let total = content_range
+					.strip_prefix(&expected_prefix)
+					.context("RML bridge returned the wrong artifact byte range")?
+					.parse::<u64>()
+					.context("RML bridge returned an invalid artifact range length")?;
+				anyhow::ensure!(total > end, "RML bridge artifact range exceeds its published length");
+				anyhow::ensure!(
+					res.copied_bytes == length,
+					"RML bridge artifact range length mismatch: requested {length}, received {}",
+					res.copied_bytes
+				);
+				Ok(res.copied_bytes)
+			}
+		}
 	}
 
 	fn ensure_success(path: &str, response: reqwest::blocking::Response) -> Result<reqwest::blocking::Response> {
@@ -1117,16 +1565,17 @@ mod tests {
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		let (mut discovery, capabilities) = discovery_and_capabilities(true, 1);
 		discovery.endpoint = format!("http://{}/", listener.local_addr().unwrap());
-		let path = env::temp_dir().join(format!(
-			"carbon-exact-rml-bridge-{}-{}.json",
-			std::process::id(),
-			uuid::Uuid::new_v4().simple()
-		));
-		fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
-		let bridge =
-			Bridge::from_path_with_timeouts(&path, None, Duration::from_millis(100), Duration::from_millis(100))
-				.unwrap();
-		fs::remove_file(&path).unwrap();
+		let endpoint = discovery.endpoint.clone();
+		let client = Client::builder()
+			.connect_timeout(Duration::from_millis(100))
+			.timeout(Duration::from_millis(100))
+			.build()
+			.unwrap();
+		let bridge = Bridge {
+			discovery,
+			endpoint,
+			transport: Transport::Reqwest { client },
+		};
 
 		let server = thread::spawn(move || {
 			let (mut stream, _) = listener.accept().unwrap();
@@ -1179,5 +1628,254 @@ mod tests {
 		assert!(route.exists());
 		assert!(other.exists());
 		fs::remove_dir_all(root).unwrap();
+	}
+	#[derive(Debug)]
+	struct MockHelperExecutor {
+		raw_stdout: Vec<u8>,
+	}
+
+	impl HelperExecutor for MockHelperExecutor {
+		fn execute(
+			&self,
+			request: HelperExecutionRequest<'_>,
+			writer: &mut dyn Write,
+		) -> Result<HelperExecutionResult> {
+			let mut cursor = io::Cursor::new(&self.raw_stdout);
+			parse_helper_stdout(&mut cursor, writer, request.process_id)
+		}
+	}
+
+	#[derive(Debug)]
+	struct AuthenticatedHelperExecutor {
+		raw_stdout: Vec<u8>,
+	}
+
+	impl HelperExecutor for AuthenticatedHelperExecutor {
+		fn execute(
+			&self,
+			request: HelperExecutionRequest<'_>,
+			writer: &mut dyn Write,
+		) -> Result<HelperExecutionResult> {
+			assert_eq!(request.method, "GET");
+			assert_eq!(
+				BASE64_STANDARD.decode(request.path_b64).unwrap(),
+				b"/v1/capabilities"
+			);
+			assert_eq!(request.port, 1234);
+			assert_eq!(request.stdin_payload, b"CBRQ0001\x06\x00\x00\x00secret");
+			let mut cursor = io::Cursor::new(&self.raw_stdout);
+			parse_helper_stdout(&mut cursor, writer, request.process_id)
+		}
+	}
+
+	fn make_helper_stdout(
+		status: u32,
+		content_length: Option<u64>,
+		content_range: Option<&str>,
+		body: &[u8],
+	) -> Vec<u8> {
+		let mut buf = Vec::new();
+		buf.extend_from_slice(b"CBRS0001");
+		buf.extend_from_slice(&status.to_le_bytes());
+		let raw_len = content_length.unwrap_or(u64::MAX);
+		buf.extend_from_slice(&raw_len.to_le_bytes());
+		let range_bytes = content_range.unwrap_or("").as_bytes();
+		let range_len = range_bytes.len() as u32;
+		buf.extend_from_slice(&range_len.to_le_bytes());
+		if range_len > 0 {
+			buf.extend_from_slice(range_bytes);
+		}
+		buf.extend_from_slice(body);
+		buf
+	}
+
+	#[test]
+	fn backend_selection_uses_helper_when_wsl_and_wsl_endpoint_present() {
+		let (mut discovery, _) = discovery_and_capabilities(true, 1);
+		discovery.wsl_endpoint = Some("http://172.25.80.1:1234/".to_owned());
+		let path = env::temp_dir().join(format!(
+			"carbon-backend-selection-{}-{}.json",
+			std::process::id(),
+			uuid::Uuid::new_v4().simple()
+		));
+		fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
+
+		let old_env = env::var_os("WSL_DISTRO_NAME");
+		env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+
+		let bridge =
+			Bridge::from_path_with_timeouts(&path, None, Duration::from_millis(100), Duration::from_millis(100))
+				.unwrap();
+
+		if let Some(old) = old_env {
+			env::set_var("WSL_DISTRO_NAME", old);
+		} else {
+			env::remove_var("WSL_DISTRO_NAME");
+		}
+		fs::remove_file(&path).unwrap();
+
+		match bridge.transport {
+			Transport::Helper { port, .. } => assert_eq!(port, 1234),
+			Transport::Reqwest { .. } => panic!("expected Helper transport under WSL when wslEndpoint is present"),
+		}
+	}
+
+	#[test]
+	fn backend_selection_uses_helper_when_wsl_endpoint_absent() {
+		let (discovery, _) = discovery_and_capabilities(true, 1);
+		let path = env::temp_dir().join(format!(
+			"carbon-backend-selection-reqwest-{}-{}.json",
+			std::process::id(),
+			uuid::Uuid::new_v4().simple()
+		));
+		fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
+
+		let old_env = env::var_os("WSL_DISTRO_NAME");
+		env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+
+		let bridge =
+			Bridge::from_path_with_timeouts(&path, None, Duration::from_millis(100), Duration::from_millis(100))
+				.unwrap();
+
+		if let Some(old) = old_env {
+			env::set_var("WSL_DISTRO_NAME", old);
+		} else {
+			env::remove_var("WSL_DISTRO_NAME");
+		}
+		fs::remove_file(&path).unwrap();
+
+		match bridge.transport {
+			Transport::Helper { port, .. } => assert_eq!(port, 1234),
+			Transport::Reqwest { .. } => panic!("expected Helper transport under WSL when wslEndpoint is absent"),
+		}
+	}
+
+	#[test]
+	fn helper_transport_frames_the_bearer_token() {
+		let (discovery, capabilities) = discovery_and_capabilities(true, 1);
+		let body = serde_json::to_vec(&capabilities).unwrap();
+		let mock = Arc::new(AuthenticatedHelperExecutor {
+			raw_stdout: make_helper_stdout(200, Some(body.len() as u64), None, &body),
+		});
+		let bridge = Bridge::with_test_transport(
+			discovery,
+			Transport::Helper {
+				port: 1234,
+				token: "secret".to_owned(),
+				process_id: 42,
+				request_timeout: Duration::from_secs(1),
+				executor: mock,
+			},
+		);
+
+		assert_eq!(
+			bridge.get::<Capabilities>("v1/capabilities").unwrap().bridge_id,
+			bridge.bridge_id()
+		);
+	}
+
+	#[test]
+	fn helper_framing_failure_invalid_magic() {
+		let raw_stdout = b"CBRX0001\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec();
+		let mock = Arc::new(MockHelperExecutor { raw_stdout });
+		let (discovery, _) = discovery_and_capabilities(true, 1);
+		let bridge = Bridge::with_test_transport(
+			discovery,
+			Transport::Helper {
+				port: 1234,
+				token: "secret".to_owned(),
+				process_id: 42,
+				request_timeout: Duration::from_secs(1),
+				executor: mock,
+			},
+		);
+
+		let err = bridge.get::<serde_json::Value>("v1/capabilities").unwrap_err();
+		assert!(err.to_string().contains("invalid framing magic"));
+	}
+
+	#[test]
+	fn helper_framing_failure_truncated_header() {
+		let raw_stdout = b"CBRS0001short".to_vec();
+		let mock = Arc::new(MockHelperExecutor { raw_stdout });
+		let (discovery, _) = discovery_and_capabilities(true, 1);
+		let bridge = Bridge::with_test_transport(
+			discovery,
+			Transport::Helper {
+				port: 1234,
+				token: "secret".to_owned(),
+				process_id: 42,
+				request_timeout: Duration::from_secs(1),
+				executor: mock,
+			},
+		);
+
+		let err = bridge.get::<serde_json::Value>("v1/capabilities").unwrap_err();
+		assert!(err.to_string().contains("failed to return framing header"));
+	}
+
+	#[test]
+	fn helper_status_failure_returns_error_detail() {
+		let raw_stdout = make_helper_stdout(500, None, None, b"internal server error");
+		let mock = Arc::new(MockHelperExecutor { raw_stdout });
+		let (discovery, _) = discovery_and_capabilities(true, 1);
+		let bridge = Bridge::with_test_transport(
+			discovery,
+			Transport::Helper {
+				port: 1234,
+				token: "secret".to_owned(),
+				process_id: 42,
+				request_timeout: Duration::from_secs(1),
+				executor: mock,
+			},
+		);
+
+		let err = bridge.get::<serde_json::Value>("v1/capabilities").unwrap_err();
+		assert!(err.to_string().contains("500: internal server error"));
+	}
+
+	#[test]
+	fn helper_header_failure_missing_content_range_for_range_request() {
+		let raw_stdout = make_helper_stdout(206, Some(10), None, b"0123456789");
+		let mock = Arc::new(MockHelperExecutor { raw_stdout });
+		let (discovery, _) = discovery_and_capabilities(true, 1);
+		let bridge = Bridge::with_test_transport(
+			discovery,
+			Transport::Helper {
+				port: 1234,
+				token: "secret".to_owned(),
+				process_id: 42,
+				request_timeout: Duration::from_secs(1),
+				executor: mock,
+			},
+		);
+
+		let mut writer = Vec::new();
+		let err = bridge
+			.get_range_to_writer("v1/artifact", 0, 10, &mut writer)
+			.unwrap_err();
+		assert!(err.to_string().contains("no Content-Range header"));
+	}
+
+	#[test]
+	fn helper_truncation_failure_content_length_mismatch() {
+		let raw_stdout = make_helper_stdout(200, Some(100), None, b"short");
+		let mock = Arc::new(MockHelperExecutor { raw_stdout });
+		let (discovery, _) = discovery_and_capabilities(true, 1);
+		let bridge = Bridge::with_test_transport(
+			discovery,
+			Transport::Helper {
+				port: 1234,
+				token: "secret".to_owned(),
+				process_id: 42,
+				request_timeout: Duration::from_secs(1),
+				executor: mock,
+			},
+		);
+
+		let err = bridge.get::<serde_json::Value>("v1/capabilities").unwrap_err();
+		assert!(err
+			.to_string()
+			.contains("RML bridge artifact length mismatch: declared 100, received 5"));
 	}
 }

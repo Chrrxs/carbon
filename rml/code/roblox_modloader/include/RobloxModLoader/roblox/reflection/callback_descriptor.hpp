@@ -14,26 +14,8 @@ namespace RBX::Reflection
 		typedef Callback ConstMember;
 		typedef Callback Member;
 
-	protected:
-		SignatureDescriptor signature;
-		bool async_flag;
-
 	public:
-		const SignatureDescriptor& get_signature() const
-		{
-			return signature;
-		}
-
-		bool is_async() const
-		{
-			return async_flag;
-		}
-
-	private:
-		RML_LAYOUT_GUARD_BEGIN()
-			RML_ASSERT_LAYOUT_SIZE(CallbackDescriptor, 0x78);
-			RML_ASSERT_LAYOUT_OFFSET(CallbackDescriptor, signature, 0x40);
-			RML_ASSERT_LAYOUT_OFFSET(CallbackDescriptor, async_flag, 0x70);
-		RML_LAYOUT_GUARD_END()
+		[[nodiscard]] const SignatureDescriptor* get_signature() const noexcept;
+		[[nodiscard]] bool is_async() const noexcept;
 	};
 }

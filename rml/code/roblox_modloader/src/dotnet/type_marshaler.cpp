@@ -40,8 +40,10 @@ namespace rml::dotnet
 
 		static_assert(TypeMarshaler::kMaxBlittableEngineTypeBytes >= sizeof(RBX::CoordinateFrame) && TypeMarshaler::kMaxBlittableEngineTypeBytes >= sizeof(RBX::Rect2D) && TypeMarshaler::kMaxBlittableEngineTypeBytes >= sizeof(RBX::Vector3) && TypeMarshaler::kMaxBlittableEngineTypeBytes >= sizeof(RBX::Color3) && TypeMarshaler::kMaxBlittableEngineTypeBytes >= sizeof(RBX::BrickColor), "TypeMarshaler::kMaxBlittableEngineTypeBytes must bound every reconstructed blittable engine type");
 
-		[[nodiscard]] size_t blittable_size(const RBX::Name& type_name) noexcept
+		[[nodiscard]] size_t blittable_size(const RBX::Name* type_name) noexcept
 		{
+			if (!type_name)
+				return 0;
 			static constexpr std::pair<const char*, size_t> table[] = {
 			    {"Vector3", sizeof(RBX::Vector3)},
 			    {"Vector3int16", sizeof(RBX::Vector3int16)},
@@ -62,17 +64,19 @@ namespace rml::dotnet
 
 			for (const auto& [name, size] : table)
 			{
-				if (type_name == name)
+				if (*type_name == name)
 					return size;
 			}
 			return 0;
 		}
 
-		[[nodiscard]] size_t sequence_stride(const RBX::Name& type_name) noexcept
+		[[nodiscard]] size_t sequence_stride(const RBX::Name* type_name) noexcept
 		{
-			if (type_name == "NumberSequence")
+			if (!type_name)
+				return 0;
+			if (*type_name == "NumberSequence")
 				return 12;
-			if (type_name == "ColorSequence")
+			if (*type_name == "ColorSequence")
 				return 20;
 			return 0;
 		}
@@ -268,13 +272,14 @@ namespace rml::dotnet
 		default: break;
 		}
 
-		if (const auto size = blittable_size(type.name); size != 0)
+		const auto* type_name = type.name();
+		if (const auto size = blittable_size(type_name); size != 0)
 			return {MarshalKind::Blittable, size};
 
-		if (const auto stride = sequence_stride(type.name); stride != 0)
+		if (const auto stride = sequence_stride(type_name); stride != 0)
 			return {MarshalKind::Sequence, stride};
 
-		if (type.name == "buffer")
+		if (type_name && *type_name == "buffer")
 			return {MarshalKind::Buffer, 0};
 
 		if (type.is_enum)
@@ -304,7 +309,8 @@ namespace rml::dotnet
 			const auto instance = shared ? reinterpret_cast<uintptr_t>(shared->get()) : 0;
 			if (!utils::memory::is_valid_pointer(instance))
 			{
-				RML_WARN("Dropping implausible instance handle {:#x} for type '{}'", instance, type.name.c_str());
+				const auto* type_name = type.name();
+				RML_WARN("Dropping implausible instance handle {:#x} for type '{}'", instance, type_name ? type_name->c_str() : "");
 				return null_value();
 			}
 			return instance_value(instance);
@@ -352,13 +358,20 @@ namespace rml::dotnet
 			const auto* shared = variant.try_cast<InstancesSharedPtr>();
 			return marshal_instances(shared ? shared->get() : nullptr);
 		}
-		default: RML_WARN("Unsupported variant type '{}'", type.name.c_str()); return null_value();
+		default:
+		{
+			const auto* type_name = type.name();
+			RML_WARN("Unsupported variant type '{}'", type_name ? type_name->c_str() : "");
+			return null_value();
+		}
 		}
 	}
 
 	InteropVariant TypeMarshaler::encode_property(const RBX::Reflection::PropertyDescriptor* descriptor, const RBX::Reflection::DescribedBase* instance)
 	{
-		const auto& type = descriptor->type;
+		const auto* type_ptr = descriptor ? descriptor->type() : nullptr;
+		if (!type_ptr) return null_value();
+		const auto& type = *type_ptr;
 		const auto [kind, byte_size] = classify(type);
 
 		if (kind == MarshalKind::String)
@@ -372,7 +385,9 @@ namespace rml::dotnet
 
 		if (kind == MarshalKind::Unsupported)
 		{
-			RML_WARN("Unsupported property type '{}' for get_property('{}')", type.name.c_str(), descriptor->name.c_str());
+			const auto* desc_name = descriptor ? descriptor->name() : nullptr;
+			const auto* type_name = type.name();
+			RML_WARN("Unsupported property type '{}' for get_property('{}')", type_name ? type_name->c_str() : "", desc_name ? desc_name->c_str() : "");
 			return null_value();
 		}
 
@@ -392,7 +407,9 @@ namespace rml::dotnet
 
 	bool TypeMarshaler::decode_property(const RBX::Reflection::PropertyDescriptor* descriptor, RBX::Reflection::DescribedBase* instance, const InteropVariant& value)
 	{
-		const auto& type = descriptor->type;
+		const auto* type_ptr = descriptor ? descriptor->type() : nullptr;
+		if (!type_ptr) return false;
+		const auto& type = *type_ptr;
 		const auto plan = classify(type);
 
 		if (plan.kind == MarshalKind::String)
@@ -493,7 +510,9 @@ namespace rml::dotnet
 			return true;
 		}
 
-		RML_WARN("Unsupported property type '{}' for set_property('{}')", type.name.c_str(), descriptor->name.c_str());
+		const auto* desc_name = descriptor ? descriptor->name() : nullptr;
+		const auto* type_name = type.name();
+		RML_WARN("Unsupported property type '{}' for set_property('{}')", type_name ? type_name->c_str() : "", desc_name ? desc_name->c_str() : "");
 		return false;
 	}
 

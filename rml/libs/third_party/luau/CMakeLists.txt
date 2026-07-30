@@ -82,7 +82,7 @@ endif()
 # Proxy target to make it possible to depend on private VM headers
 add_library(Luau.VM.Internals INTERFACE)
 
-include(Sources.cmake)
+include(sources.cmake)
 
 target_compile_features(Luau.Common PUBLIC cxx_std_17)
 target_include_directories(Luau.Common PUBLIC Common/include)

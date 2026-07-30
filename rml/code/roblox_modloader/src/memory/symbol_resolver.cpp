@@ -1,3 +1,4 @@
+#include "RobloxModLoader/internal/common.hpp"
 #include "RobloxModLoader/memory/symbol_resolver.hpp"
 
 #if defined(RML_WINDOWS)

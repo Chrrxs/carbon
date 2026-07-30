@@ -149,9 +149,26 @@ namespace rml::memory::rtti
 
 	RTTIInfo* Scanner::get_class_rtti(std::string_view class_name) noexcept
 	{
-		const auto it = s_class_rtti_map.find(std::string(class_name));
-		return it != s_class_rtti_map.end() ? it->second.get() : nullptr;
+		const auto candidates = get_class_rtti_candidates(class_name);
+		if (candidates.empty())
+			return nullptr;
+		for (const auto& candidate : candidates)
+		{
+			if (candidate->get_complete_object_locator()->offset == 0)
+				return candidate.get();
+		}
+		return candidates.front().get();
 	}
+
+	std::span<const std::unique_ptr<RTTIInfo> > Scanner::get_class_rtti_candidates(
+		const std::string_view class_name) noexcept
+	{
+		const auto it = s_class_rtti_map.find(std::string(class_name));
+		if (it == s_class_rtti_map.end())
+			return {};
+		return it->second;
+	}
+
 
 	void Scanner::clear_cache() noexcept
 	{
@@ -285,11 +302,18 @@ namespace rml::memory::rtti
 			return false;
 		}
 
-		auto* base_class = class_hierarchy->base_class_array_offset.as<BaseClassDescriptor*>(base_address);
-		if (!base_class)
+		if (class_hierarchy->num_base_classes == 0)
+			return false;
+		auto* base_class_offsets = class_hierarchy->base_class_array_offset.as<pe::IBO32*>(base_address);
+		if (!base_class_offsets ||
+			!pe::Parser::is_ibo_in_section(base_class_offsets[0], m_section_data->rdata_sections))
 		{
 			return false;
 		}
+		auto* first_base_class =
+			base_class_offsets[0].as<BaseClassDescriptor*>(base_address);
+		if (!first_base_class)
+			return false;
 
 		const std::string class_name = RTTIInfo::demangle_name(type_desc->name);
 		if (class_name.empty())
@@ -310,10 +334,9 @@ namespace rml::memory::rtti
 			return false;
 		}
 
-		auto rtti = std::make_unique<RTTIInfo>(vft_ptr, col, type_desc, class_hierarchy, base_class);
-
-		s_class_rtti_map.emplace(class_name, std::move(rtti));
-
+		auto& candidates = s_class_rtti_map[class_name];
+		candidates.push_back(
+			std::make_unique<RTTIInfo>(vft_ptr, col, type_desc, class_hierarchy, first_base_class));
 		LOG_TRACE("Found RTTI for class: {}", class_name);
 		return true;
 	}

@@ -7,6 +7,7 @@
 #include "type.hpp"
 
 class Function;
+struct lua_State;
 
 namespace RBX::Reflection
 {
@@ -57,38 +58,17 @@ namespace RBX::Reflection
 		// everything would be easier if they had chosen agnostic
 		virtual void invoke(DescribedBase* instance, Arguments& arguments, lua_State* L) const = 0;
 
-		[[nodiscard]] const SignatureDescriptor& get_signature() const noexcept
-		{
-			return signature;
-		}
-
-		[[nodiscard]] Kind get_kind() const noexcept
-		{
-			return kind;
-		}
+		[[nodiscard]] const SignatureDescriptor* get_signature() const noexcept;
+		[[nodiscard]] Kind get_kind() const noexcept;
 
 		template<typename T>
 		[[nodiscard]] T* native_func_ptr() const noexcept
 		{
-			return reinterpret_cast<T*>(invoke_func_ptr);
+			return reinterpret_cast<T*>(invoke_func_ptr_raw());
 		}
 
-	protected:
-		std::byte pad[0x8];
-		SignatureDescriptor signature;
-		Kind kind;
-		void* invoke_func_ptr;
-		std::intptr_t bound_this_delta;
-
 	private:
-		RML_LAYOUT_GUARD_BEGIN()
-			RML_ASSERT_LAYOUT_SIZE(FunctionDescriptor, 0x90);
-			RML_ASSERT_LAYOUT_OFFSET(FunctionDescriptor, pad, 0x40);
-			RML_ASSERT_LAYOUT_OFFSET(FunctionDescriptor, signature, 0x48);
-			RML_ASSERT_LAYOUT_OFFSET(FunctionDescriptor, kind, 0x78);
-			RML_ASSERT_LAYOUT_OFFSET(FunctionDescriptor, invoke_func_ptr, 0x80);
-			RML_ASSERT_LAYOUT_OFFSET(FunctionDescriptor, bound_this_delta, 0x88);
-		RML_LAYOUT_GUARD_END()
+		[[nodiscard]] void* invoke_func_ptr_raw() const noexcept;
 	};
 
 	class Function
@@ -108,9 +88,9 @@ namespace RBX::Reflection
 
 		Function& operator=(const Function& other) = default;
 
-		[[nodiscard]] const Name& name() const
+		[[nodiscard]] const Name* name() const noexcept
 		{
-			return m_descriptor->name;
+			return m_descriptor ? m_descriptor->name() : nullptr;
 		}
 
 		[[nodiscard]] const FunctionDescriptor* descriptor() const

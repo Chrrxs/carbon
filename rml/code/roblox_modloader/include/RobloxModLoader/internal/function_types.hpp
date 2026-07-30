@@ -11,7 +11,6 @@ namespace RBX::Security
 namespace functions
 {
 	using get_string_atom = uintptr_t (*)(const char* name);
-	using descriptor_lookup = uintptr_t* (*)(uintptr_t class_descriptor_hash, uintptr_t* member_descriptor_hash);
 	using get_scheduler = uintptr_t (*)();
 	using print = void(__fastcall*)(RBX::MessageType level, const char* fmt, ...);
 	using luaH_new = void*(__fastcall*)(void* L, int32_t narray, int32_t nhash);

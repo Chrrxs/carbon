@@ -78,15 +78,46 @@ namespace rml::carbon
 		    const RBX::Reflection::PropertyDescriptor& descriptor,
 		    const std::string_view candidate) noexcept
 		{
-			return descriptor.type.name.to_string() == candidate || descriptor.type.tag.to_string() == candidate;
+			const auto* t = descriptor.type();
+			if (!t) return false;
+			const auto* n = t->name();
+			const std::string_view name_str = n ? n->to_string() : "";
+			const std::string_view tag_str = t->tag.to_string();
+			return name_str == candidate || tag_str == candidate;
 		}
 
+		[[nodiscard]] bool is_valid_base_hierarchy(const RBX::Reflection::ClassDescriptor* descriptor) noexcept
+		{
+			if (!descriptor)
+				return false;
+			const auto* current = descriptor;
+			constexpr std::size_t max_depth = 64;
+			std::array<const RBX::Reflection::ClassDescriptor*, max_depth> visited{};
+			std::size_t depth = 0;
+			while (current != nullptr && depth < max_depth)
+			{
+				for (std::size_t i = 0; i < depth; ++i)
+					if (visited[i] == current)
+						return false;
+				visited[depth++] = current;
+
+				const auto base_res = ::get_roblox_internals_profile().reflection().base_class(current);
+				if (!base_res)
+					return false;
+				current = *base_res;
+			}
+			return current == nullptr;
+		}
 	}
 
 	bool SerializedPropertyAccess::is_binary_type(const RBX::Reflection::PropertyDescriptor& descriptor) noexcept
 	{
-		return contains(supported_types, descriptor.type.name.to_string()) ||
-		       contains(supported_types, descriptor.type.tag.to_string());
+		const auto* t = descriptor.type();
+		if (!t) return false;
+		const auto* n = t->name();
+		const std::string_view name_str = n ? n->to_string() : "";
+		const std::string_view tag_str = t->tag.to_string();
+		return contains(supported_types, name_str) || contains(supported_types, tag_str);
 	}
 
 	bool SerializedPropertyAccess::read_content_source_type(
@@ -97,13 +128,20 @@ namespace rml::carbon
 		// ContentId shares the "Content" reflection tag but stores a string.
 		// The SourceType discriminator is valid only for the concrete Content
 		// descriptor/Variant type.
-		if (descriptor.type.name != "Content")
+		const auto* t = descriptor.type();
+		const auto* n = t ? t->name() : nullptr;
+		if (!n || n->to_string() != "Content" ||
+		    !is_valid_base_hierarchy(instance.try_get_descriptor()) ||
+		    !is_valid_base_hierarchy(descriptor.owner()))
 			return false;
 
 		RBX::Reflection::Variant variant;
 		descriptor.get_variant(&instance, variant);
 		VariantCleanup cleanup(variant);
-		if (variant.is_void() || variant.type().name != "Content")
+		if (variant.is_void())
+			return false;
+		const auto* variant_name = variant.type().name();
+		if (!variant_name || variant_name->to_string() != "Content")
 			return false;
 
 		std::uint32_t source_type{};
@@ -121,15 +159,19 @@ namespace rml::carbon
 
 	bool SerializedPropertyAccess::is_supported_type(const RBX::Reflection::PropertyDescriptor& descriptor) noexcept
 	{
-		if (is_binary_type(descriptor) || descriptor.type.is_enum || descriptor.type.name == "SecurityCapabilities" ||
-		    descriptor.type.tag == "SecurityCapabilities")
+		const auto* t = descriptor.type();
+		if (!t) return false;
+		const auto* n = t->name();
+		const std::string_view name_str = n ? n->to_string() : "";
+		const std::string_view tag_str = t->tag.to_string();
+		if (is_binary_type(descriptor) || t->is_enum || name_str == "SecurityCapabilities" || tag_str == "SecurityCapabilities")
 			return true;
-		const auto marshal_kind = dotnet::TypeMarshaler::classify(descriptor.type).kind;
+		const auto marshal_kind = dotnet::TypeMarshaler::classify(*t).kind;
 		if (marshal_kind == dotnet::MarshalKind::Blittable || marshal_kind == dotnet::MarshalKind::Sequence)
 			return true;
 
 		using namespace RBX::Reflection;
-		switch (descriptor.type.type_id)
+		switch (t->type_id)
 		{
 		case TypeId::Bool:
 		case TypeId::Int:
@@ -144,8 +186,12 @@ namespace rml::carbon
 
 	bool SerializedPropertyAccess::is_explicitly_excluded(const RBX::Reflection::PropertyDescriptor& descriptor) noexcept
 	{
-		const std::string_view owner = descriptor.owner.name.to_string();
-		const std::string_view name = descriptor.name.to_string();
+		const auto* o = descriptor.owner();
+		const auto* o_name = o ? o->name() : nullptr;
+		const auto* d_name = descriptor.name();
+		if (!o_name || !d_name) return false;
+		const std::string_view owner = o_name->to_string();
+		const std::string_view name = d_name->to_string();
 		const std::string qualified = std::string(owner) + "." + std::string(name);
 		return contains(excluded_runtime_properties, qualified);
 	}
@@ -162,15 +208,21 @@ namespace rml::carbon
 
 	bool SerializedPropertyAccess::is_copyable(const RBX::Reflection::PropertyDescriptor& descriptor) noexcept
 	{
+		const auto* t = descriptor.type();
+		const auto* n = t ? t->name() : nullptr;
+		const std::string_view name_str = n ? n->to_string() : "";
+		const std::string_view tag_str = t ? t->tag.to_string() : "";
 		return !is_explicitly_excluded(descriptor) &&
-		       (is_accessible(descriptor) || contains(model_serialized_types, descriptor.type.name.to_string()) ||
-		        contains(model_serialized_types, descriptor.type.tag.to_string()));
+		       (is_accessible(descriptor) || contains(model_serialized_types, name_str) ||
+		        contains(model_serialized_types, tag_str));
 	}
 
 	bool SerializedPropertyAccess::describe(
 	    const RBX::Reflection::PropertyDescriptor& descriptor,
 	    dotnet::SerializedPropertyInfo& out_info)
 	{
+		if (!is_valid_base_hierarchy(descriptor.owner()))
+			return false;
 		out_info = {};
 		if (descriptor.can_xml_read())
 			out_info.flags |= dotnet::SerializedPropertyXmlRead;
@@ -188,11 +240,14 @@ namespace rml::carbon
 			out_info.flags |= dotnet::SerializedPropertyExcluded;
 		if (is_accessible(descriptor))
 			out_info.flags |= dotnet::SerializedPropertyAccessible;
-		if (dotnet::TypeMarshaler::classify(descriptor.type).kind == dotnet::MarshalKind::RefInstance)
+		const auto* t = descriptor.type();
+		if (!t) return false;
+		if (dotnet::TypeMarshaler::classify(*t).kind == dotnet::MarshalKind::RefInstance)
 			out_info.flags |= dotnet::SerializedPropertyReference;
 
-		const std::string_view name = descriptor.type.name.to_string();
-		const std::string_view tag = descriptor.type.tag.to_string();
+		const auto* n = t->name();
+		const std::string_view name = n ? n->to_string() : "";
+		const std::string_view tag = t->tag.to_string();
 		std::string_view type_name = name;
 		if (contains(supported_types, tag))
 			type_name = tag;
@@ -209,7 +264,9 @@ namespace rml::carbon
 	    const RBX::Reflection::DescribedBase& instance,
 	    std::vector<std::byte>& out_value)
 	{
-		if (!is_accessible(descriptor))
+		if (!is_accessible(descriptor) ||
+		    !is_valid_base_hierarchy(instance.try_get_descriptor()) ||
+		    !is_valid_base_hierarchy(descriptor.owner()))
 			return false;
 
 		std::string value;
@@ -308,7 +365,7 @@ namespace rml::carbon
 			std::memcpy(&capabilities, bytes, sizeof(capabilities));
 			value = std::to_string(capabilities);
 		}
-		else if (descriptor.type.is_enum || descriptor.type.type_id == RBX::Reflection::TypeId::Integer)
+		else if ((descriptor.type() && descriptor.type()->is_enum) || (descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Integer))
 		{
 			RBX::Reflection::Variant variant;
 			descriptor.get_variant(&instance, variant);
@@ -317,26 +374,26 @@ namespace rml::carbon
 				return false;
 			value = std::to_string(*variant.try_cast<int>());
 		}
-		else if (descriptor.type.type_id == RBX::Reflection::TypeId::Int64 ||
-		         descriptor.type.type_id == RBX::Reflection::TypeId::Float ||
-		         descriptor.type.type_id == RBX::Reflection::TypeId::Double)
+		else if ((descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Int64) ||
+		         (descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Float) ||
+		         (descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Double))
 		{
 			RBX::Reflection::Variant variant;
 			descriptor.get_variant(&instance, variant);
 			VariantCleanup cleanup(variant);
 			if (variant.is_void())
 				return false;
-			const size_t size = descriptor.type.type_id == RBX::Reflection::TypeId::Int64
+			const size_t size = descriptor.type()->type_id == RBX::Reflection::TypeId::Int64
 			                        ? sizeof(int64_t)
-			                        : descriptor.type.type_id == RBX::Reflection::TypeId::Float ? sizeof(float)
-			                                                                                 : sizeof(double);
+			                        : descriptor.type()->type_id == RBX::Reflection::TypeId::Float ? sizeof(float)
+			                                                                                   : sizeof(double);
 			const auto* bytes = variant.try_cast<std::byte>();
 			if (!bytes)
 				return false;
 			out_value.assign(bytes, bytes + size);
 			return true;
 		}
-		else if (const auto plan = dotnet::TypeMarshaler::classify(descriptor.type);
+		else if (const auto plan = descriptor.type() ? dotnet::TypeMarshaler::classify(*descriptor.type()) : dotnet::MarshalPlan{};
 		         plan.kind == dotnet::MarshalKind::Blittable || plan.kind == dotnet::MarshalKind::Sequence)
 		{
 			RBX::Reflection::Variant variant;
@@ -390,7 +447,9 @@ namespace rml::carbon
 	    RBX::Reflection::DescribedBase& instance,
 	    const std::span<const std::byte> value)
 	{
-		if (!is_accessible(descriptor))
+		if (!is_accessible(descriptor) ||
+		    !is_valid_base_hierarchy(instance.try_get_descriptor()) ||
+		    !is_valid_base_hierarchy(descriptor.owner()))
 			return false;
 
 		const std::string text{reinterpret_cast<const char*>(value.data()), value.size()};
@@ -449,34 +508,40 @@ namespace rml::carbon
 			descriptor.set_variant(&instance, variant);
 			return true;
 		}
-		if (const auto plan = dotnet::TypeMarshaler::classify(descriptor.type);
-		    plan.kind == dotnet::MarshalKind::Blittable || plan.kind == dotnet::MarshalKind::Sequence)
+		if (const auto* t = descriptor.type(); t != nullptr)
 		{
-			if (plan.kind == dotnet::MarshalKind::Blittable)
+			const auto plan = dotnet::TypeMarshaler::classify(*t);
+			if (plan.kind == dotnet::MarshalKind::Blittable || plan.kind == dotnet::MarshalKind::Sequence)
 			{
-				if (value.size() != plan.byte_size)
-					return false;
-			}
-			else
-			{
-				if (value.size() < sizeof(int32_t) || plan.byte_size == 0)
-					return false;
-				int32_t count{};
-				std::memcpy(&count, value.data(), sizeof(count));
-				if (count < 0 ||
-				    static_cast<size_t>(count) >
-				        (std::numeric_limits<size_t>::max() - sizeof(count)) / plan.byte_size ||
-				    value.size() != sizeof(count) + static_cast<size_t>(count) * plan.byte_size)
+				if (plan.kind == dotnet::MarshalKind::Blittable)
 				{
-					return false;
+					if (value.size() != plan.byte_size)
+						return false;
 				}
+				else
+				{
+					if (value.size() < sizeof(int32_t) || plan.byte_size == 0)
+						return false;
+					int32_t count{};
+					std::memcpy(&count, value.data(), sizeof(count));
+					if (count < 0 ||
+					    static_cast<size_t>(count) >
+					        (std::numeric_limits<size_t>::max() - sizeof(count)) / plan.byte_size ||
+					    value.size() != sizeof(count) + static_cast<size_t>(count) * plan.byte_size)
+					{
+						return false;
+					}
+				}
+				dotnet::InteropVariant encoded{};
+				encoded.tag = dotnet::InteropValueTag::Blittable;
+				encoded.as_instance = reinterpret_cast<uintptr_t>(value.data());
+				return dotnet::TypeMarshaler::decode_property(&descriptor, &instance, encoded);
 			}
-			dotnet::InteropVariant encoded{};
-			encoded.tag = dotnet::InteropValueTag::Blittable;
-			encoded.as_instance = reinterpret_cast<uintptr_t>(value.data());
-			return dotnet::TypeMarshaler::decode_property(&descriptor, &instance, encoded);
 		}
-		if (descriptor.type.is_enum || descriptor.type.type_id == RBX::Reflection::TypeId::Integer)
+		const auto* t = descriptor.type();
+		if (!t)
+			return false;
+		if (t->is_enum || t->type_id == RBX::Reflection::TypeId::Integer)
 		{
 			int parsed{};
 			const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
@@ -491,14 +556,14 @@ namespace rml::carbon
 			descriptor.set_variant(&instance, variant);
 			return true;
 		}
-		if (descriptor.type.type_id == RBX::Reflection::TypeId::Int64 ||
-		    descriptor.type.type_id == RBX::Reflection::TypeId::Float ||
-		    descriptor.type.type_id == RBX::Reflection::TypeId::Double)
+		if (t->type_id == RBX::Reflection::TypeId::Int64 ||
+		    t->type_id == RBX::Reflection::TypeId::Float ||
+		    t->type_id == RBX::Reflection::TypeId::Double)
 		{
-			const size_t size = descriptor.type.type_id == RBX::Reflection::TypeId::Int64
+			const size_t size = t->type_id == RBX::Reflection::TypeId::Int64
 			                        ? sizeof(int64_t)
-			                        : descriptor.type.type_id == RBX::Reflection::TypeId::Float ? sizeof(float)
-			                                                                                 : sizeof(double);
+			                        : t->type_id == RBX::Reflection::TypeId::Float ? sizeof(float)
+			                                                                  : sizeof(double);
 			if (value.size() != size)
 				return false;
 			RBX::Reflection::Variant variant;
@@ -529,8 +594,16 @@ namespace rml::carbon
 		// crashes Studio. Read with the source descriptor and write with the
 		// destination descriptor so Roblox still owns the private value's lifetime
 		// and type-safe assignment without assuming a shared owner layout.
+		const auto* src_t = source_descriptor.type();
+		const auto* dst_t = destination_descriptor.type();
+		const auto* src_n = src_t ? src_t->name() : nullptr;
+		const auto* dst_n = dst_t ? dst_t->name() : nullptr;
 		if (is_explicitly_excluded(source_descriptor) || is_explicitly_excluded(destination_descriptor) ||
-		    source_descriptor.type.name != destination_descriptor.type.name)
+		    !src_n || !dst_n || src_n->to_string() != dst_n->to_string() ||
+		    !is_valid_base_hierarchy(source.try_get_descriptor()) ||
+		    !is_valid_base_hierarchy(source_descriptor.owner()) ||
+		    !is_valid_base_hierarchy(destination.try_get_descriptor()) ||
+		    !is_valid_base_hierarchy(destination_descriptor.owner()))
 			return false;
 
 		RBX::Reflection::Variant variant;

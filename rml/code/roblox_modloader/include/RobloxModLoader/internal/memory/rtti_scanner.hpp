@@ -183,11 +183,15 @@ namespace rml::memory::rtti
          */
 		[[nodiscard]] static RTTIInfo* get_class_rtti(std::string_view class_name) noexcept;
 
+		[[nodiscard]] static std::span<const std::unique_ptr<RTTIInfo> > get_class_rtti_candidates(
+			std::string_view class_name) noexcept;
+
+
 		/**
          * @brief Get all discovered RTTI classes
          * @return Reference to RTTI map
          */
-		[[nodiscard]] static const std::unordered_map<std::string, std::unique_ptr<RTTIInfo> >& get_all_classes() noexcept
+		[[nodiscard]] static const std::unordered_map<std::string, std::vector<std::unique_ptr<RTTIInfo> > >& get_all_classes() noexcept
 		{
 			return s_class_rtti_map;
 		}
@@ -223,7 +227,7 @@ namespace rml::memory::rtti
 		std::unique_ptr<pe::Parser> m_pe_parser;
 		std::unique_ptr<SectionData> m_section_data;
 
-		static inline std::unordered_map<std::string, std::unique_ptr<RTTIInfo> > s_class_rtti_map{};
+		static inline std::unordered_map<std::string, std::vector<std::unique_ptr<RTTIInfo> > > s_class_rtti_map{};
 	};
 
 	class RTTIManager

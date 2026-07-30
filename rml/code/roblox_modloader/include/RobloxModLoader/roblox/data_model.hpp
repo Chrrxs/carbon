@@ -1,11 +1,12 @@
 #pragma once
 
+#include <expected>
+#include "RobloxModLoader/roblox/reflection/runtime_layout_resolver.hpp"
 #include <memory>
 
 #include "instance.hpp"
 #include "job_types.hpp"
 
-#include "RobloxModLoader/util/layout_assert.hpp"
 
 namespace RBX {
     class DataModelJob;
@@ -21,27 +22,14 @@ namespace RBX {
     };
 
     class DataModel : public Instance {
-        char m_pad_0[0x26C];
-        DataModelType m_type;
-        char m_pad_1[0x299];
-        bool m_initialized;
-
     public:
-        DataModelType get_type() const;
-
-        bool is_initialized() const;
+        std::expected<DataModelType, rml::roblox::internals::CompatibilityError> get_type() const;
 
         // Roblox's scheduler owns the reflection-visible DataModel Instance as
         // a subobject. Native task submission takes the owning context rather
         // than this Instance address.
-        void *get_task_context() noexcept;
+        std::expected<void*, rml::roblox::internals::CompatibilityError> get_task_context() const noexcept;
 
-        static DataModel *from_job(const DataModelJob *job);
-
-    private:
-        RML_LAYOUT_GUARD_BEGIN()
-            RML_ASSERT_LAYOUT_OFFSET(DataModel, m_type, 0x324);
-            RML_ASSERT_LAYOUT_OFFSET(DataModel, m_initialized, 0x5C1);
-        RML_LAYOUT_GUARD_END()
+        static DataModel *from_job(const DataModelJob *job, const rml::roblox::internals::RobloxInternalsProfile* profile = nullptr);
     };
 }

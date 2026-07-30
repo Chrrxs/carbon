@@ -21,7 +21,9 @@ namespace rml::jobs {
             return false;
         }
 
-        const auto data_model_type = data_model->get_type();
+        const auto type_res = data_model->get_type();
+        if (!type_res) return false;
+        const auto data_model_type = *type_res;
 
         if (!rml::has_task_scheduler()) {
             return false;
@@ -38,7 +40,9 @@ namespace rml::jobs {
             return;
         }
 
-        const auto data_model_type = data_model->get_type();
+        const auto type_res = data_model->get_type();
+        if (!type_res) return;
+        const auto data_model_type = *type_res;
 
         if (const auto engine = rml::task_scheduler().get_script_engine(data_model_type)) {
             if (auto &scheduler = const_cast<luau::ScriptScheduler &>(engine->get_scheduler()); scheduler.step()) {

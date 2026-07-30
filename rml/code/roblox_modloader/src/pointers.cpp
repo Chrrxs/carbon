@@ -8,7 +8,7 @@ namespace rml
 	constexpr auto Pointers::get_roblox_batch()
 	{
 		// clang-format off
-	    constexpr auto batch_and_hash = memory::make_batch<18>({{
+	    constexpr auto batch_and_hash = memory::make_batch<17>({{
 	         // Lua Functions
 	         {
 	             "LUA_LOAD",
@@ -88,13 +88,6 @@ namespace rml
 	            },
 	        },
 			{
-				"DESCRIPTOR_LOOKUP",
-				"48 83 EC 18 ? ? ? 4C 8B D9 75",
-				[](const memory::handle ptr) {
-					g_pointers->m_roblox_pointers.descriptor_lookup = ptr.as<functions::descriptor_lookup>();
-				}
-			},
-			{
 				"GET_STRING_ATOM",
 				"48 89 5C 24 ? 57 48 83 EC 20 48 8B 1D ? ? ? ? 48 8B F9 48 85 DB",
 				[](const memory::handle ptr) {
@@ -153,6 +146,26 @@ namespace rml
 
 		run_batch(m_roblox_batch, roblox_region, "roblox");
 
+		auto profile = roblox::internals::RobloxInternalsProfile::resolve_bootstrap(
+		    roblox_region,
+		    m_roblox_pointers.get_string_atom);
+		if (!profile)
+		{
+			const auto& error = profile.error();
+			throw std::runtime_error(fmt::format(
+			    "Unsupported Roblox Studio native reflection ABI: capability={}, failure={}, matched_calls={}, "
+			    "decoded_candidates={}",
+			    error.capability,
+			    static_cast<int>(error.failure),
+			    error.matched_calls,
+			    error.decoded_candidates));
+		}
+		m_internals_profile =
+		    std::make_unique<const roblox::internals::RobloxInternalsProfile>(std::move(*profile));
+		LOG_INFO(
+		    "Resolved Roblox internals profile: Reflection.Containers property=0x{:X}",
+		    m_internals_profile->reflection().descriptor_container_offsets()[0]);
+
 		m_hwnd = GetForegroundWindow();
 
 		if (!m_hwnd)
@@ -173,4 +186,18 @@ RobloxPointers* get_roblox_pointers()
 	}
 
 	return &g_pointers->m_roblox_pointers;
+}
+
+const rml::roblox::internals::RobloxInternalsProfile& get_roblox_internals_profile()
+{
+	if (!g_pointers)
+		throw std::runtime_error("Pointers are not initialized");
+	return g_pointers->internals_profile();
+}
+
+const rml::roblox::internals::RobloxInternalsProfile* try_get_roblox_internals_profile() noexcept
+{
+	if (!g_pointers)
+		return nullptr;
+	return g_pointers->try_internals_profile();
 }

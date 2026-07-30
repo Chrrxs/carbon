@@ -33,7 +33,9 @@ namespace rml::dotnet
 			if (!result || result->is_void())
 				return;
 
-			if (result->type().name == "Tuple")
+			const auto* type_ptr = result->type_ptr();
+			const auto* type_name = type_ptr ? type_ptr->name() : nullptr;
+			if (type_name && *type_name == "Tuple")
 			{
 				const auto* shared = result->try_cast<std::shared_ptr<const RBX::Reflection::Tuple>>();
 				if (const RBX::Reflection::Tuple* tuple = shared ? shared->get() : nullptr)

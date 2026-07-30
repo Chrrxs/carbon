@@ -3,7 +3,6 @@
 #include "app/application.hpp"
 
 RML_LOG_SCOPE("Bootstrap");
-
 BOOL APIENTRY DllMain(const HMODULE hModule, const DWORD dwReason, LPVOID lp_reserved)
 {
 	if (dwReason == DLL_PROCESS_ATTACH)

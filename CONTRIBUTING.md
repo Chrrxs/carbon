@@ -37,6 +37,30 @@ cargo audit
 cargo test --locked --all-targets
 ```
 
+### Incremental RML builds
+
+During development, reuse one preconfigured CMake build directory through
+`CARBON_RML_CMAKE_BUILD_DIR`. Preserve that directory's generator, dependency
+cache, and object files. Build only the target affected by the current change:
+
+Use the guarded wrapper, which validates the existing cache and runs only the
+equivalent target build:
+
+```sh
+CARBON_RML_CMAKE_BUILD_DIR='C:\path\to\the\existing\build' ./scripts/build-rml-target <target>
+```
+
+The wrapper executes:
+
+```powershell
+cmake --build $env:CARBON_RML_CMAKE_BUILD_DIR --config Release --target <target>
+```
+
+Do not reconfigure, clean, remap, or replace that build directory unless a
+changed input requires CMake regeneration. Do not create per-test build
+directories. Run the clean package build only once, as part of final
+`./scripts/change qualify`.
+
 ## Required change workflow
 
 Carbon does not merge unqualified feature bytes. Every behavior change starts

@@ -155,6 +155,57 @@ if (BUILD_TESTING)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
     )
     add_test(NAME foreground_activation_policy COMMAND foreground_activation_policy_tests)
+    add_executable(datamodel_rtti_capability_tests EXCLUDE_FROM_ALL
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/reflection_runtime_resolver_tests.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/reflection/runtime_layout_resolver.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/reflection/capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/datamodel_layout_resolver.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/datamodel_capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/data_model.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/job_capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/instance_capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/memory/symbol_resolver.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/utils/name.cpp"
+    )
+    target_include_directories(datamodel_rtti_capability_tests PRIVATE
+            "${ROBLOX_MODLOADER_SOURCE_DIR}"
+            "${ROBLOX_MODLOADER_INCLUDE_DIR}"
+    )
+    setup_core_dependencies(datamodel_rtti_capability_tests PRIVATE)
+    setup_luau_dependencies(datamodel_rtti_capability_tests PRIVATE)
+    target_link_libraries(datamodel_rtti_capability_tests PRIVATE Zydis rml_thirdparty)
+    target_compile_definitions(datamodel_rtti_capability_tests PRIVATE ROBLOX_MODLOADER_STATIC_DEFINE)
+    target_compile_features(datamodel_rtti_capability_tests PRIVATE cxx_std_23)
+    set_target_properties(datamodel_rtti_capability_tests PROPERTIES
+            FOLDER "Tests"
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+    )
+    add_test(NAME reflection_runtime_resolver COMMAND datamodel_rtti_capability_tests)
+    add_executable(offline_abi_resolver_tests EXCLUDE_FROM_ALL
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/offline_abi_resolver_tests.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/reflection/runtime_layout_resolver.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/reflection/capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/datamodel_layout_resolver.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/datamodel_capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/data_model.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/job_capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/instance_capabilities.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/memory/symbol_resolver.cpp"
+    )
+    target_include_directories(offline_abi_resolver_tests PRIVATE
+            "${ROBLOX_MODLOADER_SOURCE_DIR}"
+            "${ROBLOX_MODLOADER_INCLUDE_DIR}"
+    )
+    setup_core_dependencies(offline_abi_resolver_tests PRIVATE)
+    setup_luau_dependencies(offline_abi_resolver_tests PRIVATE)
+    target_link_libraries(offline_abi_resolver_tests PRIVATE Zydis rml_thirdparty)
+    target_compile_definitions(offline_abi_resolver_tests PRIVATE ROBLOX_MODLOADER_STATIC_DEFINE)
+    target_compile_features(offline_abi_resolver_tests PRIVATE cxx_std_23)
+    set_target_properties(offline_abi_resolver_tests PROPERTIES
+            FOLDER "Tests"
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+    )
+    add_test(NAME offline_abi_resolver COMMAND offline_abi_resolver_tests)
 endif ()
 
 include(GenerateExportHeader)

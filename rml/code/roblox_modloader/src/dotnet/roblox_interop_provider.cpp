@@ -107,7 +107,9 @@ namespace rml::dotnet
 					return;
 				}
 
-				auto property_name = string_value(descriptor->name.c_str());
+				const auto* n = descriptor ? descriptor->name() : nullptr;
+				if (!n) return;
+				auto property_name = string_value(n->c_str());
 				if (!property_name.as_string)
 					return;
 
@@ -145,12 +147,12 @@ namespace rml::dotnet
 
 	thread_local EngineThreadWakeState* current_engine_thread_wake{};
 
-	using PropertyDescriptorCollection =
-	    RBX::Reflection::MemberDescriptorContainer<RBX::Reflection::PropertyDescriptor>::Collection;
+	using PropertyDescriptorCollectionEntry =
+	    rml::roblox::internals::PropertyDescriptorCollectionEntry;
 
 	struct PropertyDescriptorSpan
 	{
-		const PropertyDescriptorCollection::value_type* entries{};
+		const PropertyDescriptorCollectionEntry* entries{};
 		size_t count{};
 		const RBX::Reflection::ClassDescriptor* base{};
 	};
@@ -159,55 +161,39 @@ namespace rml::dotnet
 	    const RBX::Reflection::ClassDescriptor* descriptor,
 	    PropertyDescriptorSpan& out) noexcept
 	{
-		const PropertyDescriptorCollection::value_type* begin{};
-		const PropertyDescriptorCollection::value_type* end{};
+		if (!descriptor)
+			return false;
+
 		const RBX::Reflection::ClassDescriptor* base{};
 #if defined(_MSC_VER)
 		__try
 		{
-			const auto view = descriptor->property_descriptors();
-			begin = view.m_begin.ptr;
-			end = view.m_end.ptr;
-			base = descriptor->get_base();
+			const auto base_res = descriptor->get_base();
+			if (!base_res)
+				return false;
+			base = *base_res;
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
 			return false;
 		}
 #else
-		const auto view = descriptor->property_descriptors();
-		begin = view.m_begin.ptr;
-		end = view.m_end.ptr;
-		base = descriptor->get_base();
+		const auto base_res = descriptor->get_base();
+		if (!base_res)
+			return false;
+		base = *base_res;
 #endif
 
-		const auto begin_address = reinterpret_cast<uintptr_t>(begin);
-		const auto end_address = reinterpret_cast<uintptr_t>(end);
-		if (begin_address == 0 && end_address == 0)
-		{
-			out = {nullptr, 0, base};
-			return true;
-		}
-		if (begin_address == 0 || end_address < begin_address)
+		const auto span_view = get_roblox_internals_profile().reflection().property_descriptors(descriptor);
+		if (!span_view.has_value())
 			return false;
-		const auto byte_size = end_address - begin_address;
-		if (byte_size % sizeof(PropertyDescriptorCollection::value_type) != 0)
-			return false;
-		const auto count = byte_size / sizeof(PropertyDescriptorCollection::value_type);
-		if (count > 100'000 ||
-		    (count != 0 &&
-		        (!utils::memory::is_valid_pointer(begin_address) ||
-		            !utils::memory::is_valid_pointer(
-		                begin_address + byte_size - sizeof(PropertyDescriptorCollection::value_type)))))
-		{
-			return false;
-		}
-		out = {begin, count, base};
+
+		out = {span_view->entries, span_view->count, base};
 		return true;
 	}
 
 	[[nodiscard]] bool try_probe_reference_descriptor(
-	    const PropertyDescriptorCollection::value_type* entry,
+	    const PropertyDescriptorCollectionEntry* entry,
 	    const RBX::Reflection::RefPropertyDescriptor*& out_reference,
 	    bool& out_xml_serializable) noexcept
 	{
@@ -241,7 +227,7 @@ namespace rml::dotnet
 	}
 
 	[[nodiscard]] bool try_probe_property_descriptor(
-	    const PropertyDescriptorCollection::value_type* entry,
+	    const PropertyDescriptorCollectionEntry* entry,
 	    const RBX::Reflection::PropertyDescriptor*& out_property) noexcept
 	{
 		out_property = nullptr;
@@ -261,7 +247,7 @@ namespace rml::dotnet
 	}
 
 	[[nodiscard]] bool try_probe_content_descriptor(
-	    const PropertyDescriptorCollection::value_type* entry,
+	    const PropertyDescriptorCollectionEntry* entry,
 	    const RBX::Reflection::PropertyDescriptor*& out_content) noexcept
 	{
 		out_content = nullptr;
@@ -281,7 +267,9 @@ namespace rml::dotnet
 			// Legacy ContentId descriptors use the "Content" tag too, but their
 			// Variant storage is a string rather than the inline Content union. Only
 			// the concrete Content type has the SourceType discriminator we need.
-			if (property->type.name != "Content")
+			const auto* t = property->type();
+			const auto* n = t ? t->name() : nullptr;
+			if (!n || n->to_string() != "Content")
 				return true;
 			out_content = property;
 			return true;
@@ -303,7 +291,9 @@ namespace rml::dotnet
 		__try
 		{
 #endif
-			const auto name = descriptor->name.to_string();
+			const auto* n = descriptor ? descriptor->name() : nullptr;
+			if (!n) return false;
+			const auto name = n->to_string();
 			out_data = name.data();
 			out_size = name.size();
 			return out_size == 0 || utils::memory::is_valid_pointer(reinterpret_cast<uintptr_t>(out_data));
@@ -579,7 +569,8 @@ namespace rml::dotnet
 
 		const auto function = RBX::Function(descriptor, instance);
 		const auto ret = function.invoke(arguments);
-		const auto type = descriptor.get_signature().first_result_type();
+		const auto* signature = descriptor.get_signature();
+		const auto* type = signature ? signature->first_result_type() : nullptr;
 
 		TypeMarshaler::encode_return_value(type, ret, reinterpret_cast<uintptr_t>(&arguments.return_value), out);
 	}
@@ -587,8 +578,10 @@ namespace rml::dotnet
 	RBX::Reflection::EventArguments build_event_fire_args(const RBX::Reflection::EventDescriptor* descriptor, const InteropVariant* args, const uint32_t arg_count)
 	{
 		RBX::Reflection::EventArguments event_args;
-		const auto& signature = descriptor->get_signature();
-		const auto sig_args = signature.arguments();
+		const auto* signature = descriptor->get_signature();
+		if (!signature)
+			return event_args;
+		const auto sig_args = signature->arguments();
 
 		if (sig_args.size() == 1 && sig_args[0].type && sig_args[0].type->type_id == RBX::Reflection::TypeId::Tuple)
 		{
@@ -598,7 +591,7 @@ namespace rml::dotnet
 			return event_args;
 		}
 
-		const DotNetArguments arguments{args, arg_count, &signature};
+		const DotNetArguments arguments{args, arg_count, signature};
 		event_args.reserve(arg_count);
 		for (uint32_t i = 0; i < arg_count; ++i)
 		{
@@ -667,7 +660,13 @@ namespace rml::dotnet
 
 				if (const auto* yield_descriptor = class_descriptor.find_yield_function_descriptor(function_name))
 				{
-					DotNetArguments arguments{args, arg_count, &yield_descriptor->get_signature()};
+					const auto* signature = yield_descriptor->get_signature();
+					if (!signature)
+					{
+						callback(state, nullptr, "invalid yield function signature");
+						return;
+					}
+					DotNetArguments arguments{args, arg_count, signature};
 					YieldInvocation::dispatch(*yield_descriptor, *instance, arguments, callback, state);
 					return;
 				}
@@ -1007,10 +1006,18 @@ namespace rml::dotnet
 					return;
 
 				const auto* slot = connection->raw_slot();
-				if (!slot || !slot->source)
+				if (!slot)
 					return;
 
-				auto* wrapper = static_cast<RBX::Reflection::GenericSlotWrapper*>(slot->wrapper_ptr);
+				const auto* profile = ::try_get_roblox_internals_profile();
+				if (!profile)
+					return;
+
+				const auto& signal_caps = profile->signal();
+				if (!signal_caps.get_source(slot))
+					return;
+
+				auto* wrapper = static_cast<RBX::Reflection::GenericSlotWrapper*>(signal_caps.get_wrapper_ptr(slot));
 				if (!wrapper)
 					return;
 
@@ -1134,8 +1141,13 @@ namespace rml::dotnet
 				const auto* source_descriptor = source->get_descriptor().find_property(property_name);
 				const auto* destination_descriptor = destination->get_descriptor().find_property(property_name);
 				if (!source_descriptor || !destination_descriptor ||
-				    !carbon::SerializedPropertyAccess::is_copyable(*source_descriptor) ||
-				    source_descriptor->type.name != destination_descriptor->type.name)
+				    !carbon::SerializedPropertyAccess::is_copyable(*source_descriptor))
+					return false;
+				const auto* source_type = source_descriptor->type();
+				const auto* dest_type = destination_descriptor->type();
+				const auto* source_type_name = source_type ? source_type->name() : nullptr;
+				const auto* dest_type_name = dest_type ? dest_type->name() : nullptr;
+				if (!source_type_name || !dest_type_name || source_type_name->to_string() != dest_type_name->to_string())
 					return false;
 				return carbon::SerializedPropertyAccess::copy(
 				    *source_descriptor,
@@ -1301,7 +1313,8 @@ namespace rml::dotnet
 				const auto* descriptor = instance->get_descriptor().find_event("ItemChanged");
 				if (!descriptor)
 					return 0;
-				const auto* property_descriptor_type = descriptor->get_signature().argument_type(1);
+				const auto* signature = descriptor->get_signature();
+				const auto* property_descriptor_type = signature ? signature->argument_type(1) : nullptr;
 				if (!property_descriptor_type)
 					return 0;
 
@@ -1330,10 +1343,29 @@ namespace rml::dotnet
 			try
 			{
 				auto* data_model_instance = as_instance(data_model_ptr);
+				const auto* dm_descriptor_name = data_model_instance ? data_model_instance->get_descriptor().name() : nullptr;
 				if (!callback || !data_model_instance ||
-				    data_model_instance->get_descriptor().name.to_string() != "DataModel" ||
+				    !dm_descriptor_name || dm_descriptor_name->to_string() != "DataModel" ||
 				    !g_pointers || !g_pointers->m_roblox_pointers.data_model_submit_task)
 				{
+					return 0;
+				}
+
+				const auto task_context_result = data_model_instance->as<RBX::DataModel>()->get_task_context();
+				if (!task_context_result)
+				{
+					const auto& err = task_context_result.error();
+					RML_ERROR(
+					    "engine_thread_pump_register task context resolution failed: capability={}, failure={}, matched_calls={}, decoded_candidates={}",
+					    err.capability,
+					    static_cast<int>(err.failure),
+					    err.matched_calls,
+					    err.decoded_candidates);
+					return 0;
+				}
+				if (*task_context_result == nullptr)
+				{
+					RML_ERROR("engine_thread_pump_register task context resolution returned null context");
 					return 0;
 				}
 
@@ -1342,7 +1374,7 @@ namespace rml::dotnet
 				wake_state->callback_state = state;
 				auto holder = std::make_unique<ManagedEngineThreadPump>();
 				holder->data_model_instance = data_model_instance->as<RBX::DataModel>();
-				holder->data_model_task_context = holder->data_model_instance->get_task_context();
+				holder->data_model_task_context = *task_context_result;
 				holder->state = wake_state;
 				RML_INFO(
 				    "engine-thread pump registered: DataModel instance={}, task context={}",
@@ -1476,7 +1508,7 @@ namespace rml::dotnet
 				// Do not copy this outer shared_ptr: Roblox's embedded reference count
 				// is not safe for us to retain. Its raw vector remains valid while this
 				// engine-thread operation is running.
-				auto* child_vector = parent->children.get();
+				auto* child_vector = parent->get_children();
 				if (!child_vector)
 					return count == 0 ? 1 : 0;
 				if (child_vector->size() != count)
@@ -1487,7 +1519,7 @@ namespace rml::dotnet
 				for (const auto& child_owner : *child_vector)
 				{
 					auto* child = child_owner.get();
-					if (!child || as_instance(reinterpret_cast<uintptr_t>(child)) != child || child->parent != parent)
+					if (!child || as_instance(reinterpret_cast<uintptr_t>(child)) != child || child->get_parent() != parent)
 						return 0;
 					current.push_back(reinterpret_cast<uintptr_t>(child));
 				}
@@ -1624,7 +1656,8 @@ namespace rml::dotnet
 						return reject("instance count exceeds the protocol limit");
 
 					const auto& descriptor = instance->get_descriptor();
-					const std::string_view class_name = descriptor.name.to_string();
+					const auto* class_name_ptr = descriptor.name();
+					const std::string_view class_name = class_name_ptr ? class_name_ptr->to_string() : "";
 					const auto reflected_name = name_property->get_string_value(instance);
 					const std::string_view name = reflected_name.to_string();
 					if (class_name.size() > std::numeric_limits<uint16_t>::max() ||
@@ -1738,7 +1771,7 @@ namespace rml::dotnet
 							// Workspace.CurrentCamera). Broaden only direct DataModel
 							// shells; descendants keep the bounded XML-readable set.
 							if (!detail::should_capture_reference(
-							        reference.xml_serializable, instance->parent == root))
+							        reference.xml_serializable, instance->get_parent() == root))
 								continue;
 							uintptr_t target{};
 							if (!try_read_reference_target(reference.descriptor, instance, target))
@@ -1762,7 +1795,7 @@ namespace rml::dotnet
 								content_objects.push_back({current_index, content.property_name});
 						}
 					}
-					auto* child_vector = instance->children.get();
+					auto* child_vector = instance->get_children();
 					if (!child_vector)
 						continue;
 					if (!detail::reserve_for_append(pending, child_vector->size()) ||
@@ -1772,7 +1805,7 @@ namespace rml::dotnet
 					for (const auto& child_owner : *child_vector)
 					{
 						auto* child = child_owner.get();
-						if (!child || child->parent != instance)
+						if (!child || child->get_parent() != instance)
 							return reject("a child vector entry is inconsistent");
 						if (child != excluded_root)
 							pending.push_back({child, current_index});

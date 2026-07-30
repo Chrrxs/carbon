@@ -2,66 +2,51 @@
 
 #include "RobloxModLoader/internal/common.hpp"
 #include "RobloxModLoader/roblox/data_model_job.hpp"
+#include "RobloxModLoader/roblox/internals_profile.hpp"
 
 namespace RBX
 {
-	namespace
+	std::expected<DataModelType, rml::roblox::internals::CompatibilityError> DataModel::get_type() const
 	{
-		// TaskSchedulerJob::data_model points at a DataModel base subobject
-		// eight bytes into the owning task context. The reflection-visible
-		// Instance lives at +0x1C8 from that owner.
-		constexpr std::uintptr_t job_subobject_to_instance_offset = 0x1C0;
-		constexpr std::uintptr_t task_context_to_instance_offset = 0x1C8;
+		return get_roblox_internals_profile().datamodel().resolve_type(this);
+	}
 
-		constexpr std::uintptr_t task_context_from_instance_address(const std::uintptr_t instance_address)
+	std::expected<void*, rml::roblox::internals::CompatibilityError> DataModel::get_task_context() const noexcept
+	{
+		const auto* profile = try_get_roblox_internals_profile();
+		if (profile == nullptr)
 		{
-			return instance_address - task_context_to_instance_offset;
+			return std::unexpected(rml::roblox::internals::CompatibilityError{
+				.capability = "DataModel.RTTI",
+				.failure = rml::roblox::internals::CompatibilityFailure::missing_signature,
+			});
 		}
 
-		constexpr std::uintptr_t instance_from_job_subobject_address(const std::uintptr_t job_subobject_address)
-		{
-			return job_subobject_address + job_subobject_to_instance_offset;
-		}
-
-		// Keep the two conversions asymmetric: the job holds the +0x8 base
-		// subobject, while submit_task expects the owning task context.
-		constexpr std::uintptr_t test_task_context_address = 0x1000;
-		constexpr std::uintptr_t test_job_subobject_address = test_task_context_address + sizeof(void*);
-		constexpr std::uintptr_t test_instance_address = test_task_context_address + task_context_to_instance_offset;
-		static_assert(instance_from_job_subobject_address(test_job_subobject_address) == test_instance_address);
-		static_assert(task_context_from_instance_address(test_instance_address) == test_task_context_address);
+		return profile->datamodel().data_model_to_task_context(this);
 	}
 
-	DataModelType DataModel::get_type() const
-	{
-		return m_type;
-	}
-
-	bool DataModel::is_initialized() const
-	{
-		return m_initialized;
-	}
-
-	void* DataModel::get_task_context() noexcept
-	{
-		return reinterpret_cast<void*>(task_context_from_instance_address(reinterpret_cast<std::uintptr_t>(this)));
-	}
-
-	DataModel* DataModel::from_job(const DataModelJob* job)
+	DataModel* DataModel::from_job(const DataModelJob* job, const rml::roblox::internals::RobloxInternalsProfile* profile)
 	{
 		if (job == nullptr)
 		{
 			return nullptr;
 		}
 
-		const auto fake_data_model = job->data_model;
-		if (fake_data_model == nullptr)
+		if (profile == nullptr)
+		{
+			profile = ::try_get_roblox_internals_profile();
+		}
+		if (profile == nullptr)
 		{
 			return nullptr;
 		}
 
-		const auto data_model = instance_from_job_subobject_address(reinterpret_cast<std::uintptr_t>(fake_data_model.get()));
+		const auto data_model = profile->datamodel().job_subobject_to_data_model(job);
+		if (data_model)
+		{
+			return *data_model;
+		}
 
-		return reinterpret_cast<DataModel*>(data_model);
+		return nullptr;
 	}
 }

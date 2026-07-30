@@ -45,7 +45,6 @@ struct RobloxPointers
 	PVOID resume_waiting_scripts;
 
 	functions::get_string_atom get_string_atom;
-	functions::descriptor_lookup descriptor_lookup;
 
 	// Lua Functions
 	functions::luau_execute luau_execute;

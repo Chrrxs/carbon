@@ -122,6 +122,31 @@ identity is injected into native and managed artifacts.
 | `ROBLOX_MODLOADER_BUILD_PROXY_DLL`       | Auto-generate the `dwmapi.dll` proxy | ON      |
 | `ROBLOX_MODLOADER_BUILD_EXAMPLES`        | Build the example mods               | ON      |
 
+## Private ABI capability discovery
+
+RML resolves supported Roblox-native internals from the loaded Studio image at
+startup. It does not select offsets by Studio version.
+
+- Reflection discovery follows the `ClassDescriptor` constructor data flow
+  anchored by `get_string_atom("ClassDescriptor")`. It validates the five
+  descriptor families, base-class link, and functionality flags before enabling
+  direct or inherited property, event, function, yield-function, and callback
+  lookup.
+- DataModel discovery starts from validated `RBX::DataModel` RTTI and PE
+  `RUNTIME_FUNCTION` boundaries. A candidate constructor must establish complete
+  object ownership, the `Instance` subobject, the constructor-supplied type
+  store, and a same-slot enum range check. The evidence must resolve one unique
+  type offset.
+- The immutable profile is created during pointer bootstrap, before task
+  scheduling, hooks, managed bridge startup, readiness, or mutation. Missing,
+  malformed, unsupported, or ambiguous evidence aborts initialization.
+
+Resolved capabilities are the only supported route for descriptor enumeration,
+serialized-property lookup, DataModel type identity, task-context conversion,
+and job-to-DataModel conversion. New private-internals consumers must extend the
+profile with equally validated runtime evidence rather than add overlays,
+pointer arithmetic, signature-only guesses, or version-specific tables.
+
 ## Roadmap
 
 Current focus areas:
