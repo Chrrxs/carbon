@@ -326,6 +326,10 @@ namespace
 
 		for (std::size_t i = 0; i <= code.size() - pattern.size(); ++i)
 		{
+			std::uint32_t prefix = 0;
+			std::memcpy(&prefix, code.data() + i, sizeof(prefix));
+			if (prefix != 0x245C8948)
+				continue;
 			bool match = true;
 			for (std::size_t j = 0; j < pattern.size(); ++j)
 			{
@@ -369,6 +373,10 @@ namespace
 
 		for (std::size_t i = 0; i <= code.size() - pattern.size(); ++i)
 		{
+			std::uint32_t prefix = 0;
+			std::memcpy(&prefix, code.data() + i, sizeof(prefix));
+			if (prefix != 0x245C8948)
+				continue;
 			bool match = true;
 			for (std::size_t j = 0; j < pattern.size(); ++j)
 			{
@@ -410,6 +418,10 @@ namespace
 
 		for (std::size_t i = 0; i <= code.size() - pattern.size(); ++i)
 		{
+			std::uint32_t prefix = 0;
+			std::memcpy(&prefix, code.data() + i, sizeof(prefix));
+			if (prefix != 0x245C8948)
+				continue;
 			bool match = true;
 			for (std::size_t j = 0; j < pattern.size(); ++j)
 			{
