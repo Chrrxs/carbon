@@ -1646,7 +1646,7 @@ int main(const int argc, char** argv)
 		// Job Negatives: register clobber before store
 		std::vector<std::uint8_t> job_clobber_code;
 		const auto jc_xref_off = job_clobber_code.size();
-		const auto jc_target_disp = static_cast<std::int32_t>(dm_job_vft_addr - (code_addr + jc_xref_off + 7));
+		const auto jc_target_disp = static_cast<std::int32_t>(waiting_job_vft_addr - (code_addr + jc_xref_off + 7));
 		job_clobber_code.insert(job_clobber_code.end(), {0x4C, 0x8D, 0x05});
 		const auto* jc_disp_bytes = reinterpret_cast<const std::uint8_t*>(&jc_target_disp);
 		job_clobber_code.insert(job_clobber_code.end(), jc_disp_bytes, jc_disp_bytes + 4);
@@ -1669,6 +1669,33 @@ int main(const int argc, char** argv)
 		if (job_clobber_res)
 		{
 			std::cerr << "Test 16 failed: Job register clobber did not fail closed\n";
+			return 16;
+		}
+
+		// Job Negative: unrelated third constructor argument
+		std::vector<std::uint8_t> job_arg3_code;
+		const auto ja_xref_off = job_arg3_code.size();
+		const auto ja_target_disp = static_cast<std::int32_t>(waiting_job_vft_addr - (code_addr + ja_xref_off + 7));
+		job_arg3_code.insert(job_arg3_code.end(), {0x4C, 0x8D, 0x05});
+		const auto* ja_disp_bytes = reinterpret_cast<const std::uint8_t*>(&ja_target_disp);
+		job_arg3_code.insert(job_arg3_code.end(), ja_disp_bytes, ja_disp_bytes + 4);
+		// MOV [RCX], R8
+		job_arg3_code.insert(job_arg3_code.end(), {0x4C, 0x89, 0x01});
+		// MOV [RCX + 0x1B0], R9
+		job_arg3_code.insert(job_arg3_code.end(), {0x4C, 0x89, 0x89, 0xB0, 0x01, 0x00, 0x00});
+		job_arg3_code.push_back(0xC3);
+
+		const TestRuntimeFunction job_arg3_pdata{
+			.begin_address = 0x1000,
+			.end_address = static_cast<std::uint32_t>(0x1000 + job_arg3_code.size()),
+			.unwind_info_address = 1,
+		};
+		const auto job_arg3_res = rml::roblox::internals::resolve_job_layout(
+			std::as_bytes(std::span{job_arg3_code}), code_addr,
+			std::as_bytes(std::span{&job_arg3_pdata, 1}), base_addr, waiting_job_vfts_span);
+		if (job_arg3_res)
+		{
+			std::cerr << "Test 16 failed: Job unrelated argument did not fail closed\n";
 			return 16;
 		}
 
