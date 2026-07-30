@@ -2983,7 +2983,8 @@ namespace rml::roblox::internals
 						{
 							const auto src_role = tracker.get_role(soperands[1].reg.value);
 							const auto disp = static_cast<std::ptrdiff_t>(soperands[0].mem.disp.value);
-							if (disp >= 0x30 && disp <= 0x400 && src_role != RegRole::VftAddr)
+							if (disp >= 0x30 && disp <= 0x400 &&
+								(src_role == RegRole::Arg1 || src_role == RegRole::Arg2))
 							{
 								if (fn_ctx_offset == -1)
 								{
