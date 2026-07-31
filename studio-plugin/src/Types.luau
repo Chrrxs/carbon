@@ -104,14 +104,8 @@ export type ManifestCaptureStatus = {
 
 -- Messages
 
-export type Message = SyncChanges | SyncDetails | RestartRequired | ExecuteCode | Disconnect | ManagedReload
-export type MessageKind =
-	"SyncChanges"
-	| "SyncDetails"
-	| "RestartRequired"
-	| "ExecuteCode"
-	| "Disconnect"
-	| "ManagedReload"
+export type Message = SyncChanges | SyncDetails | RestartRequired | ExecuteCode | Disconnect
+export type MessageKind = "SyncChanges" | "SyncDetails" | "RestartRequired" | "ExecuteCode" | "Disconnect"
 
 export type SyncChanges = {
 	SyncChanges: {
@@ -136,18 +130,6 @@ export type ExecuteCode = {
 
 export type Disconnect = {
 	message: string,
-}
-
-export type ManagedReloadData = {
-	transitionId: string,
-	projectName: string,
-	sourceGeneration: string,
-	worktreeId: string,
-	sessionToken: string,
-}
-
-export type ManagedReload = {
-	ManagedReload: ManagedReloadData,
 }
 
 return nil

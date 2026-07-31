@@ -713,7 +713,7 @@ mod tests {
 	}
 
 	#[test]
-	fn release_suite_requires_carbon_stop_to_report_automatic_capture() {
+	fn release_suite_requires_restart_fault_stop_to_retain_the_last_capture() {
 		let suite_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
 			.parent()
 			.unwrap()
@@ -733,8 +733,10 @@ mod tests {
 			.expect("release suite is missing managed Carbon stop");
 		let output = stop["stderr_contains"]
 			.as_array()
-			.expect("managed Carbon stop must assert its capture result");
-		assert!(output.iter().any(|value| value == "Capture Manifest completed"));
+			.expect("managed Carbon stop must assert its retained capture boundary");
+		assert!(output
+			.iter()
+			.any(|value| value == "Serve requires hard restart; latest committed manifest retained"));
 		assert!(output.iter().any(|value| value == "Carbon stopped successfully"));
 	}
 

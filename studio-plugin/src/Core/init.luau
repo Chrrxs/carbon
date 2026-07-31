@@ -373,33 +373,6 @@ function Core:__startSyncLoop()
 			elseif kind == "RestartRequired" then
 				self.status = Core.Status.Disconnecting
 				return reject(Error.new(Error.RestartRequired, data.message))
-			elseif kind == "ManagedReload" then
-				local valid = type(data) == "table"
-					and type(data.transitionId) == "string"
-					and data.transitionId ~= ""
-					and type(data.projectName) == "string"
-					and data.projectName ~= ""
-					and type(data.sourceGeneration) == "string"
-					and data.sourceGeneration ~= ""
-					and type(data.worktreeId) == "string"
-					and type(data.sessionToken) == "string"
-					and self.expectedWorktree ~= nil
-					and self.expectedWorktree.worktreeId ~= nil
-					and self.expectedWorktree.sessionToken ~= nil
-					and data.worktreeId == self.expectedWorktree.worktreeId
-					and data.sessionToken == self.expectedWorktree.sessionToken
-
-				if valid then
-					-- The old generation was captured before the transition. Trust
-					-- the authenticated replacement generation so reconnect does not
-					-- race a redundant pre-reconciliation capture against source sync.
-					self.expectedWorktree.name = data.projectName
-					self.expectedWorktree.sourceGeneration = data.sourceGeneration
-					self.status = Core.Status.Disconnecting
-					return reject(Error.new(Error.ManagedReload, data.transitionId))
-				else
-					return reject(Error.new(Error.UnknownEvent, kind, data))
-				end
 			elseif kind == "ExecuteCode" then
 				self.executor:execute(data.code)
 			elseif kind == "Disconnect" then

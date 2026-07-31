@@ -25,7 +25,7 @@
     "procedural_generator_partial_fixture": "${artifact_dir}/procedural-generator-partial-fixture",
     "procedural_generator_corrected_fixture": "${artifact_dir}/procedural-generator-corrected-fixture",
     "foreground_watch_ready": "${artifact_dir}/foreground-watch.ready",
-    "manifest_reload_backup": "${artifact_dir}/manifest-reload-backup.json",
+    "manifest_restart_backup": "${artifact_dir}/manifest-restart-backup.json",
     "foreground_watch_done": "${artifact_dir}/foreground-watch.done"
   },
   "requirements": {
@@ -290,56 +290,15 @@
           "max_duration_ms": 2000
         },
         {
-          "name": "trigger-in-process-manifest-reload",
+          "name": "capture-pending-studio-change",
           "kind": "command",
-          "program": "${repo}/qualification/scripts/trigger-manifest-reload",
-          "args": ["trigger", "${project}", "${manifest_reload_backup}"],
+          "program": "${carbon}",
+          "args": ["capture", "--port", "${port}", "--color", "never"],
           "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["manifest reload with project rename triggered atomically"]
+          "timeout_seconds": 300
         },
         {
-          "name": "managed-reload-preserves-studio-process",
-          "kind": "mcp",
-          "tool": "manage_instance",
-          "arguments": {"action": "status", "instance_id": "${studio_instance}"},
-          "timeout_seconds": 120,
-          "poll_interval_ms": 100,
-          "checks": [
-            {"pointer": "/pid", "op": "equals", "value": "${studio_pid}"},
-            {"pointer": "/process_running", "op": "equals", "value": true},
-            {"pointer": "/state", "op": "equals", "value": "connected"}
-          ]
-        },
-        {
-          "name": "wait-for-managed-reload-project-name",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "return workspace:GetAttribute('__StudioWorktree_CarbonProject')"
-          },
-          "timeout_seconds": 30,
-          "poll_interval_ms": 100,
-          "checks": [
-            {"pointer": "/returnValue", "op": "equals", "value": "${studio_data_model}-Reloaded"}
-          ]
-        },
-        {
-          "name": "managed-reload-preserves-pending-studio-change",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "assert(workspace:GetAttribute('__StudioWorktree_CarbonProject') == '${studio_data_model}-Reloaded', 'managed reload retained the stale project name'); local parent = game:GetService('Workspace'):FindFirstChild('CarbonManifestScriptParent'); assert(parent and parent:IsA('Part'), 'capture parent missing after managed reload'); assert(parent:GetAttribute('CarbonManifestRevision') == 2, 'pending Studio attribute was lost during managed reload'); assert(parent.Size == Vector3.new(7, 3, 5), 'pending Studio property was lost during managed reload'); assert(parent:FindFirstChild('CarbonManifestDeletedOnMutation') == nil, 'pending Studio deletion was lost during managed reload'); return true"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 2000
-        },
-        {
-          "name": "post-reload-capture-is-fixed-point",
+          "name": "post-mutation-capture-is-fixed-point",
           "kind": "command",
           "program": "${carbon}",
           "args": ["capture", "--port", "${port}", "--color", "never"],
@@ -1093,17 +1052,63 @@
           "tool": "manage_instance",
           "arguments": {"action": "close", "launch_id": "${secondary_studio_launch}"},
           "timeout_seconds": 30
+        },
+        {
+          "name": "pre-restart-runtime-log-gate",
+          "kind": "mcp",
+          "tool": "get_runtime_logs",
+          "arguments": {"instance_id": "${studio_instance}", "target": "edit"},
+          "timeout_seconds": 30
+        },
+        {
+          "name": "trigger-project-document-restart-requirement",
+          "kind": "command",
+          "program": "${repo}/qualification/scripts/trigger-project-restart",
+          "args": ["trigger", "${project}", "${manifest_restart_backup}"],
+          "cwd": "${repo}",
+          "timeout_seconds": 30,
+          "stdout_contains": ["project document restart requirement triggered atomically"]
+        },
+        {
+          "name": "wait-for-project-document-watcher",
+          "kind": "sleep",
+          "milliseconds": 1200
+        },
+        {
+          "name": "project-document-change-keeps-frozen-studio-contract",
+          "kind": "mcp",
+          "tool": "execute_luau",
+          "arguments": {
+            "instance_id": "${studio_instance}",
+            "target": "edit",
+            "code": "return workspace:GetAttribute('__StudioWorktree_CarbonProject')"
+          },
+          "timeout_seconds": 30,
+          "checks": [
+            {"pointer": "/returnValue", "op": "equals", "value": "${studio_data_model}"}
+          ]
+        },
+        {
+          "name": "project-document-change-blocks-capture-with-restart-guidance",
+          "kind": "command",
+          "program": "${carbon}",
+          "args": ["capture", "--port", "${port}", "--color", "never"],
+          "cwd": "${repo}",
+          "timeout_seconds": 30,
+          "expected_exit_code": 1,
+          "stderr_contains": ["hard restart"],
+          "allowed_diagnostic_contains": ["hard restart"]
         }
       ],
       "cleanup": [
         {
           "name": "restore-qualified-manifest",
           "kind": "command",
-          "program": "${repo}/qualification/scripts/trigger-manifest-reload",
-          "args": ["restore", "${project}", "${manifest_reload_backup}"],
+          "program": "${repo}/qualification/scripts/trigger-project-restart",
+          "args": ["restore", "${project}", "${manifest_restart_backup}"],
           "cwd": "${repo}",
           "timeout_seconds": 30,
-          "stdout_contains": ["manifest restore"]
+          "stdout_contains": ["project document restored"]
         },
         {
           "name": "stop-residual-foreground-event-watch",
@@ -1118,20 +1123,13 @@
           "timeout_seconds": 30
         },
         {
-          "name": "final-runtime-log-gate",
-          "kind": "mcp",
-          "tool": "get_runtime_logs",
-          "arguments": {"instance_id": "${studio_instance}", "target": "edit"},
-          "timeout_seconds": 30
-        },
-        {
           "name": "stop-managed-serve-and-studio",
           "kind": "command",
           "program": "${carbon}",
           "args": ["stop", "--port", "${port}", "--color", "never"],
           "cwd": "${repo}",
           "timeout_seconds": 30,
-          "stderr_contains": ["Capture Manifest completed", "Carbon stopped successfully"]
+          "stderr_contains": ["Serve requires hard restart; latest committed manifest retained", "Carbon stopped successfully"]
         },
         {
           "name": "managed-serve-and-studio-exited-cleanly",

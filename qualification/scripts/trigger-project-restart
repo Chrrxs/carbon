@@ -3,7 +3,7 @@ set -euo pipefail
 mode="$1"
 project="$2"
 backup="$3"
-temporary="${project}.qualification-reload.$$"
+temporary="${project}.qualification-restart.$$"
 case "$mode" in
   trigger)
     cp -- "$project" "$backup"
@@ -13,17 +13,17 @@ case "$mode" in
     }
     jq '.name += "-Reloaded"' "$project" > "$temporary"
     mv -- "$temporary" "$project"
-    printf 'manifest reload with project rename triggered atomically\n'
+    printf 'project document restart requirement triggered atomically\n'
     ;;
   restore)
     if [[ ! -f "$backup" ]]; then
-      printf 'manifest restore skipped; no backup was created\n'
+      printf 'project document restore skipped; no backup was created\n'
       exit 0
     fi
     cp -- "$backup" "$temporary"
     mv -- "$temporary" "$project"
     rm -f -- "$backup"
-    printf 'manifest restored atomically\n'
+    printf 'project document restored atomically\n'
     ;;
   *)
     printf 'usage: %s trigger|restore PROJECT BACKUP\n' "$0" >&2
