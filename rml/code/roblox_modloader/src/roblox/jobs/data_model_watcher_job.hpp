@@ -1,6 +1,12 @@
 #pragma once
 #include "RobloxModLoader/roblox/job_base.hpp"
 #include "RobloxModLoader/roblox/task_scheduler.hpp"
+#include <chrono>
+#include <cstdint>
+#include <string_view>
+#include <unordered_map>
+
+
 
 namespace RBX {
     class DataModel;
@@ -31,6 +37,13 @@ namespace rml::jobs {
         void destroy_impl() noexcept override;
 
         static constexpr std::string_view JOB_NAME = "DataModelWatcher";
+        static constexpr auto CHANGE_CHECK_INTERVAL = std::chrono::milliseconds{250};
+        static constexpr auto STALE_DATA_MODEL_THRESHOLD = std::chrono::seconds{5};
+
+
+
+        [[nodiscard]] static std::uint8_t studio_marker_priority(
+            const RBX::DataModel *data_model) noexcept;
 
         static void on_data_model_changed(const RBX::DataModel *old_data_model,
                                           RBX::DataModel *new_data_model,
@@ -40,6 +53,6 @@ namespace rml::jobs {
 
         std::unordered_map<RBX::DataModelType, RBX::DataModel *> m_data_models;
         std::unordered_map<RBX::DataModelType, std::chrono::steady_clock::time_point> m_data_model_last_time_stepped;
-        std::chrono::steady_clock::time_point m_last_check = std::chrono::high_resolution_clock::now();
+        std::chrono::steady_clock::time_point m_last_check = std::chrono::steady_clock::now();
     };
 }

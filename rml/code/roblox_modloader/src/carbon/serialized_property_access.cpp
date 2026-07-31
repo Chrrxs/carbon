@@ -82,7 +82,8 @@ namespace rml::carbon
 			if (!t) return false;
 			const auto* n = t->name();
 			const std::string_view name_str = n ? n->to_string() : "";
-			const std::string_view tag_str = t->tag.to_string();
+			const auto* tag = t->tag();
+			const std::string_view tag_str = tag ? tag->to_string() : "";
 			return name_str == candidate || tag_str == candidate;
 		}
 
@@ -116,7 +117,8 @@ namespace rml::carbon
 		if (!t) return false;
 		const auto* n = t->name();
 		const std::string_view name_str = n ? n->to_string() : "";
-		const std::string_view tag_str = t->tag.to_string();
+		const auto* tag = t->tag();
+		const std::string_view tag_str = tag ? tag->to_string() : "";
 		return contains(supported_types, name_str) || contains(supported_types, tag_str);
 	}
 
@@ -163,15 +165,16 @@ namespace rml::carbon
 		if (!t) return false;
 		const auto* n = t->name();
 		const std::string_view name_str = n ? n->to_string() : "";
-		const std::string_view tag_str = t->tag.to_string();
-		if (is_binary_type(descriptor) || t->is_enum || name_str == "SecurityCapabilities" || tag_str == "SecurityCapabilities")
+		const auto* tag = t->tag();
+		const std::string_view tag_str = tag ? tag->to_string() : "";
+		if (is_binary_type(descriptor) || t->is_enum() || name_str == "SecurityCapabilities" || tag_str == "SecurityCapabilities")
 			return true;
 		const auto marshal_kind = dotnet::TypeMarshaler::classify(*t).kind;
 		if (marshal_kind == dotnet::MarshalKind::Blittable || marshal_kind == dotnet::MarshalKind::Sequence)
 			return true;
 
 		using namespace RBX::Reflection;
-		switch (t->type_id)
+		switch (t->type_id())
 		{
 		case TypeId::Bool:
 		case TypeId::Int:
@@ -211,7 +214,8 @@ namespace rml::carbon
 		const auto* t = descriptor.type();
 		const auto* n = t ? t->name() : nullptr;
 		const std::string_view name_str = n ? n->to_string() : "";
-		const std::string_view tag_str = t ? t->tag.to_string() : "";
+		const auto* tag = t ? t->tag() : nullptr;
+		const std::string_view tag_str = tag ? tag->to_string() : "";
 		return !is_explicitly_excluded(descriptor) &&
 		       (is_accessible(descriptor) || contains(model_serialized_types, name_str) ||
 		        contains(model_serialized_types, tag_str));
@@ -247,7 +251,8 @@ namespace rml::carbon
 
 		const auto* n = t->name();
 		const std::string_view name = n ? n->to_string() : "";
-		const std::string_view tag = t->tag.to_string();
+		const auto* tag_ptr = t->tag();
+		const std::string_view tag = tag_ptr ? tag_ptr->to_string() : "";
 		std::string_view type_name = name;
 		if (contains(supported_types, tag))
 			type_name = tag;
@@ -365,7 +370,7 @@ namespace rml::carbon
 			std::memcpy(&capabilities, bytes, sizeof(capabilities));
 			value = std::to_string(capabilities);
 		}
-		else if ((descriptor.type() && descriptor.type()->is_enum) || (descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Integer))
+		else if ((descriptor.type() && descriptor.type()->is_enum()) || (descriptor.type() && descriptor.type()->type_id() == RBX::Reflection::TypeId::Integer))
 		{
 			RBX::Reflection::Variant variant;
 			descriptor.get_variant(&instance, variant);
@@ -374,18 +379,18 @@ namespace rml::carbon
 				return false;
 			value = std::to_string(*variant.try_cast<int>());
 		}
-		else if ((descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Int64) ||
-		         (descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Float) ||
-		         (descriptor.type() && descriptor.type()->type_id == RBX::Reflection::TypeId::Double))
+		else if ((descriptor.type() && descriptor.type()->type_id() == RBX::Reflection::TypeId::Int64) ||
+		         (descriptor.type() && descriptor.type()->type_id() == RBX::Reflection::TypeId::Float) ||
+		         (descriptor.type() && descriptor.type()->type_id() == RBX::Reflection::TypeId::Double))
 		{
 			RBX::Reflection::Variant variant;
 			descriptor.get_variant(&instance, variant);
 			VariantCleanup cleanup(variant);
 			if (variant.is_void())
 				return false;
-			const size_t size = descriptor.type()->type_id == RBX::Reflection::TypeId::Int64
+			const size_t size = descriptor.type()->type_id() == RBX::Reflection::TypeId::Int64
 			                        ? sizeof(int64_t)
-			                        : descriptor.type()->type_id == RBX::Reflection::TypeId::Float ? sizeof(float)
+			                        : descriptor.type()->type_id() == RBX::Reflection::TypeId::Float ? sizeof(float)
 			                                                                                   : sizeof(double);
 			const auto* bytes = variant.try_cast<std::byte>();
 			if (!bytes)
@@ -541,7 +546,8 @@ namespace rml::carbon
 		const auto* t = descriptor.type();
 		if (!t)
 			return false;
-		if (t->is_enum || t->type_id == RBX::Reflection::TypeId::Integer)
+		const auto type_id = t->type_id();
+		if (t->is_enum() || type_id == RBX::Reflection::TypeId::Integer)
 		{
 			int parsed{};
 			const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
@@ -556,13 +562,13 @@ namespace rml::carbon
 			descriptor.set_variant(&instance, variant);
 			return true;
 		}
-		if (t->type_id == RBX::Reflection::TypeId::Int64 ||
-		    t->type_id == RBX::Reflection::TypeId::Float ||
-		    t->type_id == RBX::Reflection::TypeId::Double)
+		if (type_id == RBX::Reflection::TypeId::Int64 ||
+		    type_id == RBX::Reflection::TypeId::Float ||
+		    type_id == RBX::Reflection::TypeId::Double)
 		{
-			const size_t size = t->type_id == RBX::Reflection::TypeId::Int64
+			const size_t size = type_id == RBX::Reflection::TypeId::Int64
 			                        ? sizeof(int64_t)
-			                        : t->type_id == RBX::Reflection::TypeId::Float ? sizeof(float)
+			                        : type_id == RBX::Reflection::TypeId::Float ? sizeof(float)
 			                                                                  : sizeof(double);
 			if (value.size() != size)
 				return false;

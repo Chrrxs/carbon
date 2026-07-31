@@ -53,6 +53,23 @@ public sealed class PolicyAndEngineWorkTests
     }
 
     [Theory]
+    [InlineData(true, 5_000, false)]
+    [InlineData(false, 0, false)]
+    [InlineData(false, 1_999, false)]
+    [InlineData(false, 2_000, true)]
+    public void ProvisionalDataModelGetsExclusiveBoundedAttachmentLease(
+        bool sameDataModel,
+        int attachedMilliseconds,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CarbonBridgeMod.ShouldReplaceProvisionalEditDataModel(
+                sameDataModel,
+                TimeSpan.FromMilliseconds(attachedMilliseconds)));
+    }
+
+    [Theory]
     [InlineData("session\ninstance", "session", "instance")]
     [InlineData("session-with-dashes\ninstance-with-dashes", "session-with-dashes", "instance-with-dashes")]
     public void StudioRouteRequiresOneNonEmptySeparator(

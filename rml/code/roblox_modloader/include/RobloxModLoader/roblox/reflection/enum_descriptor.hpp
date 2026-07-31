@@ -80,7 +80,7 @@ namespace RBX::Reflection
 		}
 		static const EnumDescriptor* lookup_descriptor(const Type& type)
 		{
-			if (type.is_enum)
+			if (type.is_enum())
 				return dynamic_cast<const EnumDescriptor*>(&type);
 
 			return nullptr;

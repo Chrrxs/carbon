@@ -206,7 +206,7 @@ namespace rml::dotnet
 
 		for (const auto* type : *registry)
 		{
-			if (type && type->type_id == type_id)
+			if (type && type->type_id() == type_id)
 				return type;
 		}
 		return nullptr;
@@ -242,7 +242,7 @@ namespace rml::dotnet
 		if (RBX::Reflection::RefPropertyDescriptor::is_ref_property_descriptor(type))
 			return {MarshalKind::RefInstance, 0};
 
-		switch (type.type_id)
+		switch (type.type_id())
 		{
 		case RBX::Reflection::TypeId::Bool: return {MarshalKind::Bool, 0};
 		case RBX::Reflection::TypeId::Int:
@@ -282,13 +282,13 @@ namespace rml::dotnet
 		if (type_name && *type_name == "buffer")
 			return {MarshalKind::Buffer, 0};
 
-		if (type.is_enum)
+		if (type.is_enum())
 			return {MarshalKind::Enum, 0};
 
-		if (type.is_float)
+		if (type.is_float())
 			return {MarshalKind::Double, 0};
 
-		if (type.is_number)
+		if (type.is_number())
 			return {MarshalKind::Number, 0};
 
 		return {MarshalKind::Unsupported, 0};
@@ -347,7 +347,7 @@ namespace rml::dotnet
 		case MarshalKind::Float: return float_value(*variant.try_cast<float>());
 		case MarshalKind::Double: return double_value(*variant.try_cast<double>());
 		case MarshalKind::Number:
-			return int64_value(type.type_id == RBX::Reflection::TypeId::Int ? *variant.try_cast<int>() : *variant.try_cast<int64_t>());
+			return int64_value(type.type_id() == RBX::Reflection::TypeId::Int ? *variant.try_cast<int>() : *variant.try_cast<int64_t>());
 		case MarshalKind::Tuple:
 		{
 			const auto* shared = variant.try_cast<TupleSharedPtr>();
@@ -503,7 +503,7 @@ namespace rml::dotnet
 				return false;
 
 			RBX::Property property(*descriptor, instance);
-			if (type.type_id == RBX::Reflection::TypeId::Int64 || type.type_id == RBX::Reflection::TypeId::Integer)
+			if (type.type_id() == RBX::Reflection::TypeId::Int64 || type.type_id() == RBX::Reflection::TypeId::Integer)
 				property.set<int64_t>(decoded);
 			else
 				property.set<int>(static_cast<int>(decoded));
@@ -615,7 +615,7 @@ namespace rml::dotnet
 		{
 			int64_t decoded = 0;
 			(void)read_int64(value, decoded);
-			if (type->type_id == RBX::Reflection::TypeId::Int64 || type->type_id == RBX::Reflection::TypeId::Integer)
+			if (type->type_id() == RBX::Reflection::TypeId::Int64 || type->type_id() == RBX::Reflection::TypeId::Integer)
 				*static_cast<int64_t*>(storage) = decoded;
 			else
 				*static_cast<int*>(storage) = static_cast<int>(decoded);

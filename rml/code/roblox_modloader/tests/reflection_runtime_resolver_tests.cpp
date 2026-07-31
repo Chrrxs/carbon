@@ -28,10 +28,15 @@ namespace
 	constexpr std::uintptr_t vft_yield_function = image_base + 0x2040;
 	constexpr std::uintptr_t vft_event = image_base + 0x2050;
 	constexpr std::uintptr_t vft_callback = image_base + 0x2060;
-	constexpr std::uintptr_t vft_class_descriptor = image_base + 0x2070;
+	constexpr std::uintptr_t vft_type = image_base + 0x2070;
+	constexpr std::uintptr_t vft_class_descriptor = image_base + 0x2080;
 	constexpr std::uintptr_t get_string_atom_target = image_base + 0x3000;
 
-	constexpr std::uintptr_t vft_target = image_base + 0x2070;
+	void executable_pointer_fixture()
+	{
+	}
+
+	constexpr std::uintptr_t vft_target = image_base + 0x2080;
 
 	template <std::size_t N>
 	void append_u32(std::array<std::byte, N>& code, std::size_t& size, const std::uint32_t value)
@@ -129,6 +134,41 @@ namespace
 		append_u32(code, size, 0x08);
 
 		// 6. RET
+		code[size++] = std::byte{0xc3};
+	}
+
+	template <std::size_t N>
+	void append_type_constructor_code(
+		std::array<std::byte, N>& code,
+		std::size_t& size,
+		const std::uint32_t tag_offset = 0x28,
+		const std::uint32_t type_id_offset = 0x30,
+		const std::uint32_t first_flag_offset = 0x34)
+	{
+		code[size++] = std::byte{0x48};
+		code[size++] = std::byte{0x8d};
+		code[size++] = std::byte{0x05};
+		const auto inst_address = image_base + size - 3;
+		const auto target_disp = static_cast<std::int32_t>(vft_type - (inst_address + 7));
+		append_u32(code, size, static_cast<std::uint32_t>(target_disp));
+		code[size++] = std::byte{0x48};
+		code[size++] = std::byte{0x89};
+		code[size++] = std::byte{0x01};
+		code[size++] = std::byte{0x48};
+		code[size++] = std::byte{0x89};
+		code[size++] = std::byte{0x91};
+		append_u32(code, size, tag_offset);
+		code[size++] = std::byte{0x44};
+		code[size++] = std::byte{0x89};
+		code[size++] = std::byte{0x81};
+		append_u32(code, size, type_id_offset);
+		for (std::uint32_t index = 0; index < 3; ++index)
+		{
+			code[size++] = std::byte{0xc6};
+			code[size++] = std::byte{0x81};
+			append_u32(code, size, first_flag_offset + index);
+			code[size++] = static_cast<std::byte>(index & 1u);
+		}
 		code[size++] = std::byte{0xc3};
 	}
 constexpr std::array<std::byte, 2336> studio_0731_constructor_fixture = {
@@ -494,6 +534,7 @@ int main(const int argc, char** argv)
 	const std::array<std::uintptr_t, 1> prop_vfts{vft_property};
 	const std::array<std::uintptr_t, 1> func_vfts{vft_function};
 	const std::array<std::uintptr_t, 1> yield_vfts{vft_yield_function};
+	const std::array<std::uintptr_t, 1> type_vfts{vft_type};
 	const std::array<std::uintptr_t, 1> event_vfts{vft_event};
 	const std::array<std::uintptr_t, 1> callback_vfts{vft_callback};
 	const std::array<std::uintptr_t, 1> class_vfts{vft_class_descriptor};
@@ -503,6 +544,7 @@ int main(const int argc, char** argv)
 		.member_vfts = mem_vfts,
 		.property_vfts = prop_vfts,
 		.function_vfts = func_vfts,
+		.type_vfts = type_vfts,
 		.yield_function_vfts = yield_vfts,
 		.event_vfts = event_vfts,
 		.callback_vfts = callback_vfts,
@@ -620,6 +662,8 @@ int main(const int argc, char** argv)
 		append_u32(code, size, esig_off);
 		code[size++] = std::byte{0xc3};
 
+		append_type_constructor_code(code, size);
+
 		// 8. ClassDescriptor constructor: LEA RAX, [vft_class_descriptor]; MOV [RCX], RAX; XOR R9, R9; ... containers, base, functionality
 		append_constructor_code(code, size, containers, base_off, func_off);
 	};
@@ -637,8 +681,8 @@ int main(const int argc, char** argv)
 		std::uint32_t prop_func_off = 0x8c,
 		std::uint32_t sig_off = 0x48,
 		std::uint32_t fkind_off = 0x78,
-		std::uint32_t finv_off = 0x60,
-		std::uint32_t fdelta_off = 0x68,
+		std::uint32_t finv_off = 0x80,
+		std::uint32_t fdelta_off = 0x88,
 		std::uint32_t csig_off = 0x48,
 		std::uint32_t casync_off = 0x78,
 		std::uint32_t esig_off = 0x48)
@@ -734,6 +778,8 @@ int main(const int argc, char** argv)
 		append_u32(code, size, esig_off);
 		code[size++] = std::byte{0xc3};
 
+		append_type_constructor_code(code, size);
+
 		// 8. ClassDescriptor constructor: LEA RAX, [vft_class_descriptor]; MOV [RCX], RAX; XOR R9, R9; ...
 		append_constructor_code(code, size, containers, base_off, func_off);
 	};
@@ -757,6 +803,7 @@ int main(const int argc, char** argv)
 		append_u32(code, size, functionality_offset);
 		append_u32(code, size, 0x08);
 		code[size++] = std::byte{0xc3};
+		append_type_constructor_code(code, size);
 		return result;
 	};
 
@@ -765,7 +812,7 @@ int main(const int argc, char** argv)
 	const std::array<std::uint32_t, 5> layout_0731_storage = {0x40, 0xa0, 0x100, 0x160, 0x1c0};
 	const std::array<std::uint32_t, 5> layout_0732_storage = {0x40, 0x88, 0xd0, 0x118, 0x160};
 
-	// 1. 0.731 positive encoded body test across all 8 families
+	// 1. 0.731 positive encoded body test across all 9 families
 	std::array<std::byte, 4096> code_0731{};
 	std::size_t size_0731 = 0;
 	build_full_code(code_0731, size_0731, get_string_atom_target, layout_0731_containers, 0x228, 0x220);
@@ -774,12 +821,17 @@ int main(const int argc, char** argv)
 	if (!layout_0731 ||
 		layout_0731->name_offset != 0x8 ||
 		layout_0731->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0xA0, 0x100, 0x160, 0x1C0} ||
-		layout_0731->base_class_offset != 0x228 ||
+		layout_0731->base_class_offset != 0x230 ||
 		layout_0731->functionality_offset != 0x220 ||
 		layout_0731->owner_offset != 0x30 ||
 		layout_0731->security_offset != 0x38 ||
 		layout_0731->property_type_offset != 0x40 ||
 		layout_0731->property_functionality_offset != 0x8c ||
+		layout_0731->type_tag_offset != 0x28 ||
+		layout_0731->type_id_offset != 0x30 ||
+		layout_0731->type_is_float_offset != 0x34 ||
+		layout_0731->type_is_number_offset != 0x35 ||
+		layout_0731->type_is_enum_offset != 0x36 ||
 		layout_0731->signature_offset != 0x48 ||
 		layout_0731->function_kind_offset != 0x78 ||
 		layout_0731->function_invoke_func_ptr_offset != 0x80 ||
@@ -817,7 +869,8 @@ int main(const int argc, char** argv)
 		append_class_tail(studio_0731_constructor_fixture, 0x228, 0x220);
 	auto layout_exact_0731 = resolve(exact_0731_code, exact_0731_size, desc_0731_vfts[0]);
 	if (!layout_exact_0731 ||
-		layout_exact_0731->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0xA0, 0x100, 0x160, 0x1C0})
+		layout_exact_0731->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0xA0, 0x100, 0x160, 0x1C0} ||
+		layout_exact_0731->base_class_offset != 0x230)
 	{
 		if (!layout_exact_0731)
 			std::cerr << "Test 1b failed: " << layout_exact_0731.error().capability
@@ -833,7 +886,7 @@ int main(const int argc, char** argv)
 		return 1;
 	}
 
-	// 2. 0.732 positive encoded body test across all 8 families
+	// 2. 0.732 positive encoded body test across all 9 families
 	std::array<std::byte, 4096> code_0732{};
 	std::size_t size_0732 = 0;
 	build_full_code(code_0732, size_0732, get_string_atom_target, layout_0732_containers, 0x1a8, 0x1bc);
@@ -842,12 +895,17 @@ int main(const int argc, char** argv)
 	if (!layout_0732 ||
 		layout_0732->name_offset != 0x8 ||
 		layout_0732->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0x88, 0xD0, 0x118, 0x160} ||
-		layout_0732->base_class_offset != 0x1a8 ||
+		layout_0732->base_class_offset != 0x1b0 ||
 		layout_0732->functionality_offset != 0x1bc ||
 		layout_0732->owner_offset != 0x30 ||
 		layout_0732->security_offset != 0x38 ||
 		layout_0732->property_type_offset != 0x40 ||
 		layout_0732->property_functionality_offset != 0x8c ||
+		layout_0732->type_tag_offset != 0x28 ||
+		layout_0732->type_id_offset != 0x30 ||
+		layout_0732->type_is_float_offset != 0x34 ||
+		layout_0732->type_is_number_offset != 0x35 ||
+		layout_0732->type_is_enum_offset != 0x36 ||
 		layout_0732->signature_offset != 0x48 ||
 		layout_0732->function_kind_offset != 0x78 ||
 		layout_0732->function_invoke_func_ptr_offset != 0x80 ||
@@ -863,7 +921,8 @@ int main(const int argc, char** argv)
 		append_class_tail(studio_0732_constructor_fixture, 0x1A8, 0x1BC);
 	auto layout_exact_0732 = resolve(exact_0732_code, exact_0732_size, desc_0732_vfts[0]);
 	if (!layout_exact_0732 ||
-		layout_exact_0732->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0x88, 0xD0, 0x118, 0x160})
+		layout_exact_0732->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0x88, 0xD0, 0x118, 0x160} ||
+		layout_exact_0732->base_class_offset != 0x1b0)
 	{
 		if (!layout_exact_0732)
 			std::cerr << "Test 2c failed: " << layout_exact_0732.error().capability
@@ -878,7 +937,7 @@ int main(const int argc, char** argv)
 				<< layout_exact_0732->descriptor_container_offsets[4] << '\n';
 		return 2;
 	}
-	// 2b. MSVC PE encoded body test across all 8 families
+	// 2b. MSVC PE encoded body test across all 9 families
 	std::array<std::byte, 4096> code_msvc{};
 	std::size_t size_msvc = 0;
 	build_full_code_msvc(code_msvc, size_msvc, get_string_atom_target, layout_0731_containers, 0x228, 0x220);
@@ -887,8 +946,8 @@ int main(const int argc, char** argv)
 	if (!layout_msvc ||
 		layout_msvc->signature_offset != 0x48 ||
 		layout_msvc->function_kind_offset != 0x78 ||
-		layout_msvc->function_invoke_func_ptr_offset != 0x60 ||
-		layout_msvc->function_bound_this_delta_offset != 0x68 ||
+		layout_msvc->function_invoke_func_ptr_offset != 0x80 ||
+		layout_msvc->function_bound_this_delta_offset != 0x88 ||
 		layout_msvc->callback_signature_offset != 0x48 ||
 		layout_msvc->callback_async_flag_offset != 0x78)
 	{
@@ -903,8 +962,8 @@ int main(const int argc, char** argv)
 		{
 			std::cerr << "Test 2b failed: MSVC PE layout mismatch: signature=" << layout_msvc->signature_offset << " (exp 0x48)"
 				<< " kind=" << layout_msvc->function_kind_offset << " (exp 0x78)"
-				<< " invoke=" << layout_msvc->function_invoke_func_ptr_offset << " (exp 0x60)"
-				<< " this_delta=" << layout_msvc->function_bound_this_delta_offset << " (exp 0x68)"
+				<< " invoke=" << layout_msvc->function_invoke_func_ptr_offset << " (exp 0x80)"
+				<< " this_delta=" << layout_msvc->function_bound_this_delta_offset << " (exp 0x88)"
 				<< " callback_sig=" << layout_msvc->callback_signature_offset << " (exp 0x48)"
 				<< " callback_async=" << layout_msvc->callback_async_flag_offset << " (exp 0x78)\n";
 		}
@@ -913,7 +972,7 @@ int main(const int argc, char** argv)
 
 	// 3. Negative: Missing family VFT set
 	rml::roblox::internals::ReflectionVftSets missing_family_vft_sets = full_vft_sets;
-	missing_family_vft_sets.property_vfts = {};
+	missing_family_vft_sets.type_vfts = {};
 	const auto missing_family_res = resolve_all(code_0731, size_0731, missing_family_vft_sets);
 	if (missing_family_res || missing_family_res.error().failure != CompatibilityFailure::missing_signature)
 	{
@@ -956,6 +1015,18 @@ int main(const int argc, char** argv)
 	if (conflict_res || conflict_res.error().failure != CompatibilityFailure::ambiguous_evidence)
 	{
 		std::cerr << "Test 5 failed: conflict check\n";
+		return 5;
+	}
+
+	std::array<std::byte, 4096> code_type_conflict = code_0731;
+	auto size_type_conflict = size_0731;
+	append_type_constructor_code(code_type_conflict, size_type_conflict, 0x38, 0x40, 0x44);
+	const auto type_conflict_res =
+		resolve_all(code_type_conflict, size_type_conflict, full_vft_sets);
+	if (type_conflict_res ||
+		type_conflict_res.error().failure != CompatibilityFailure::ambiguous_evidence)
+	{
+		std::cerr << "Test 5b failed: conflicting Type layout evidence accepted\n";
 		return 5;
 	}
 	// Test ReflectionCapabilities find_* across families
@@ -1012,13 +1083,18 @@ int main(const int argc, char** argv)
 	ReflectionCapabilities caps_storage(
 		mock_get_string_atom,
 		test_offsets,
-		0x228,
+		0x230,
 		0x220,
 		0x8,
 		0x30,
 		0x38,
 		0x40,
 		0x8c,
+		0x28,
+		0x30,
+		0x34,
+		0x35,
+		0x36,
 		0x48,
 		0x78,
 		0x80,
@@ -1029,6 +1105,31 @@ int main(const int argc, char** argv)
 	const auto* caps = &caps_storage;
 	const auto* class_desc =
 		reinterpret_cast<const RBX::Reflection::ClassDescriptor*>(class_buf.data());
+
+	alignas(void*) std::array<std::byte, 0x90> function_descriptor_buf{};
+	const auto executable_pointer =
+		reinterpret_cast<std::uintptr_t>(&executable_pointer_fixture);
+	std::memcpy(function_descriptor_buf.data() + 0x80, &executable_pointer, sizeof(executable_pointer));
+	const std::uint64_t contaminated_delta = 0x7f000000fffffff4ULL;
+	std::memcpy(function_descriptor_buf.data() + 0x88, &contaminated_delta, sizeof(contaminated_delta));
+	const auto* function_descriptor =
+		reinterpret_cast<const RBX::Reflection::FunctionDescriptor*>(function_descriptor_buf.data());
+	if (caps->function_invoke_func_ptr(function_descriptor) !=
+			reinterpret_cast<void*>(executable_pointer) ||
+		caps->function_bound_this_delta(function_descriptor) != -12)
+	{
+		std::cerr << "Test 6 failed: executable function pointer or 32-bit this delta rejected\n";
+		return 6;
+	}
+	alignas(void*) std::array<std::byte, sizeof(void*)> non_executable_storage{};
+	const auto non_executable_pointer =
+		reinterpret_cast<std::uintptr_t>(non_executable_storage.data());
+	std::memcpy(function_descriptor_buf.data() + 0x80, &non_executable_pointer, sizeof(non_executable_pointer));
+	if (caps->function_invoke_func_ptr(function_descriptor) != nullptr)
+	{
+		std::cerr << "Test 6 failed: non-executable function pointer accepted\n";
+		return 6;
+	}
 
 	std::array<std::byte, 0x100> event_descriptor_buf{};
 	std::array<std::byte, 0x40> event_source_buf{};
@@ -1086,7 +1187,7 @@ int main(const int argc, char** argv)
 
 	// 7. Inherited lookup test across all 5 families
 	std::vector<std::byte> child_class_buf(0x400, std::byte{0});
-	const auto base_class_offset = 0x228;
+	const auto base_class_offset = 0x230;
 	const auto parent_address = reinterpret_cast<std::uintptr_t>(class_buf.data());
 	std::memcpy(child_class_buf.data() + base_class_offset, &parent_address, sizeof(parent_address));
 
@@ -1253,7 +1354,7 @@ int main(const int argc, char** argv)
 	if (!large_layout ||
 		large_layout->descriptor_container_offsets !=
 			std::array<std::ptrdiff_t, 5>{0x40, 0x88, 0xD0, 0x118, 0x160} ||
-		large_layout->base_class_offset != 0x1a8 ||
+		large_layout->base_class_offset != 0x1b0 ||
 		large_layout->functionality_offset != 0x1bc)
 	{
 		std::cerr << "Test 10 failed: large constructor >256 bytes regression test\n";
@@ -1362,7 +1463,7 @@ int main(const int argc, char** argv)
 	auto adv_layout = resolve(adv_code, adv_size);
 	if (!adv_layout ||
 		adv_layout->descriptor_container_offsets != std::array<std::ptrdiff_t, 5>{0x40, 0xA0, 0x100, 0x160, 0x1C0} ||
-		adv_layout->base_class_offset != 0x228 ||
+		adv_layout->base_class_offset != 0x230 ||
 		adv_layout->functionality_offset != 0x220)
 	{
 		std::cerr << "Test 11 failed: adversarial noise test\n";
@@ -1681,7 +1782,7 @@ int main(const int argc, char** argv)
 	auto mov_zero_res = resolve(mov_zero_code, mov_zero_size);
 	if (!mov_zero_res ||
 		!std::equal(mov_zero_res->descriptor_container_offsets.begin(), mov_zero_res->descriptor_container_offsets.end(), layout_0731_storage.begin(), layout_0731_storage.end()) ||
-		mov_zero_res->base_class_offset != 0x228 ||
+		mov_zero_res->base_class_offset != 0x230 ||
 		mov_zero_res->functionality_offset != 0x220)
 	{
 		std::cerr << "Test 15 failed: MOV reg, 0 immediate zero resolution failed\n";
@@ -1711,7 +1812,7 @@ int main(const int argc, char** argv)
 		// Function 1: Constructor-shaped initialization from current MSVC Studio output.
 		// MOV RBX, RCX; XOR ESI, ESI
 		inst_code.insert(inst_code.end(), {0x48, 0x8B, 0xD9, 0x33, 0xF6});
-		// parent shared ownership pair at 0x60
+		// parent ownership pair at 0x60; the raw parent pointer is the second word
 		inst_code.insert(inst_code.end(), {0x48, 0x89, 0x73, 0x60});
 		inst_code.insert(inst_code.end(), {0x48, 0x89, 0x73, 0x68});
 		const auto xref_off = inst_code.size();
@@ -1759,7 +1860,7 @@ int main(const int argc, char** argv)
 			vfts_span,
 			inst_entries_span);
 
-		if (!inst_res || inst_res->parent_offset != 0x60 || inst_res->children_offset != 0x70 || inst_res->name_offset != 0x98)
+		if (!inst_res || inst_res->parent_offset != 0x68 || inst_res->children_offset != 0x70 || inst_res->name_offset != 0x98)
 		{
 			std::cerr << "Test 16 failed: Instance 0.732 dynamic layout resolution\n";
 			return 16;
@@ -2012,6 +2113,22 @@ int main(const int argc, char** argv)
 		const auto event_signal_evidence_offset = sig_pos_code.size();
 		append_bytes({0x4C, 0x63, 0x79, 0x78});
 		append_bytes({0x4C, 0x03, 0xFD});
+		// Prove the non-volatile zero register on the allocator path. The decoy branch
+		// overwrites it but exits without reaching allocation.
+		append_bytes({0x45, 0x33, 0xE4}); // XOR R12D, R12D
+		append_bytes({0x48, 0x85, 0xED}); // TEST RBP, RBP
+		const std::size_t connect_main_jne_pos = sig_pos_code.size();
+		append_bytes({0x0F, 0x85, 0x00, 0x00, 0x00, 0x00}); // JNE main
+		append_bytes({0x4D, 0x8B, 0x60, 0x08}); // MOV R12, [R8 + 8] (off-path clobber)
+		const std::size_t connect_exit_jmp_pos = sig_pos_code.size();
+		append_bytes({0xE9, 0x00, 0x00, 0x00, 0x00}); // JMP exit
+		const std::size_t connect_main_pos = sig_pos_code.size();
+		{
+			const auto disp = static_cast<std::int32_t>(
+				connect_main_pos - (connect_main_jne_pos + 6));
+			const auto* disp_bytes = reinterpret_cast<const std::uint8_t*>(&disp);
+			std::copy_n(disp_bytes, 4, sig_pos_code.begin() + connect_main_jne_pos + 2);
+		}
 		// MOV ECX, 0x40 (allocation size = 64)
 		append_bytes({0xB9, 0x40, 0x00, 0x00, 0x00});
 		// CALL allocator (dummy target: disconnect_fn)
@@ -2021,10 +2138,10 @@ int main(const int argc, char** argv)
 		// MOV RAX, [R15]; MOV [RBX + 0x20], RAX (source = 32)
 		append_bytes({0x49, 0x8B, 0x07});
 		append_bytes({0x48, 0x89, 0x43, 0x20});
-		// MOV dword ptr [RBX + 0x00], 0 (strong = 0)
-		append_bytes({0xC7, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00});
-		// MOV qword ptr [RBX + 0x10], 0 (next = 16)
-		append_bytes({0x48, 0xC7, 0x43, 0x10, 0x00, 0x00, 0x00, 0x00});
+		// MOV dword ptr [RBX + 0x00], R12D (strong = proven zero)
+		append_bytes({0x44, 0x89, 0x23});
+		// MOV qword ptr [RBX + 0x10], R12 (next = proven zero)
+		append_bytes({0x4C, 0x89, 0x63, 0x10});
 		// MOV dword ptr [RBX + 0x04], 1 (weak = 4)
 		append_bytes({0xC7, 0x43, 0x04, 0x01, 0x00, 0x00, 0x00});
 		// MOV R8, [R8 + 0x00] (WrapperPtr setup)
@@ -2041,8 +2158,14 @@ int main(const int argc, char** argv)
 		append_rel32_call(off_insert_helper);
 		// INC dword ptr [RBX + 0x04] (weak increment)
 		append_bytes({0xFF, 0x43, 0x04});
-		// RET
+		const std::size_t connect_exit_pos = sig_pos_code.size();
 		append_bytes({0xC3});
+		{
+			const auto disp = static_cast<std::int32_t>(
+				connect_exit_pos - (connect_exit_jmp_pos + 5));
+			const auto* disp_bytes = reinterpret_cast<const std::uint8_t*>(&disp);
+			std::copy_n(disp_bytes, 4, sig_pos_code.begin() + connect_exit_jmp_pos + 1);
+		}
 
 		const std::size_t end_sig_pos_code = sig_pos_code.size();
 
@@ -2091,6 +2214,51 @@ int main(const int argc, char** argv)
 			sig_pos_res->slot_source_offset != 32 || sig_pos_res->slot_wrapper_ptr_offset != 48)
 		{
 			std::cerr << "Test 16 failed: Signal dynamic layout resolution\n";
+			return 16;
+		}
+
+		rml::roblox::internals::SignalConnectTrace pos_trace{};
+		pos_trace.focus_function_address = code_addr + off_connect_fn;
+		const auto sig_pos_focused_res = rml::roblox::internals::resolve_signal_layout(
+			std::as_bytes(std::span{sig_pos_code}),
+			code_addr,
+			std::as_bytes(std::span{sig_pos_pdata}),
+			base_addr,
+			code_addr + off_disconnect,
+			code_addr + off_disconnect,
+			nullptr,
+			&pos_trace);
+
+		if (!sig_pos_focused_res)
+		{
+			std::cerr << "Test 16 failed: Focused Signal layout resolution failed\n";
+			return 16;
+		}
+		if (pos_trace.focus_function_address != code_addr + off_connect_fn ||
+			pos_trace.total_connect_callers != 1 ||
+			pos_trace.candidates.size() != 1 ||
+			pos_trace.candidates.front().function_address != code_addr + off_connect_fn ||
+			!pos_trace.candidates.front().valid)
+		{
+			std::cerr << "Test 16 failed: Focused Signal layout trace evidence validation\n";
+			return 16;
+		}
+
+		rml::roblox::internals::SignalConnectTrace not_found_trace{};
+		not_found_trace.focus_function_address = code_addr + 0x7777;
+		const auto sig_focus_not_found_res = rml::roblox::internals::resolve_signal_layout(
+			std::as_bytes(std::span{sig_pos_code}),
+			code_addr,
+			std::as_bytes(std::span{sig_pos_pdata}),
+			base_addr,
+			code_addr + off_disconnect,
+			code_addr + off_disconnect,
+			nullptr,
+			&not_found_trace);
+
+		if (sig_focus_not_found_res)
+		{
+			std::cerr << "Test 16 failed: Focused Signal layout accepted undiscovered focus address\n";
 			return 16;
 		}
 

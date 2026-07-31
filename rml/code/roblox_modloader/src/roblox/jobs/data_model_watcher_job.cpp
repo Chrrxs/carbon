@@ -35,16 +35,29 @@ namespace rml::jobs
 		}
 
 		const auto type = *type_res;
-		m_data_models[type]                  = data_model;
-		m_data_model_last_time_stepped[type] = std::chrono::high_resolution_clock::now();
-		return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - m_last_check)
-		           .count()
-		    > 16;
+		const auto now = std::chrono::steady_clock::now();
+		const auto current_data_model = rml::task_scheduler().get_data_model_by_type(type);
+		if (current_data_model == data_model)
+			m_data_model_last_time_stepped[type] = now;
+
+		if (!current_data_model)
+			return true;
+		if (now - m_last_check <= CHANGE_CHECK_INTERVAL)
+			return false;
+		if (current_data_model == data_model)
+			return true;
+
+		const auto last_step = m_data_model_last_time_stepped.find(type);
+		const bool current_is_stale =
+			last_step == m_data_model_last_time_stepped.end() ||
+			now - last_step->second > STALE_DATA_MODEL_THRESHOLD;
+		return current_is_stale ||
+			studio_marker_priority(data_model) > studio_marker_priority(current_data_model);
 	}
 
 	void DataModelWatcherJob::execute_impl(const JobExecutionContext& context)
 	{
-		m_last_check = std::chrono::high_resolution_clock::now();
+		m_last_check = std::chrono::steady_clock::now();
 
 		const auto job            = context.job_as<RBX::ScriptContextFacets::WaitingHybridScriptsJob>();
 		const auto new_data_model = RBX::DataModel::from_job(job);
@@ -60,18 +73,59 @@ namespace rml::jobs
 			return;
 		}
 
-		const auto old_data_model = rml::task_scheduler().get_data_model_by_type(*new_type_res);
+		const auto data_model_type = *new_type_res;
+		const auto old_data_model = rml::task_scheduler().get_data_model_by_type(data_model_type);
 		if (old_data_model == new_data_model)
 		{
 			return;
 		}
-		check_and_cleanup_stale_data_models();
 
+		m_data_models[data_model_type] = new_data_model;
+		m_data_model_last_time_stepped[data_model_type] = m_last_check;
+		check_and_cleanup_stale_data_models();
 		on_data_model_changed(old_data_model, new_data_model, job->get_script_context());
 	}
 
 	void DataModelWatcherJob::destroy_impl() noexcept
 	{
+	}
+
+	std::uint8_t DataModelWatcherJob::studio_marker_priority(
+		const RBX::DataModel* data_model) noexcept
+	{
+		constexpr std::string_view core_gui_name = "CoreGui";
+		constexpr std::string_view studio_route_marker = "__CarbonStudioRoute";
+		constexpr std::string_view managed_baseline_ready_marker = "__CarbonManagedBaselineReady";
+
+		if (!data_model)
+			return 0;
+		const auto* services = data_model->get_children();
+		if (!services)
+			return 0;
+
+		for (const auto& service_owner : *services)
+		{
+			auto* service = service_owner.get();
+			if (!service || service->get_name() != core_gui_name)
+				continue;
+			const auto* children = service->get_children();
+			if (!children)
+				return 0;
+
+			std::size_t route_markers = 0;
+			for (const auto& child_owner : *children)
+			{
+				const auto* child = child_owner.get();
+				if (!child)
+					continue;
+				const auto name = child->get_name();
+				if (name == managed_baseline_ready_marker)
+					return 2;
+				route_markers += name == studio_route_marker ? 1u : 0u;
+			}
+			return route_markers == 1 ? 1 : 0;
+		}
+		return 0;
 	}
 
 	void DataModelWatcherJob::on_data_model_changed(const RBX::DataModel* old_data_model, RBX::DataModel* new_data_model, RBX::ScriptContext* script_context)

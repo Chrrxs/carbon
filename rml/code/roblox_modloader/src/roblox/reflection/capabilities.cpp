@@ -44,10 +44,30 @@ namespace
 			return false;
 		return begin >= region_begin && end <= region_begin + region.RegionSize;
 	}
+
+	bool is_executable(const void* address) noexcept
+	{
+		if (!address)
+			return false;
+		MEMORY_BASIC_INFORMATION region{};
+		if (VirtualQuery(address, &region, sizeof(region)) != sizeof(region) ||
+			region.State != MEM_COMMIT || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+		{
+			return false;
+		}
+		const auto protection = region.Protect & 0xff;
+		return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+			protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+	}
 #else
 	bool is_readable(const void* address, const std::size_t size) noexcept
 	{
 		return address != nullptr && size > 0;
+	}
+
+	bool is_executable(const void* address) noexcept
+	{
+		return address != nullptr;
 	}
 #endif
 
@@ -211,6 +231,11 @@ namespace rml::roblox::internals
 		const std::ptrdiff_t security_offset,
 		const std::ptrdiff_t property_type_offset,
 		const std::ptrdiff_t property_functionality_offset,
+		const std::ptrdiff_t type_tag_offset,
+		const std::ptrdiff_t type_id_offset,
+		const std::ptrdiff_t type_is_float_offset,
+		const std::ptrdiff_t type_is_number_offset,
+		const std::ptrdiff_t type_is_enum_offset,
 		const std::ptrdiff_t signature_offset,
 		const std::ptrdiff_t function_kind_offset,
 		const std::ptrdiff_t function_invoke_func_ptr_offset,
@@ -227,6 +252,11 @@ namespace rml::roblox::internals
 		m_security_offset(security_offset),
 		m_property_type_offset(property_type_offset),
 		m_property_functionality_offset(property_functionality_offset),
+		m_type_tag_offset(type_tag_offset),
+		m_type_id_offset(type_id_offset),
+		m_type_is_float_offset(type_is_float_offset),
+		m_type_is_number_offset(type_is_number_offset),
+		m_type_is_enum_offset(type_is_enum_offset),
 		m_signature_offset(signature_offset),
 		m_function_kind_offset(function_kind_offset),
 		m_function_invoke_func_ptr_offset(function_invoke_func_ptr_offset),
@@ -344,6 +374,32 @@ namespace rml::roblox::internals
 		auto* type = read_pointer_field<const RBX::Reflection::Type>(property, m_property_type_offset);
 		return type && is_readable(type, sizeof(void*)) ? type : nullptr;
 	}
+	const RBX::Name* ReflectionCapabilities::type_tag(
+		const RBX::Reflection::Type* type) const noexcept
+	{
+		const auto* tag = read_pointer_field<const RBX::Name>(type, m_type_tag_offset);
+		return tag && is_readable(tag, sizeof(void*)) ? tag : nullptr;
+	}
+
+	int ReflectionCapabilities::type_id(const RBX::Reflection::Type* type) const noexcept
+	{
+		return read_field<std::int32_t>(type, m_type_id_offset).value_or(0);
+	}
+
+	bool ReflectionCapabilities::type_is_float(const RBX::Reflection::Type* type) const noexcept
+	{
+		return read_field<bool>(type, m_type_is_float_offset).value_or(false);
+	}
+
+	bool ReflectionCapabilities::type_is_number(const RBX::Reflection::Type* type) const noexcept
+	{
+		return read_field<bool>(type, m_type_is_number_offset).value_or(false);
+	}
+
+	bool ReflectionCapabilities::type_is_enum(const RBX::Reflection::Type* type) const noexcept
+	{
+		return read_field<bool>(type, m_type_is_enum_offset).value_or(false);
+	}
 
 	std::uint32_t ReflectionCapabilities::property_functionality(
 		const RBX::Reflection::PropertyDescriptor* property) const noexcept
@@ -394,12 +450,13 @@ namespace rml::roblox::internals
 	void* ReflectionCapabilities::function_invoke_func_ptr(
 		const RBX::Reflection::FunctionDescriptor* function) const noexcept
 	{
-		return read_pointer_field<void>(function, m_function_invoke_func_ptr_offset);
+		auto* pointer = read_pointer_field<void>(function, m_function_invoke_func_ptr_offset);
+		return is_executable(pointer) ? pointer : nullptr;
 	}
 	std::intptr_t ReflectionCapabilities::function_bound_this_delta(
 		const RBX::Reflection::FunctionDescriptor* function) const noexcept
 	{
-		return read_field<std::intptr_t>(function, m_function_bound_this_delta_offset).value_or(0);
+		return read_field<std::int32_t>(function, m_function_bound_this_delta_offset).value_or(0);
 	}
 	const RBX::Reflection::SignatureDescriptor* ReflectionCapabilities::yield_signature(
 		const RBX::Reflection::YieldFunctionDescriptor* function) const noexcept

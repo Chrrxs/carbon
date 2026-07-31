@@ -176,6 +176,15 @@ namespace rml::roblox::internals
 			});
 		}
 
+		const auto type_vfts = gather_family_vfts("RBX::Reflection::Type", "class RBX::Reflection::Type");
+		if (type_vfts.empty())
+		{
+			return std::unexpected(CompatibilityError{
+				.capability = "Reflection.TypeRTTI",
+				.failure = CompatibilityFailure::missing_signature,
+			});
+		}
+
 		const auto yield_function_vfts = gather_family_vfts("RBX::Reflection::YieldFunctionDescriptor", "class RBX::Reflection::YieldFunctionDescriptor");
 		if (yield_function_vfts.empty())
 		{
@@ -338,6 +347,7 @@ namespace rml::roblox::internals
 			.member_vfts = member_vfts,
 			.property_vfts = property_vfts,
 			.function_vfts = function_vfts,
+			.type_vfts = type_vfts,
 			.yield_function_vfts = yield_function_vfts,
 			.event_vfts = event_vfts,
 			.callback_vfts = callback_vfts,
@@ -689,6 +699,11 @@ namespace rml::roblox::internals
 				reflection_layout->security_offset,
 				reflection_layout->property_type_offset,
 				reflection_layout->property_functionality_offset,
+				reflection_layout->type_tag_offset,
+				reflection_layout->type_id_offset,
+				reflection_layout->type_is_float_offset,
+				reflection_layout->type_is_number_offset,
+				reflection_layout->type_is_enum_offset,
 				reflection_layout->signature_offset,
 				reflection_layout->function_kind_offset,
 				reflection_layout->function_invoke_func_ptr_offset,

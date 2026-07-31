@@ -143,6 +143,12 @@ namespace rml::roblox::internals
 
 		[[nodiscard]] const RBX::Reflection::Type* property_type(
 			const RBX::Reflection::PropertyDescriptor* property) const noexcept;
+		[[nodiscard]] const RBX::Name* type_tag(
+			const RBX::Reflection::Type* type) const noexcept;
+		[[nodiscard]] int type_id(const RBX::Reflection::Type* type) const noexcept;
+		[[nodiscard]] bool type_is_float(const RBX::Reflection::Type* type) const noexcept;
+		[[nodiscard]] bool type_is_number(const RBX::Reflection::Type* type) const noexcept;
+		[[nodiscard]] bool type_is_enum(const RBX::Reflection::Type* type) const noexcept;
 		[[nodiscard]] bool property_always_clone(const RBX::Reflection::PropertyDescriptor* property) const noexcept;
 
 		[[nodiscard]] std::uint32_t property_functionality(
@@ -218,6 +224,11 @@ namespace rml::roblox::internals
 			std::ptrdiff_t security_offset,
 			std::ptrdiff_t property_type_offset,
 			std::ptrdiff_t property_functionality_offset,
+			std::ptrdiff_t type_tag_offset,
+			std::ptrdiff_t type_id_offset,
+			std::ptrdiff_t type_is_float_offset,
+			std::ptrdiff_t type_is_number_offset,
+			std::ptrdiff_t type_is_enum_offset,
 			std::ptrdiff_t signature_offset,
 			std::ptrdiff_t function_kind_offset,
 			std::ptrdiff_t function_invoke_func_ptr_offset,
@@ -241,6 +252,11 @@ namespace rml::roblox::internals
 		std::ptrdiff_t m_security_offset{-1};
 		std::ptrdiff_t m_property_type_offset{-1};
 		std::ptrdiff_t m_property_functionality_offset{-1};
+		std::ptrdiff_t m_type_tag_offset{-1};
+		std::ptrdiff_t m_type_id_offset{-1};
+		std::ptrdiff_t m_type_is_float_offset{-1};
+		std::ptrdiff_t m_type_is_number_offset{-1};
+		std::ptrdiff_t m_type_is_enum_offset{-1};
 		std::ptrdiff_t m_signature_offset{-1};
 		std::ptrdiff_t m_function_kind_offset{-1};
 		std::ptrdiff_t m_function_invoke_func_ptr_offset{-1};

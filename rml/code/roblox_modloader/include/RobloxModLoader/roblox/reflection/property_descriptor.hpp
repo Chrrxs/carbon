@@ -296,7 +296,8 @@ namespace RBX::Reflection
 
 		static bool is_ref_property_descriptor(const Type& type)
 		{
-			return type.tag == "Ref";
+			const auto* tag = type.tag();
+			return tag != nullptr && *tag == "Ref";
 		}
 
 		static bool is_ref_property_descriptor(const PropertyDescriptor& descriptor)

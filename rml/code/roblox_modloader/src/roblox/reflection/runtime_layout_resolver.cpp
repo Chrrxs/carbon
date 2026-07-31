@@ -1,4 +1,5 @@
 #include "RobloxModLoader/roblox/reflection/runtime_layout_resolver.hpp"
+#include "RobloxModLoader/roblox/reflection/type.hpp"
 
 #include <Zydis/Zydis.h>
 
@@ -539,6 +540,7 @@ namespace rml::roblox::internals
 			vft_sets.member_vfts.empty() &&
 			vft_sets.property_vfts.empty() &&
 			vft_sets.function_vfts.empty() &&
+			vft_sets.type_vfts.empty() &&
 			vft_sets.yield_function_vfts.empty() &&
 			vft_sets.event_vfts.empty() &&
 			vft_sets.callback_vfts.empty() &&
@@ -547,6 +549,7 @@ namespace rml::roblox::internals
 			vft_sets.member_vfts.empty() ||
 			vft_sets.property_vfts.empty() ||
 			vft_sets.function_vfts.empty() ||
+			vft_sets.type_vfts.empty() ||
 			vft_sets.yield_function_vfts.empty() ||
 			vft_sets.event_vfts.empty() ||
 			vft_sets.callback_vfts.empty())) ||
@@ -591,6 +594,11 @@ namespace rml::roblox::internals
 		DerivedField field_security;
 		DerivedField field_property_type;
 		DerivedField field_property_func;
+		DerivedField field_type_tag;
+		DerivedField field_type_id;
+		DerivedField field_type_is_float;
+		DerivedField field_type_is_number;
+		DerivedField field_type_is_enum;
 		DerivedField field_signature;
 		DerivedField field_func_kind;
 		DerivedField field_func_invoke;
@@ -616,6 +624,7 @@ namespace rml::roblox::internals
 			event_family = 1u << 5,
 			callback_family = 1u << 6,
 			class_family = 1u << 7,
+			type_family = 1u << 8,
 		};
 		std::unordered_map<std::uintptr_t, std::uint16_t> vft_families;
 		const auto vft_count =
@@ -623,6 +632,7 @@ namespace rml::roblox::internals
 			vft_sets.member_vfts.size() +
 			vft_sets.property_vfts.size() +
 			vft_sets.function_vfts.size() +
+			vft_sets.type_vfts.size() +
 			vft_sets.yield_function_vfts.size() +
 			vft_sets.event_vfts.size() +
 			vft_sets.callback_vfts.size() +
@@ -636,6 +646,7 @@ namespace rml::roblox::internals
 		add_family(vft_sets.member_vfts, member_family);
 		add_family(vft_sets.property_vfts, property_family);
 		add_family(vft_sets.function_vfts, function_family);
+		add_family(vft_sets.type_vfts, type_family);
 		add_family(vft_sets.yield_function_vfts, yield_family);
 		add_family(vft_sets.event_vfts, event_family);
 		add_family(vft_sets.callback_vfts, callback_family);
@@ -696,13 +707,14 @@ namespace rml::roblox::internals
 			const bool is_member_vft = (families & member_family) != 0;
 			const bool is_property_vft = (families & property_family) != 0;
 			const bool is_function_vft = (families & function_family) != 0;
+			const bool is_type_vft = (families & type_family) != 0;
 			const bool is_yield_vft = (families & yield_family) != 0;
 			const bool is_event_vft = (families & event_family) != 0;
 			const bool is_callback_vft = (families & callback_family) != 0;
 			const bool is_class_vft = (families & class_family) != 0;
 
 			if (!is_descriptor_vft && !is_member_vft && !is_property_vft && !is_function_vft &&
-				!is_yield_vft && !is_event_vft && !is_callback_vft && !is_class_vft)
+				!is_type_vft && !is_yield_vft && !is_event_vft && !is_callback_vft && !is_class_vft)
 			{
 				cursor += inst.length;
 				continue;
@@ -1008,20 +1020,108 @@ namespace rml::roblox::internals
 				}
 			}
 
+			// 4. Type fields: the Type constructor stores a tag pointer, a 32-bit
+			// TypeId, and the three contiguous classification flags.
+			if (is_type_vft)
+			{
+				std::vector<std::ptrdiff_t> qword_stores;
+				std::vector<std::ptrdiff_t> dword_stores;
+				std::vector<std::ptrdiff_t> byte_stores;
+				for (const auto& dinst : func_instructions)
+				{
+					if (dinst.inst.mnemonic != ZYDIS_MNEMONIC_MOV ||
+						dinst.operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY ||
+						dinst.operands[0].mem.base != this_reg ||
+						!dinst.operands[0].mem.disp.has_displacement ||
+						dinst.operands[0].mem.disp.value <= 0)
+					{
+						continue;
+					}
+					const auto disp =
+						static_cast<std::ptrdiff_t>(dinst.operands[0].mem.disp.value);
+					switch (dinst.operands[0].size)
+					{
+					case 64:
+						qword_stores.push_back(disp);
+						break;
+					case 32:
+						dword_stores.push_back(disp);
+						break;
+					case 8:
+						byte_stores.push_back(disp);
+						break;
+					default:
+						break;
+					}
+				}
+				for (const auto tag_offset : qword_stores)
+				{
+					const auto id_offset = tag_offset + static_cast<std::ptrdiff_t>(sizeof(void*));
+					const auto first_flag_offset =
+						id_offset + static_cast<std::ptrdiff_t>(sizeof(std::int32_t));
+					if (std::find(dword_stores.begin(), dword_stores.end(), id_offset) ==
+							dword_stores.end() ||
+						std::find(byte_stores.begin(), byte_stores.end(), first_flag_offset) ==
+							byte_stores.end() ||
+						std::find(byte_stores.begin(), byte_stores.end(), first_flag_offset + 1) ==
+							byte_stores.end() ||
+						std::find(byte_stores.begin(), byte_stores.end(), first_flag_offset + 2) ==
+							byte_stores.end())
+					{
+						continue;
+					}
+					field_type_tag.add_candidate(tag_offset);
+					field_type_id.add_candidate(id_offset);
+					field_type_is_float.add_candidate(first_flag_offset);
+					field_type_is_number.add_candidate(first_flag_offset + 1);
+					field_type_is_enum.add_candidate(first_flag_offset + 2);
+				}
+			}
+
+
 			// 4. FunctionDescriptor & YieldFunctionDescriptor fields:
 			if (is_function_vft || is_yield_vft)
 			{
-				// Signature is a three-word in-place object, followed by the three-word
-				// callable state and a scalar FunctionKind. Derive the member starts from
-				// the constructor's contiguous zero-initialization run.
+				// SignatureDescriptor owns two three-word ranges. The base constructor
+				// zeroes that complete object and then its scalar FunctionKind. Concrete
+				// function descriptors append the code pointer and this-adjustment after
+				// the aligned base object; the signature's middle words are not callable
+				// state.
 				for (const auto& run : zero_store_runs)
 				{
-					if (run.qword_offsets.size() < 6 || run.trailing_scalar_size != 32)
+					constexpr auto signature_qwords =
+						sizeof(RBX::Reflection::SignatureDescriptor) / sizeof(std::uintptr_t);
+					if (run.qword_offsets.size() != signature_qwords ||
+						run.trailing_scalar_size != 32 ||
+						run.trailing_scalar_offset !=
+							run.qword_offsets.front() +
+								static_cast<std::ptrdiff_t>(sizeof(RBX::Reflection::SignatureDescriptor)))
+					{
 						continue;
-					field_signature.add_candidate(run.qword_offsets[0]);
-					field_func_invoke.add_candidate(run.qword_offsets[3]);
-					field_func_this_delta.add_candidate(run.qword_offsets[4]);
-					field_func_kind.add_candidate(run.trailing_scalar_offset);
+					}
+					bool contiguous = true;
+					for (std::size_t index = 1; index < run.qword_offsets.size(); ++index)
+					{
+						contiguous &= run.qword_offsets[index] ==
+							run.qword_offsets.front() +
+								static_cast<std::ptrdiff_t>(index * sizeof(std::uintptr_t));
+					}
+					if (!contiguous)
+						continue;
+
+					field_signature.add_candidate(run.qword_offsets.front());
+					if (is_function_vft)
+					{
+						field_func_kind.add_candidate(run.trailing_scalar_offset);
+						const auto invoke_offset =
+							(run.trailing_scalar_offset +
+								static_cast<std::ptrdiff_t>(sizeof(std::uint32_t)) +
+								static_cast<std::ptrdiff_t>(alignof(void*) - 1)) &
+							-static_cast<std::ptrdiff_t>(alignof(void*));
+						field_func_invoke.add_candidate(invoke_offset);
+						field_func_this_delta.add_candidate(
+							invoke_offset + static_cast<std::ptrdiff_t>(sizeof(void*)));
+					}
 				}
 				std::size_t vft_store_index = func_instructions.size();
 				ZydisRegister vft_register = ZYDIS_REGISTER_NONE;
@@ -1066,7 +1166,8 @@ namespace rml::roblox::internals
 						{
 							field_signature.add_candidate(disp);
 						}
-						if (disp > 0 && dinst.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+						if (is_function_vft && disp > 0 &&
+							dinst.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
 							dinst.operands[1].imm.value.u > 0 && dinst.operands[1].imm.value.u < 0x10 &&
 							(dinst.operands[0].size == 8 || dinst.operands[0].size == 32))
 						{
@@ -1093,11 +1194,22 @@ namespace rml::roblox::internals
 						}
 					}
 
-					if (i > vft_store_index && dinst.inst.mnemonic == ZYDIS_MNEMONIC_LEA &&
+					if (is_function_vft && i > vft_store_index &&
+						dinst.inst.mnemonic == ZYDIS_MNEMONIC_LEA &&
 						dinst.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 						dinst.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
 						dinst.operands[1].mem.base == ZYDIS_REGISTER_RIP)
 					{
+						std::uintptr_t code_target = 0;
+						if (!checked_add(
+								code_address + dinst.offset + dinst.inst.length,
+								dinst.operands[1].mem.disp.value,
+								code_target) ||
+							code_target < code_address ||
+							code_target - code_address >= executable_code.size())
+						{
+							continue;
+						}
 						const auto code_register = dinst.operands[0].reg.value;
 						const auto store_limit = std::min(func_instructions.size(), i + 8);
 						for (std::size_t j = i + 1; j < store_limit; ++j)
@@ -1561,6 +1673,8 @@ namespace rml::roblox::internals
 								sub_inst.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 								sub_inst.operands[1].reg.value == load_reg)
 							{
+								// This copied identity word immediately precedes the raw
+								// ClassDescriptor base pointer in both recovered layouts.
 								field_base_class.add_candidate(static_cast<std::ptrdiff_t>(disp));
 								break;
 							}
@@ -1680,7 +1794,7 @@ namespace rml::roblox::internals
 				offset += field_container_storage.val;
 			return ReflectionLayoutEvidence{
 				.descriptor_container_offsets = container_offsets,
-				.base_class_offset = field_base_class.val,
+				.base_class_offset = field_base_class.val + static_cast<std::ptrdiff_t>(sizeof(std::uintptr_t)),
 				.functionality_offset = field_class_func.val,
 				.supporting_calls = matched_calls,
 				.matched_calls = matched_calls,
@@ -1712,6 +1826,11 @@ namespace rml::roblox::internals
 		check_field(field_security.has_conflict, field_security.val == -1, "Reflection.Member.Security");
 		check_field(field_property_type.has_conflict, field_property_type.val == -1, "Reflection.Property.Type");
 		check_field(field_property_func.has_conflict, field_property_func.val == -1, "Reflection.Property.Functionality");
+		check_field(field_type_tag.has_conflict, field_type_tag.val == -1, "Reflection.Type.Tag");
+		check_field(field_type_id.has_conflict, field_type_id.val == -1, "Reflection.Type.Id");
+		check_field(field_type_is_float.has_conflict, field_type_is_float.val == -1, "Reflection.Type.IsFloat");
+		check_field(field_type_is_number.has_conflict, field_type_is_number.val == -1, "Reflection.Type.IsNumber");
+		check_field(field_type_is_enum.has_conflict, field_type_is_enum.val == -1, "Reflection.Type.IsEnum");
 		check_field(field_signature.has_conflict, field_signature.val == -1, "Reflection.Function.Signature");
 		check_field(field_func_kind.has_conflict, field_func_kind.val == -1, "Reflection.Function.Kind");
 		check_field(field_func_invoke.has_conflict, field_func_invoke.val == -1, "Reflection.Function.Invoke");
@@ -1748,12 +1867,17 @@ namespace rml::roblox::internals
 		return ReflectionLayoutEvidence{
 			.name_offset = field_name.val,
 			.descriptor_container_offsets = container_offsets,
-			.base_class_offset = field_base_class.val,
+			.base_class_offset = field_base_class.val + static_cast<std::ptrdiff_t>(sizeof(std::uintptr_t)),
 			.functionality_offset = field_class_func.val,
 			.owner_offset = field_owner.val,
 			.security_offset = field_security.val,
 			.property_type_offset = field_property_type.val,
 			.property_functionality_offset = field_property_func.val,
+			.type_tag_offset = field_type_tag.val,
+			.type_id_offset = field_type_id.val,
+			.type_is_float_offset = field_type_is_float.val,
+			.type_is_number_offset = field_type_is_number.val,
+			.type_is_enum_offset = field_type_is_enum.val,
 			.signature_offset = field_signature.val,
 			.function_kind_offset = field_func_kind.val,
 			.function_invoke_func_ptr_offset = field_func_invoke.val,
@@ -2060,9 +2184,9 @@ namespace rml::roblox::internals
 
 					if (has_vft_store)
 					{
-						// parent is a two-word ownership object immediately before the
-						// Instance VFT store; children is the three-word ownership object
-						// initialized immediately after it.
+						// Instance stores the raw parent pointer in the second word of
+						// the two-word ownership pair immediately before the VFT store.
+						// Children is the three-word ownership object initialized after it.
 						for (std::size_t i = 0; i + 1 < zero_field_stores.size(); ++i)
 						{
 							const auto& first = zero_field_stores[i];
@@ -2073,7 +2197,7 @@ namespace rml::roblox::internals
 								second.displacement == first.displacement +
 									static_cast<std::ptrdiff_t>(sizeof(std::uintptr_t)))
 							{
-								fn_parent = first.displacement;
+								fn_parent = second.displacement;
 							}
 						}
 						for (std::size_t i = 0; i + 2 < zero_field_stores.size(); ++i)
@@ -2197,8 +2321,15 @@ namespace rml::roblox::internals
 		const std::uintptr_t module_address,
 		const std::uintptr_t signal_disconnect_address,
 		const std::uintptr_t signal_slot_free_address,
-		std::vector<CompatibilityError>* diagnostics) noexcept
+		std::vector<CompatibilityError>* diagnostics,
+		SignalConnectTrace* trace) noexcept
 	{
+		if (trace)
+		{
+			const auto focus_input = trace->focus_function_address;
+			*trace = SignalConnectTrace{};
+			trace->focus_function_address = focus_input;
+		}
 		auto emit = [diagnostics](CompatibilityError err) {
 			if (diagnostics)
 				diagnostics->push_back(err);
@@ -2528,279 +2659,24 @@ namespace rml::roblox::internals
 		if (insert_callers.empty())
 			return fail(CompatibilityFailure::insufficient_evidence, 2);
 
-		struct ConnectCandidate
+		if (trace)
 		{
-			std::ptrdiff_t event_signal{-1};
-			std::ptrdiff_t source{-1};
-			std::ptrdiff_t wrapper{-1};
-			std::ptrdiff_t wrapper_rep{-1};
-			std::ptrdiff_t weak{-1};
-			std::size_t allocation_size{};
-			std::uintptr_t insert_helper{};
-			std::vector<std::ptrdiff_t> zero_dwords;
-			std::vector<std::ptrdiff_t> zero_qwords;
-		};
-		std::vector<ConnectCandidate> connect_candidates;
-		std::vector<std::uintptr_t> connect_functions = insert_callers;
-		for (const auto function_address : connect_functions)
+			trace->total_connect_callers = insert_callers.size();
+		}
+
+		const std::uintptr_t focus = trace ? trace->focus_function_address : 0;
+		std::vector<std::uintptr_t> connect_functions;
+		if (focus != 0)
 		{
-			const auto function_bounds = bounds_for(function_address);
-			if (!function_bounds || function_bounds->end - function_bounds->begin > 0x4000)
-				continue;
-			RegTracker tracker;
-			ConnectCandidate candidate;
-			std::size_t pending_allocation_size = 0;
-			bool has_allocation = false;
-			bool insertion_seen = false;
-			std::vector<std::ptrdiff_t> one_dwords;
-			std::vector<std::ptrdiff_t> weak_increments;
-			auto finish_candidate = [&]() {
-				if (!has_allocation || candidate.event_signal <= 0)
-					return;
-				if (candidate.insert_helper == 0 || candidate.source <= 0 ||
-					candidate.wrapper < 0 ||
-					candidate.wrapper_rep != candidate.wrapper +
-						static_cast<std::ptrdiff_t>(sizeof(void*)) ||
-					static_cast<std::size_t>(candidate.wrapper_rep + sizeof(void*)) !=
-						candidate.allocation_size)
-				{
-					return;
-				}
-				std::vector<std::ptrdiff_t> weak_candidates;
-				for (const auto disp : one_dwords)
-					if (std::find(weak_increments.begin(), weak_increments.end(), disp) !=
-						weak_increments.end())
-						weak_candidates.push_back(disp);
-				if (weak_candidates.size() != 1)
-					return;
-				candidate.weak = weak_candidates.front();
-				connect_candidates.push_back(candidate);
-			};
-			std::ptrdiff_t pending_event_signal{-1};
-			ZydisRegister pending_wrapper_base = ZYDIS_REGISTER_NONE;
-			ZydisRegister pending_wrapper_dest = ZYDIS_REGISTER_NONE;
-			std::size_t position = function_bounds->begin;
-			bool decode_failed = false;
-			while (position < function_bounds->end)
+			if (std::find(insert_callers.begin(), insert_callers.end(), focus) == insert_callers.end())
 			{
-				const auto* bytes = reinterpret_cast<const std::uint8_t*>(
-					executable_code.data() + position);
-				ZydisDecodedInstruction inst;
-				ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-				if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-						&decoder, bytes, function_bounds->end - position, &inst, operands)) ||
-					inst.length == 0)
-				{
-					decode_failed = true;
-					break;
-				}
-
-				if ((inst.mnemonic == ZYDIS_MNEMONIC_MOV ||
-					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSX ||
-					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSXD) &&
-					inst.operand_count >= 2 &&
-					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-					operands[1].mem.disp.has_displacement &&
-					operands[1].size == 32 &&
-					tracker.get_role(operands[1].mem.base) == RegRole::This)
-				{
-					tracker.set_role(
-						operands[0].reg.value,
-						RegRole::EventSignalField,
-						static_cast<std::uint64_t>(operands[1].mem.disp.value));
-					position += inst.length;
-					continue;
-				}
-				if (inst.mnemonic == ZYDIS_MNEMONIC_ADD && inst.operand_count >= 2 &&
-					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-					operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-					tracker.get_role(operands[0].reg.value) == RegRole::EventSignalField &&
-					(tracker.get_role(operands[1].reg.value) == RegRole::Arg1 ||
-					 tracker.get_role(operands[1].reg.value) == RegRole::Arg2))
-				{
-					const auto disp = tracker.get_imm(operands[0].reg.value);
-					tracker.set_role(operands[0].reg.value, RegRole::SignalAddress, disp);
-					position += inst.length;
-					continue;
-				}
-				if ((inst.mnemonic == ZYDIS_MNEMONIC_MOV ||
-					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSX) &&
-					inst.operand_count >= 2 &&
-					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-					tracker.get_role(operands[1].mem.base) == RegRole::SignalAddress &&
-					(!operands[1].mem.disp.has_displacement || operands[1].mem.disp.value == 0))
-				{
-					const auto event_signal =
-						static_cast<std::ptrdiff_t>(tracker.get_imm(operands[1].mem.base));
-					if (pending_event_signal != -1 && pending_event_signal != event_signal)
-					{
-						decode_failed = true;
-						break;
-					}
-					pending_event_signal = event_signal;
-					if (has_allocation)
-					{
-						if (candidate.event_signal != -1 && candidate.event_signal != event_signal)
-						{
-							decode_failed = true;
-							break;
-						}
-						candidate.event_signal = event_signal;
-					}
-					tracker.set_role(
-						operands[0].reg.value,
-						RegRole::SignalObject,
-						tracker.get_imm(operands[1].mem.base));
-					position += inst.length;
-					continue;
-				}
-
-				if (inst.mnemonic == ZYDIS_MNEMONIC_MOV && inst.operand_count >= 2 &&
-					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY)
-				{
-					const auto base = to_gpr32(operands[1].mem.base);
-					const auto disp = operands[1].mem.disp.has_displacement
-						? static_cast<std::ptrdiff_t>(operands[1].mem.disp.value) : 0;
-					if (disp == static_cast<std::ptrdiff_t>(sizeof(void*)) &&
-						base == pending_wrapper_base &&
-						pending_wrapper_dest != ZYDIS_REGISTER_NONE)
-					{
-						tracker.set_role(pending_wrapper_dest, RegRole::WrapperPtr);
-						tracker.set_role(operands[0].reg.value, RegRole::WrapperRep);
-						pending_wrapper_base = ZYDIS_REGISTER_NONE;
-						pending_wrapper_dest = ZYDIS_REGISTER_NONE;
-						position += inst.length;
-						continue;
-					}
-					if (disp == 0 && base != ZYDIS_REGISTER_RSP && base != ZYDIS_REGISTER_RBP)
-					{
-						pending_wrapper_base = base;
-						pending_wrapper_dest = operands[0].reg.value;
-					}
-					else
-					{
-						pending_wrapper_base = ZYDIS_REGISTER_NONE;
-						pending_wrapper_dest = ZYDIS_REGISTER_NONE;
-					}
-				}
-
-				if (inst.mnemonic == ZYDIS_MNEMONIC_MOV && inst.operand_count >= 2 &&
-					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-					operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-					to_gpr32(operands[0].reg.value) == ZYDIS_REGISTER_RCX &&
-					operands[1].imm.value.u >= 32 && operands[1].imm.value.u <= 256)
-				{
-					pending_allocation_size = static_cast<std::size_t>(operands[1].imm.value.u);
-				}
-
-				if (inst.mnemonic == ZYDIS_MNEMONIC_CALL)
-				{
-					if (pending_allocation_size != 0)
-					{
-						finish_candidate();
-						tracker.handle_call();
-						tracker.set_role(ZYDIS_REGISTER_RAX, RegRole::AllocatedSlot);
-						candidate = ConnectCandidate{
-							.event_signal = pending_event_signal,
-							.allocation_size = pending_allocation_size,
-						};
-						has_allocation = true;
-						insertion_seen = false;
-						one_dwords.clear();
-						weak_increments.clear();
-						pending_allocation_size = 0;
-						position += inst.length;
-						continue;
-					}
-					if (has_allocation &&
-						(tracker.get_role(ZYDIS_REGISTER_RDX) == RegRole::AllocatedSlot ||
-						 tracker.get_role(ZYDIS_REGISTER_RDX) == RegRole::SlotPtr))
-					{
-						if (const auto target = direct_call_target(inst, operands, position);
-							target && *target == insert_address)
-						{
-							candidate.insert_helper = *target;
-							insertion_seen = true;
-						}
-					}
-				}
-
-				if (has_allocation && inst.operand_count >= 2 &&
-					inst.mnemonic == ZYDIS_MNEMONIC_MOV &&
-					operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
-				{
-					const auto base_role = tracker.get_role(operands[0].mem.base);
-					if (base_role == RegRole::AllocatedSlot || base_role == RegRole::SlotPtr)
-					{
-						const auto disp = operands[0].mem.disp.has_displacement
-							? static_cast<std::ptrdiff_t>(operands[0].mem.disp.value) : 0;
-						if (disp >= 0 && static_cast<std::size_t>(disp) < candidate.allocation_size)
-						{
-							const auto source_role = operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-								? tracker.get_role(operands[1].reg.value) : RegRole::Unknown;
-							const bool zero =
-								(operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-								 operands[1].imm.value.u == 0) ||
-								(operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-								 source_role == RegRole::Zero);
-							const bool one =
-								(operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-								 operands[1].imm.value.u == 1) ||
-								(operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-								 source_role == RegRole::ImmVal &&
-								 tracker.get_imm(operands[1].reg.value) == 1);
-							if (operands[0].size == 32 && zero)
-								append_unique(candidate.zero_dwords, disp);
-							if (operands[0].size == 32 && one)
-								append_unique(one_dwords, disp);
-							if (operands[0].size == 64 && zero)
-								append_unique(candidate.zero_qwords, disp);
-							if (operands[0].size == 64 &&
-								source_role == RegRole::SignalObject &&
-								disp == unlink_topology.source)
-							{
-								candidate.source = disp;
-							}
-							if (operands[0].size == 64 && source_role == RegRole::WrapperPtr)
-							{
-								if (candidate.wrapper != -1 && candidate.wrapper != disp)
-									decode_failed = true;
-								candidate.wrapper = disp;
-							}
-							if (operands[0].size == 64 && source_role == RegRole::WrapperRep)
-							{
-								if (candidate.wrapper_rep != -1 && candidate.wrapper_rep != disp)
-									decode_failed = true;
-								candidate.wrapper_rep = disp;
-							}
-						}
-					}
-				}
-				if (has_allocation && insertion_seen &&
-					(inst.mnemonic == ZYDIS_MNEMONIC_INC ||
-					 inst.mnemonic == ZYDIS_MNEMONIC_XADD) &&
-					inst.operand_count >= 1 && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-					operands[0].size == 32)
-				{
-					const auto base_role = tracker.get_role(operands[0].mem.base);
-					if (base_role == RegRole::AllocatedSlot || base_role == RegRole::SlotPtr)
-					{
-						append_unique(weak_increments,
-							operands[0].mem.disp.has_displacement
-								? static_cast<std::ptrdiff_t>(operands[0].mem.disp.value) : 0);
-					}
-				}
-
-				if (decode_failed)
-					break;
-				tracker.update(inst, operands, code_address + position);
-				position += inst.length;
+				return fail(CompatibilityFailure::invalid_address_range);
 			}
-			if (!decode_failed)
-				finish_candidate();
+			connect_functions = {focus};
+		}
+		else
+		{
+			connect_functions = insert_callers;
 		}
 
 		struct InsertCandidate
@@ -2901,6 +2777,551 @@ namespace rml::roblox::internals
 			};
 		};
 
+		struct ConnectCandidate
+		{
+			std::ptrdiff_t event_signal{-1};
+			std::ptrdiff_t source{-1};
+			std::ptrdiff_t wrapper{-1};
+			std::ptrdiff_t wrapper_rep{-1};
+			std::ptrdiff_t weak{-1};
+			std::size_t allocation_size{};
+			std::uintptr_t insert_helper{};
+			std::vector<std::ptrdiff_t> zero_dwords;
+			std::vector<std::ptrdiff_t> zero_qwords;
+		};
+		std::vector<ConnectCandidate> connect_candidates;
+		for (const auto function_address : connect_functions)
+		{
+			const auto function_bounds = bounds_for(function_address);
+			if (!function_bounds || function_bounds->end - function_bounds->begin > 0x4000)
+			{
+				if (trace)
+				{
+					trace->candidates.push_back(SignalConnectCandidateTrace{
+						.function_address = function_address,
+					});
+				}
+				continue;
+			}
+			struct FlowInstruction
+			{
+				std::size_t position{};
+				std::size_t next{};
+				std::optional<std::size_t> branch_target;
+				bool conditional_branch{false};
+				bool unconditional_branch{false};
+				bool terminator{false};
+			};
+			std::vector<FlowInstruction> flow;
+			std::vector<std::size_t> allocation_positions;
+			std::size_t flow_pending_allocation_size = 0;
+			std::size_t flow_position = function_bounds->begin;
+			while (flow_position < function_bounds->end)
+			{
+				const auto* bytes = reinterpret_cast<const std::uint8_t*>(
+					executable_code.data() + flow_position);
+				ZydisDecodedInstruction inst;
+				ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+				if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+						&decoder, bytes, function_bounds->end - flow_position, &inst, operands)) ||
+					inst.length == 0)
+				{
+					flow.clear();
+					allocation_positions.clear();
+					break;
+				}
+				bool sets_allocation_size = false;
+				if (inst.mnemonic == ZYDIS_MNEMONIC_MOV && inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+					to_gpr32(operands[0].reg.value) == ZYDIS_REGISTER_RCX &&
+					operands[1].imm.value.u >= 32 && operands[1].imm.value.u <= 256)
+				{
+					flow_pending_allocation_size =
+						static_cast<std::size_t>(operands[1].imm.value.u);
+					sets_allocation_size = true;
+				}
+				if (inst.mnemonic == ZYDIS_MNEMONIC_CALL &&
+					flow_pending_allocation_size != 0)
+				{
+					allocation_positions.push_back(flow_position);
+					flow_pending_allocation_size = 0;
+				}
+				else if (!sets_allocation_size &&
+					(inst.mnemonic == ZYDIS_MNEMONIC_CALL ||
+					 inst.meta.category == ZYDIS_CATEGORY_COND_BR ||
+					 inst.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+					 inst.meta.category == ZYDIS_CATEGORY_RET ||
+					 (inst.operand_count >= 1 &&
+					  operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					  (operands[0].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) &&
+					  to_gpr32(operands[0].reg.value) == ZYDIS_REGISTER_RCX)))
+				{
+					flow_pending_allocation_size = 0;
+				}
+				FlowInstruction flow_inst{
+					.position = flow_position,
+					.next = flow_position + inst.length,
+					.conditional_branch =
+						inst.meta.category == ZYDIS_CATEGORY_COND_BR,
+					.unconditional_branch =
+						inst.meta.category == ZYDIS_CATEGORY_UNCOND_BR,
+					.terminator = inst.meta.category == ZYDIS_CATEGORY_RET,
+				};
+				if ((flow_inst.conditional_branch || flow_inst.unconditional_branch) &&
+					inst.operand_count >= 1 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+					operands[0].imm.is_relative)
+				{
+					std::uintptr_t target = 0;
+					if (checked_add(
+							code_address + flow_position + inst.length,
+							operands[0].imm.value.s,
+							target) &&
+						target >= code_address + function_bounds->begin &&
+						target < code_address + function_bounds->end)
+					{
+						flow_inst.branch_target =
+							static_cast<std::size_t>(target - code_address);
+					}
+				}
+				flow.push_back(flow_inst);
+				flow_position += inst.length;
+			}
+			auto flow_index = [&](const std::size_t position) -> std::optional<std::size_t> {
+				const auto it = std::lower_bound(
+					flow.begin(), flow.end(), position,
+					[](const FlowInstruction& inst, const std::size_t target) {
+						return inst.position < target;
+					});
+				if (it == flow.end() || it->position != position)
+					return std::nullopt;
+				return static_cast<std::size_t>(it - flow.begin());
+			};
+			std::vector<std::vector<std::size_t>> flow_predecessors(flow.size());
+			for (std::size_t index = 0; index < flow.size(); ++index)
+			{
+				const auto add_predecessor = [&](const std::optional<std::size_t> successor) {
+					if (successor)
+						flow_predecessors[*successor].push_back(index);
+				};
+				if (flow[index].terminator)
+					continue;
+				if (flow[index].unconditional_branch)
+				{
+					add_predecessor(
+						flow[index].branch_target
+							? flow_index(*flow[index].branch_target) : std::nullopt);
+					continue;
+				}
+				add_predecessor(flow_index(flow[index].next));
+				if (flow[index].conditional_branch && flow[index].branch_target)
+					add_predecessor(flow_index(*flow[index].branch_target));
+			}
+			std::vector<bool> can_reach_allocation(flow.size(), false);
+			std::vector<std::size_t> pending_flow;
+			for (const auto position : allocation_positions)
+			{
+				if (const auto index = flow_index(position); index && !can_reach_allocation[*index])
+				{
+					can_reach_allocation[*index] = true;
+					pending_flow.push_back(*index);
+				}
+			}
+			while (!pending_flow.empty())
+			{
+				const auto index = pending_flow.back();
+				pending_flow.pop_back();
+				for (const auto predecessor : flow_predecessors[index])
+				{
+					if (!can_reach_allocation[predecessor])
+					{
+						can_reach_allocation[predecessor] = true;
+						pending_flow.push_back(predecessor);
+					}
+				}
+			}
+			const auto is_on_allocation_path = [&](const std::size_t position) {
+				const auto index = flow_index(position);
+				return allocation_positions.empty() ||
+					(index && can_reach_allocation[*index]);
+			};
+
+			RegTracker tracker;
+			ConnectCandidate candidate;
+			std::size_t pending_allocation_size = 0;
+			bool has_allocation = false;
+			bool insertion_seen = false;
+			std::vector<std::ptrdiff_t> one_dwords;
+			std::vector<std::ptrdiff_t> weak_increments;
+			std::vector<std::ptrdiff_t> wrapper_offsets;
+			std::vector<std::ptrdiff_t> wrapper_rep_offsets;
+			std::vector<ConnectCandidate> function_candidates;
+			std::size_t decoded_instructions = 0;
+			std::size_t event_field_reads = 0;
+			std::size_t signal_address_derivations = 0;
+			std::size_t signal_object_reads = 0;
+			std::size_t allocation_calls = 0;
+			std::size_t source_stores = 0;
+			std::size_t wrapper_stores = 0;
+			std::size_t insert_calls = 0;
+			std::size_t weak_increments_count = 0;
+			auto finish_candidate = [&]() {
+				if (!has_allocation || candidate.event_signal <= 0)
+					return;
+				std::vector<std::pair<std::ptrdiff_t, std::ptrdiff_t>> terminal_wrapper_pairs;
+				for (const auto wrapper : wrapper_offsets)
+				{
+					for (const auto wrapper_rep : wrapper_rep_offsets)
+					{
+						if (wrapper_rep == wrapper + static_cast<std::ptrdiff_t>(sizeof(void*)) &&
+							static_cast<std::size_t>(wrapper_rep + sizeof(void*)) ==
+								candidate.allocation_size)
+						{
+							terminal_wrapper_pairs.push_back({wrapper, wrapper_rep});
+						}
+					}
+				}
+				if (terminal_wrapper_pairs.size() != 1)
+					return;
+				candidate.wrapper = terminal_wrapper_pairs.front().first;
+				candidate.wrapper_rep = terminal_wrapper_pairs.front().second;
+				if (candidate.insert_helper == 0 || candidate.source <= 0)
+				{
+					return;
+				}
+				std::vector<std::ptrdiff_t> weak_candidates;
+				for (const auto disp : one_dwords)
+					if (std::find(weak_increments.begin(), weak_increments.end(), disp) !=
+						weak_increments.end())
+						weak_candidates.push_back(disp);
+				if (weak_candidates.size() != 1)
+					return;
+				candidate.weak = weak_candidates.front();
+				function_candidates.push_back(candidate);
+				connect_candidates.push_back(candidate);
+			};
+			std::ptrdiff_t pending_event_signal{-1};
+			ZydisRegister pending_wrapper_base = ZYDIS_REGISTER_NONE;
+			ZydisRegister pending_wrapper_dest = ZYDIS_REGISTER_NONE;
+			std::size_t position = function_bounds->begin;
+			bool decode_failed = false;
+			while (position < function_bounds->end)
+			{
+				const auto* bytes = reinterpret_cast<const std::uint8_t*>(
+					executable_code.data() + position);
+				ZydisDecodedInstruction inst;
+				ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+				if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+						&decoder, bytes, function_bounds->end - position, &inst, operands)) ||
+					inst.length == 0)
+				{
+					decode_failed = true;
+					break;
+				}
+				if (!has_allocation && !is_on_allocation_path(position))
+				{
+					position += inst.length;
+					continue;
+				}
+				++decoded_instructions;
+
+
+				if ((inst.mnemonic == ZYDIS_MNEMONIC_MOV ||
+					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSX ||
+					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSXD) &&
+					inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+					operands[1].mem.disp.has_displacement &&
+					operands[1].size == 32 &&
+					tracker.get_role(operands[1].mem.base) == RegRole::This)
+				{
+					++event_field_reads;
+					tracker.set_role(
+						operands[0].reg.value,
+						RegRole::EventSignalField,
+						static_cast<std::uint64_t>(operands[1].mem.disp.value));
+					position += inst.length;
+					continue;
+				}
+				if (inst.mnemonic == ZYDIS_MNEMONIC_ADD && inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					tracker.get_role(operands[0].reg.value) == RegRole::EventSignalField &&
+					(tracker.get_role(operands[1].reg.value) == RegRole::Arg1 ||
+					 tracker.get_role(operands[1].reg.value) == RegRole::Arg2))
+				{
+					++signal_address_derivations;
+					const auto disp = tracker.get_imm(operands[0].reg.value);
+					tracker.set_role(operands[0].reg.value, RegRole::SignalAddress, disp);
+					position += inst.length;
+					continue;
+				}
+				if ((inst.mnemonic == ZYDIS_MNEMONIC_MOV ||
+					 inst.mnemonic == ZYDIS_MNEMONIC_MOVSX) &&
+					inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+					tracker.get_role(operands[1].mem.base) == RegRole::SignalAddress &&
+					(!operands[1].mem.disp.has_displacement || operands[1].mem.disp.value == 0))
+				{
+					++signal_object_reads;
+					const auto event_signal =
+						static_cast<std::ptrdiff_t>(tracker.get_imm(operands[1].mem.base));
+					if (pending_event_signal != -1 && pending_event_signal != event_signal)
+					{
+						decode_failed = true;
+						break;
+					}
+					pending_event_signal = event_signal;
+					if (has_allocation)
+					{
+						if (candidate.event_signal != -1 && candidate.event_signal != event_signal)
+						{
+							decode_failed = true;
+							break;
+						}
+						candidate.event_signal = event_signal;
+					}
+					tracker.set_role(
+						operands[0].reg.value,
+						RegRole::SignalObject,
+						tracker.get_imm(operands[1].mem.base));
+					position += inst.length;
+					continue;
+				}
+
+				if (inst.mnemonic == ZYDIS_MNEMONIC_MOV && inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY)
+				{
+					const auto base = to_gpr32(operands[1].mem.base);
+					const auto disp = operands[1].mem.disp.has_displacement
+						? static_cast<std::ptrdiff_t>(operands[1].mem.disp.value) : 0;
+					if (disp == static_cast<std::ptrdiff_t>(sizeof(void*)) &&
+						base == pending_wrapper_base &&
+						pending_wrapper_dest != ZYDIS_REGISTER_NONE)
+					{
+						tracker.set_role(pending_wrapper_dest, RegRole::WrapperPtr);
+						tracker.set_role(operands[0].reg.value, RegRole::WrapperRep);
+						pending_wrapper_base = ZYDIS_REGISTER_NONE;
+						pending_wrapper_dest = ZYDIS_REGISTER_NONE;
+						position += inst.length;
+						continue;
+					}
+					if (disp == 0 && base != ZYDIS_REGISTER_RSP && base != ZYDIS_REGISTER_RBP)
+					{
+						pending_wrapper_base = base;
+						pending_wrapper_dest = operands[0].reg.value;
+					}
+					else
+					{
+						pending_wrapper_base = ZYDIS_REGISTER_NONE;
+						pending_wrapper_dest = ZYDIS_REGISTER_NONE;
+					}
+				}
+
+				if (inst.mnemonic == ZYDIS_MNEMONIC_MOV && inst.operand_count >= 2 &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+					operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+					to_gpr32(operands[0].reg.value) == ZYDIS_REGISTER_RCX &&
+					operands[1].imm.value.u >= 32 && operands[1].imm.value.u <= 256)
+				{
+					pending_allocation_size = static_cast<std::size_t>(operands[1].imm.value.u);
+				}
+
+				if (inst.mnemonic == ZYDIS_MNEMONIC_CALL)
+				{
+					if (pending_allocation_size != 0)
+					{
+						++allocation_calls;
+						finish_candidate();
+						tracker.handle_call();
+						tracker.set_role(ZYDIS_REGISTER_RAX, RegRole::AllocatedSlot);
+						candidate = ConnectCandidate{
+							.event_signal = pending_event_signal,
+							.allocation_size = pending_allocation_size,
+						};
+						has_allocation = true;
+						insertion_seen = false;
+						one_dwords.clear();
+						weak_increments.clear();
+						wrapper_offsets.clear();
+						wrapper_rep_offsets.clear();
+						pending_allocation_size = 0;
+						position += inst.length;
+						continue;
+					}
+					if (has_allocation &&
+						(tracker.get_role(ZYDIS_REGISTER_RDX) == RegRole::AllocatedSlot ||
+						 tracker.get_role(ZYDIS_REGISTER_RDX) == RegRole::SlotPtr))
+					{
+						if (const auto target = direct_call_target(inst, operands, position);
+							target && *target == insert_address)
+						{
+							++insert_calls;
+							candidate.insert_helper = *target;
+							insertion_seen = true;
+						}
+					}
+				}
+
+				if (has_allocation && inst.operand_count >= 2 &&
+					inst.mnemonic == ZYDIS_MNEMONIC_MOV &&
+					operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
+				{
+					const auto base_role = tracker.get_role(operands[0].mem.base);
+					if (base_role == RegRole::AllocatedSlot || base_role == RegRole::SlotPtr)
+					{
+						const auto disp = operands[0].mem.disp.has_displacement
+							? static_cast<std::ptrdiff_t>(operands[0].mem.disp.value) : 0;
+						if (disp >= 0 && static_cast<std::size_t>(disp) < candidate.allocation_size)
+						{
+							const auto source_role = operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER
+								? tracker.get_role(operands[1].reg.value) : RegRole::Unknown;
+							const bool zero =
+								(operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+								 operands[1].imm.value.u == 0) ||
+								(operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+								 source_role == RegRole::Zero);
+							const bool one =
+								(operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+								 operands[1].imm.value.u == 1) ||
+								(operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+								 source_role == RegRole::ImmVal &&
+								 tracker.get_imm(operands[1].reg.value) == 1);
+							if (operands[0].size == 32 && zero)
+								append_unique(candidate.zero_dwords, disp);
+							if (operands[0].size == 32 && one)
+								append_unique(one_dwords, disp);
+							if (operands[0].size == 64 && zero)
+								append_unique(candidate.zero_qwords, disp);
+							if (operands[0].size == 64 &&
+								source_role == RegRole::SignalObject &&
+								disp == unlink_topology.source)
+							{
+								++source_stores;
+								candidate.source = disp;
+							}
+							if (operands[0].size == 64 && !zero &&
+								source_role == RegRole::WrapperPtr)
+							{
+								++wrapper_stores;
+								append_unique(wrapper_offsets, disp);
+							}
+							if (operands[0].size == 64 && !zero &&
+								source_role == RegRole::WrapperRep)
+							{
+								++wrapper_stores;
+								append_unique(wrapper_rep_offsets, disp);
+							}
+						}
+					}
+				}
+				if (has_allocation && insertion_seen &&
+					(inst.mnemonic == ZYDIS_MNEMONIC_INC ||
+					 inst.mnemonic == ZYDIS_MNEMONIC_XADD) &&
+					inst.operand_count >= 1 && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+					operands[0].size == 32)
+				{
+					const auto base_role = tracker.get_role(operands[0].mem.base);
+					if (base_role == RegRole::AllocatedSlot || base_role == RegRole::SlotPtr)
+					{
+						++weak_increments_count;
+						append_unique(weak_increments,
+							operands[0].mem.disp.has_displacement
+								? static_cast<std::ptrdiff_t>(operands[0].mem.disp.value) : 0);
+					}
+				}
+
+				if (decode_failed)
+					break;
+				tracker.update(inst, operands, code_address + position);
+				position += inst.length;
+			}
+			if (!decode_failed)
+				finish_candidate();
+
+			if (function_candidates.empty())
+			{
+				if (trace)
+				{
+					trace->candidates.push_back(SignalConnectCandidateTrace{
+						.function_address = function_address,
+						.event_signal_offset = candidate.event_signal,
+						.slot_source_offset = candidate.source,
+						.slot_wrapper_ptr_offset = candidate.wrapper,
+						.slot_wrapper_rep_offset = candidate.wrapper_rep,
+						.slot_weak_offset = candidate.weak,
+						.allocation_size = candidate.allocation_size,
+						.insert_helper_address = candidate.insert_helper,
+						.decoded_instructions = decoded_instructions,
+						.event_field_reads = event_field_reads,
+						.signal_address_derivations = signal_address_derivations,
+						.signal_object_reads = signal_object_reads,
+						.allocation_calls = allocation_calls,
+						.source_stores = source_stores,
+						.wrapper_stores = wrapper_stores,
+						.insert_calls = insert_calls,
+						.weak_increments = weak_increments_count,
+						.decode_failed = decode_failed,
+						.valid = false,
+					});
+				}
+			}
+			else
+			{
+				for (const auto& connect : function_candidates)
+				{
+					const auto insert = analyze_insert(connect.insert_helper);
+					const bool is_valid = insert &&
+						connect.source == unlink_topology.source &&
+						connect.wrapper == unlink_topology.destroy +
+							static_cast<std::ptrdiff_t>(sizeof(void*)) &&
+						insert->head == unlink_topology.head &&
+						insert->next == unlink_topology.next &&
+						std::find(connect.zero_dwords.begin(), connect.zero_dwords.end(), insert->strong) !=
+							connect.zero_dwords.end() &&
+						std::find(connect.zero_qwords.begin(), connect.zero_qwords.end(), insert->next) !=
+							connect.zero_qwords.end() &&
+						insert->strong != connect.weak;
+
+					if (trace)
+					{
+						SignalConnectCandidateTrace cand_trace{
+							.function_address = function_address,
+							.event_signal_offset = connect.event_signal,
+							.slot_source_offset = connect.source,
+							.slot_wrapper_ptr_offset = connect.wrapper,
+							.slot_wrapper_rep_offset = connect.wrapper_rep,
+							.slot_weak_offset = connect.weak,
+							.allocation_size = connect.allocation_size,
+							.insert_helper_address = connect.insert_helper,
+							.decoded_instructions = decoded_instructions,
+							.event_field_reads = event_field_reads,
+							.signal_address_derivations = signal_address_derivations,
+							.signal_object_reads = signal_object_reads,
+							.allocation_calls = allocation_calls,
+							.source_stores = source_stores,
+							.wrapper_stores = wrapper_stores,
+							.insert_calls = insert_calls,
+							.weak_increments = weak_increments_count,
+							.decode_failed = decode_failed,
+							.valid = is_valid,
+						};
+						if (insert)
+						{
+							cand_trace.signal_head_offset = insert->head;
+							cand_trace.slot_strong_offset = insert->strong;
+							cand_trace.slot_next_offset = insert->next;
+						}
+						trace->candidates.push_back(cand_trace);
+					}
+				}
+			}
+		}
+
 		struct CompleteCandidate
 		{
 			std::ptrdiff_t event_signal{-1};
@@ -2938,6 +3359,10 @@ namespace rml::roblox::internals
 				.source = connect.source,
 				.wrapper = connect.wrapper,
 			});
+		}
+		if (trace)
+		{
+			trace->valid_connect_candidates = complete_candidates.size();
 		}
 		if (complete_candidates.empty())
 			return fail(CompatibilityFailure::insufficient_evidence, 3, connect_candidates.size());

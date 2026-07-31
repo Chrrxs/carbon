@@ -42,6 +42,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private static readonly TimeSpan AttestedManagedSnapshotQuietPeriod = TimeSpan.FromMilliseconds(250);
     internal static readonly TimeSpan ManagedSnapshotRetryPeriod = TimeSpan.FromMilliseconds(100);
     internal static readonly TimeSpan ManagedSnapshotReadinessTimeout = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan ProvisionalDataModelLease = TimeSpan.FromSeconds(2);
+
 
     [DllImport("roblox_modloader.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern nint carbon_rml_build_version();
@@ -273,6 +275,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private CaptureLeaseManager? _captureLeases;
     private DataModel? _dataModel;
     private nuint _detachedEditDataModelHandle;
+    private long _provisionalDataModelAttachedAt;
+
     private SerializedPropertyAccess.EngineThreadPump? _engineThreadPump;
     private Timer? _managedSnapshotTimer;
     private IDisposable? _propertyObservation;
@@ -352,31 +356,39 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
     public void OnDataModelLoaded(DataModel dataModel, DataModelType dataModelType)
     {
+        DataModel? provisionalDataModelToDetach = null;
         bool hasAuthenticatedEditDataModel;
         lock (_engineStateLock)
         {
             hasAuthenticatedEditDataModel = _dataModel is not null && _studioIdentity is not null;
-        }
-        if (!ShouldAttachEditDataModelCandidate(dataModelType, hasAuthenticatedEditDataModel))
-        {
-            if (IsEditDataModelCandidate(dataModelType))
+            if (!ShouldAttachEditDataModelCandidate(dataModelType, hasAuthenticatedEditDataModel))
             {
-                Logger.Info(
-                    $"Ignoring unknown DataModel type {(int)dataModelType}; " +
-                    "an authenticated edit DataModel is already attached");
+                return;
             }
-            return;
+
+            if (_dataModel is { } currentDataModel)
+            {
+                var attachedFor = _provisionalDataModelAttachedAt == 0
+                    ? TimeSpan.Zero
+                    : Stopwatch.GetElapsedTime(_provisionalDataModelAttachedAt);
+                if (!ShouldReplaceProvisionalEditDataModel(
+                        currentDataModel.Equals(dataModel),
+                        attachedFor))
+                {
+                    return;
+                }
+                provisionalDataModelToDetach = currentDataModel;
+            }
         }
-        if (dataModelType != DataModelType.Edit)
+
+        if (provisionalDataModelToDetach is not null)
         {
-            // Studio 0.732 reports its editable place as Standalone. Attach
-            // provisionally until the unique CoreGui route authenticates it;
-            // the same route check also protects the existing unknown-value
-            // fallback from binding Carbon to a playtest DataModel.
             Logger.Info(
-                $"RML reported provisional edit DataModel type {(int)dataModelType}; " +
-                "probing it until Studio routing is established");
+                $"Replacing unauthenticated DataModel after {ProvisionalDataModelLease.TotalSeconds:F0} seconds");
+            DetachDataModel(provisionalDataModelToDetach);
         }
+
+
 
         var dataModelHandle = InstanceHierarchy.RuntimeHandle(dataModel);
         nuint detachedDataModelHandle;
@@ -389,7 +401,11 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _preservedStudioRoute = null;
         }
 
-        _dataModel = dataModel;
+        lock (_engineStateLock)
+        {
+            _dataModel = dataModel;
+            _provisionalDataModelAttachedAt = Stopwatch.GetTimestamp();
+        }
         // Exact-property requests identify every snapshot node by Studio's
         // debug identity. DataModel itself is not a descendant, so it never
         // reaches the cache through the hierarchy observation callbacks.
@@ -607,6 +623,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _studioIdentity = null;
             _detachedEditDataModelHandle = InstanceHierarchy.RuntimeHandle(dataModel);
             _dataModel = null;
+            _provisionalDataModelAttachedAt = 0;
             Interlocked.Exchange(ref _excludedEditCameraHandle, 0);
         }
 
@@ -1536,6 +1553,12 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         bool hasAuthenticatedEditDataModel) =>
         IsEditDataModelCandidate(dataModelType)
         && !hasAuthenticatedEditDataModel;
+
+    internal static bool ShouldReplaceProvisionalEditDataModel(
+        bool sameDataModel,
+        TimeSpan attachedFor) =>
+        !sameDataModel && attachedFor >= ProvisionalDataModelLease;
+
 
     internal static bool IsManagedBaselineReadyMarker(
         string className,
@@ -6689,10 +6712,9 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         && detachedRoute is not null
         && detachedRoute == activeRoute;
 
-    private void TryCacheStudioIdentity(Instance instance)
+
+    private static (string StudioSessionId, string InstanceId)? TryReadStudioRoute(Instance instance)
     {
-        var handle = InstanceHierarchy.RuntimeHandle(instance);
-        (string StudioSessionId, string InstanceId)? route = null;
         try
         {
             if (instance.Name == StudioRouteMarker
@@ -6701,13 +6723,20 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 && instance.Parent is { } parent
                 && parent.ClassName == "CoreGui")
             {
-                route = ParseStudioRoute(
+                return ParseStudioRoute(
                     Reflection.GetProperty<string>(instance, "Value") ?? string.Empty);
             }
         }
         catch
         {
         }
+        return null;
+    }
+
+    private void TryCacheStudioIdentity(Instance instance)
+    {
+        var handle = InstanceHierarchy.RuntimeHandle(instance);
+        var route = TryReadStudioRoute(instance);
 
         StudioIdentity? publishedIdentity;
         var changed = false;

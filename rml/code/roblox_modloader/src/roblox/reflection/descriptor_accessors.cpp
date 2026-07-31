@@ -4,6 +4,7 @@
 #include "RobloxModLoader/roblox/reflection/event_descriptor.hpp"
 #include "RobloxModLoader/roblox/reflection/function_descriptor.hpp"
 #include "RobloxModLoader/roblox/reflection/property_descriptor.hpp"
+#include "RobloxModLoader/roblox/reflection/type.hpp"
 #include "RobloxModLoader/roblox/reflection/yield_function_descriptor.hpp"
 
 namespace RBX::Reflection
@@ -27,6 +28,31 @@ namespace RBX::Reflection
 	{
 		const auto* profile = ::try_get_roblox_internals_profile();
 		return profile ? profile->reflection().property_type(this) : nullptr;
+	}
+	const Name* Type::tag() const noexcept
+	{
+		const auto* profile = ::try_get_roblox_internals_profile();
+		return profile ? profile->reflection().type_tag(this) : nullptr;
+	}
+	int Type::type_id() const noexcept
+	{
+		const auto* profile = ::try_get_roblox_internals_profile();
+		return profile ? profile->reflection().type_id(this) : 0;
+	}
+	bool Type::is_float() const noexcept
+	{
+		const auto* profile = ::try_get_roblox_internals_profile();
+		return profile && profile->reflection().type_is_float(this);
+	}
+	bool Type::is_number() const noexcept
+	{
+		const auto* profile = ::try_get_roblox_internals_profile();
+		return profile && profile->reflection().type_is_number(this);
+	}
+	bool Type::is_enum() const noexcept
+	{
+		const auto* profile = ::try_get_roblox_internals_profile();
+		return profile && profile->reflection().type_is_enum(this);
 	}
 	bool PropertyDescriptor::is_public() const noexcept
 	{

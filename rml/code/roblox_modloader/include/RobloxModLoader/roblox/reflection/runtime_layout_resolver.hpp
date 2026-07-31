@@ -37,6 +37,11 @@ namespace rml::roblox::internals
 		std::ptrdiff_t security_offset{-1};
 		std::ptrdiff_t property_type_offset{-1};
 		std::ptrdiff_t property_functionality_offset{-1};
+		std::ptrdiff_t type_tag_offset{-1};
+		std::ptrdiff_t type_id_offset{-1};
+		std::ptrdiff_t type_is_float_offset{-1};
+		std::ptrdiff_t type_is_number_offset{-1};
+		std::ptrdiff_t type_is_enum_offset{-1};
 		std::ptrdiff_t signature_offset{-1};
 		std::ptrdiff_t function_kind_offset{-1};
 		std::ptrdiff_t function_invoke_func_ptr_offset{-1};
@@ -53,6 +58,7 @@ namespace rml::roblox::internals
 		std::span<const std::uintptr_t> member_vfts;
 		std::span<const std::uintptr_t> property_vfts;
 		std::span<const std::uintptr_t> function_vfts;
+		std::span<const std::uintptr_t> type_vfts;
 		std::span<const std::uintptr_t> yield_function_vfts;
 		std::span<const std::uintptr_t> event_vfts;
 		std::span<const std::uintptr_t> callback_vfts;
@@ -98,6 +104,40 @@ namespace rml::roblox::internals
 		std::size_t matched_calls{};
 	};
 
+	struct SignalConnectCandidateTrace
+	{
+		std::uintptr_t function_address{};
+		std::ptrdiff_t event_signal_offset{-1};
+		std::ptrdiff_t slot_source_offset{-1};
+		std::ptrdiff_t slot_wrapper_ptr_offset{-1};
+		std::ptrdiff_t slot_wrapper_rep_offset{-1};
+		std::ptrdiff_t slot_weak_offset{-1};
+		std::size_t allocation_size{};
+		std::uintptr_t insert_helper_address{};
+		std::ptrdiff_t signal_head_offset{-1};
+		std::ptrdiff_t slot_strong_offset{-1};
+		std::ptrdiff_t slot_next_offset{-1};
+		std::size_t decoded_instructions{};
+		std::size_t event_field_reads{};
+		std::size_t signal_address_derivations{};
+		std::size_t signal_object_reads{};
+		std::size_t allocation_calls{};
+		std::size_t source_stores{};
+		std::size_t wrapper_stores{};
+		std::size_t insert_calls{};
+		std::size_t weak_increments{};
+		bool decode_failed{false};
+		bool valid{false};
+	};
+
+	struct SignalConnectTrace
+	{
+		std::uintptr_t focus_function_address{};
+		std::size_t total_connect_callers{};
+		std::size_t valid_connect_candidates{};
+		std::vector<SignalConnectCandidateTrace> candidates{};
+	};
+
 	[[nodiscard]] std::expected<SignalLayoutEvidence, CompatibilityError> resolve_signal_layout(
 		std::span<const std::byte> executable_code,
 		std::uintptr_t code_address,
@@ -105,7 +145,8 @@ namespace rml::roblox::internals
 		std::uintptr_t module_address,
 		std::uintptr_t signal_disconnect_address = 0,
 		std::uintptr_t signal_slot_free_address = 0,
-		std::vector<CompatibilityError>* diagnostics = nullptr) noexcept;
+		std::vector<CompatibilityError>* diagnostics = nullptr,
+		SignalConnectTrace* trace = nullptr) noexcept;
 
 	struct JobLayoutEvidence
 	{

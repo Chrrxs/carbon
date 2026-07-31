@@ -35,7 +35,7 @@ namespace rml::dotnet
 
 				for (const auto& arg : args)
 				{
-					if (!arg.is_void() && arg.type().type_id == RBX::Reflection::TypeId::Tuple)
+					if (!arg.is_void() && arg.type().type_id() == RBX::Reflection::TypeId::Tuple)
 					{
 						if (const auto* tuple = arg.try_cast<std::shared_ptr<const RBX::Reflection::Tuple>>()->get())
 						{

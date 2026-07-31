@@ -22,11 +22,11 @@ namespace RBX::Reflection
 	class Type : public Descriptor
 	{
 	public:
-		const Name& tag;
-		const int type_id;
-		const bool is_float;
-		const bool is_number;
-		const bool is_enum;
+		[[nodiscard]] const Name* tag() const noexcept;
+		[[nodiscard]] int type_id() const noexcept;
+		[[nodiscard]] bool is_float() const noexcept;
+		[[nodiscard]] bool is_number() const noexcept;
+		[[nodiscard]] bool is_enum() const noexcept;
 
 		bool operator==(const Type& other) const noexcept
 		{
@@ -77,17 +77,17 @@ namespace RBX::Reflection
 
 		bool is_float() const
 		{
-			return m_type->is_float;
+			return m_type && m_type->is_float();
 		}
 
 		bool is_number() const
 		{
-			return m_type->is_number;
+			return m_type && m_type->is_number();
 		}
 
 		bool is_enum() const
 		{
-			return m_type->is_enum;
+			return m_type && m_type->is_enum();
 		}
 
 		[[nodiscard]] bool is_void() const noexcept
@@ -175,9 +175,10 @@ namespace RBX::Reflection
 		struct ResultItem
 		{
 			const Type* type;
-			std::uint64_t _unk0; // idk what's this
+			std::uint64_t _reserved0;
+			std::uint64_t _reserved1;
 		};
-		static_assert(sizeof(ResultItem) == 0x10);
+		static_assert(sizeof(ResultItem) == 0x18);
 
 		// i need to reverse more, but it's solve, im lazy
 		template<typename T>

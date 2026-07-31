@@ -170,7 +170,12 @@ namespace rml::dotnet
 		{
 			const auto base_res = descriptor->get_base();
 			if (!base_res)
+			{
+				RML_ERROR(
+				    "property descriptor span base read failed: descriptor=0x{:X}",
+				    reinterpret_cast<std::uintptr_t>(descriptor));
 				return false;
+			}
 			base = *base_res;
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
@@ -184,9 +189,45 @@ namespace rml::dotnet
 		base = *base_res;
 #endif
 
-		const auto span_view = get_roblox_internals_profile().reflection().property_descriptors(descriptor);
+		const auto& reflection = get_roblox_internals_profile().reflection();
+		const auto span_view = reflection.property_descriptors(descriptor);
 		if (!span_view.has_value())
+		{
+#if defined(_MSC_VER)
+			__try
+			{
+#endif
+				std::array<std::uintptr_t, 3> collection_words{};
+				std::array<std::uintptr_t, 2> base_words{};
+				const auto collection_offset = reflection.descriptor_container_offsets()[0];
+				const auto base_offset = reflection.base_class_offset();
+				std::memcpy(
+				    collection_words.data(),
+				    reinterpret_cast<const std::byte*>(descriptor) + collection_offset,
+				    sizeof(collection_words));
+				std::memcpy(
+				    base_words.data(),
+				    reinterpret_cast<const std::byte*>(descriptor) + base_offset,
+				    sizeof(base_words));
+				RML_ERROR(
+				    "property descriptor span read failed: descriptor=0x{:X}, collection=[0x{:X},0x{:X},0x{:X}], base=[0x{:X},0x{:X}]",
+				    reinterpret_cast<std::uintptr_t>(descriptor),
+				    collection_words[0],
+				    collection_words[1],
+				    collection_words[2],
+				    base_words[0],
+				    base_words[1]);
+#if defined(_MSC_VER)
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER)
+			{
+				RML_ERROR(
+				    "property descriptor span diagnostics faulted: descriptor=0x{:X}",
+				    reinterpret_cast<std::uintptr_t>(descriptor));
+			}
+#endif
 			return false;
+		}
 
 		out = {span_view->entries, span_view->count, base};
 		return true;
@@ -565,12 +606,10 @@ namespace rml::dotnet
 	void invoke_reflection_function(RBX::Reflection::DescribedBase* instance, const RBX::Reflection::FunctionDescriptor& descriptor, const InteropVariant* args, const uint32_t arg_count, InteropVariant& out)
 	{
 		DotNetArguments arguments{args, arg_count};
-
 		const auto function = RBX::Function(descriptor, instance);
 		const auto ret = function.invoke(arguments);
 		const auto* signature = descriptor.get_signature();
 		const auto* type = signature ? signature->first_result_type() : nullptr;
-
 		TypeMarshaler::encode_return_value(type, ret, reinterpret_cast<uintptr_t>(&arguments.return_value), out);
 	}
 
@@ -582,7 +621,7 @@ namespace rml::dotnet
 			return event_args;
 		const auto sig_args = signature->arguments();
 
-		if (sig_args.size() == 1 && sig_args[0].type && sig_args[0].type->type_id == RBX::Reflection::TypeId::Tuple)
+		if (sig_args.size() == 1 && sig_args[0].type && sig_args[0].type->type_id() == RBX::Reflection::TypeId::Tuple)
 		{
 			RBX::Reflection::Variant tuple_variant;
 			if (TypeMarshaler::build_tuple_variant(args, arg_count, sig_args[0].type, tuple_variant))
@@ -605,7 +644,7 @@ namespace rml::dotnet
 	{
 		for (auto& value : event_args)
 		{
-			if (!value.is_void() && value.type().type_id == RBX::Reflection::TypeId::Tuple)
+			if (!value.is_void() && value.type().type_id() == RBX::Reflection::TypeId::Tuple)
 				std::destroy_at(static_cast<std::shared_ptr<const RBX::Reflection::Tuple>*>(value.storage()));
 		}
 	}
@@ -1592,10 +1631,9 @@ namespace rml::dotnet
 				const auto* name_property = root->get_descriptor().find_property("Name");
 				if (!name_property)
 					return reject("Name is unavailable");
-				const auto* archivable_property_base = root->get_descriptor().find_property("Archivable");
-				const auto* archivable_property = dynamic_cast<const RBX::Reflection::TypedPropertyDescriptor<bool>*>(
-				    archivable_property_base);
-				if (!archivable_property)
+				const auto* archivable_property = root->get_descriptor().find_property("Archivable");
+				if (!archivable_property || !archivable_property->type() ||
+				    archivable_property->type()->type_id() != RBX::Reflection::TypeId::Bool)
 					return reject("Archivable is unavailable");
 				constexpr std::array<std::byte, 7> magic_prefix{
 				    std::byte{'R'}, std::byte{'M'}, std::byte{'L'}, std::byte{'H'},
@@ -1682,10 +1720,15 @@ namespace rml::dotnet
 					    name.size() > std::numeric_limits<uint32_t>::max())
 						return reject("class or name exceeds the protocol limit");
 
+					RBX::Reflection::Variant archivable;
+					archivable_property->get_variant(instance, archivable);
+					if (archivable.is_void())
+						return reject("Archivable value is unavailable");
+
 					const auto handle = reinterpret_cast<uintptr_t>(instance);
 					const uint8_t persistence_flags =
 					    (descriptor.is_serializable() ? uint8_t{1} : uint8_t{0}) |
-					    (archivable_property->get(instance) ? uint8_t{2} : uint8_t{0});
+					    (*archivable.try_cast<bool>() ? uint8_t{2} : uint8_t{0});
 					if (!detail::append_hierarchy_node_record(
 					        bytes, handle, parent_index, persistence_flags, class_name, name))
 						return reject("hierarchy node exceeds the snapshot allocation limit");
@@ -1823,8 +1866,16 @@ namespace rml::dotnet
 					for (const auto& child_owner : *child_vector)
 					{
 						auto* child = child_owner.get();
-						if (!child || child->get_parent() != instance)
+						auto* child_parent = child ? child->get_parent() : nullptr;
+						if (!child || child_parent != instance)
+						{
+							RML_ERROR(
+							    "hierarchy child mismatch: parent=0x{:X}, child=0x{:X}, child_parent=0x{:X}",
+							    reinterpret_cast<std::uintptr_t>(instance),
+							    reinterpret_cast<std::uintptr_t>(child),
+							    reinterpret_cast<std::uintptr_t>(child_parent));
 							return reject("a child vector entry is inconsistent");
+						}
 						if (child != excluded_root)
 							pending.push_back({child, current_index});
 					}

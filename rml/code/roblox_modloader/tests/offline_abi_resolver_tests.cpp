@@ -6,6 +6,7 @@
 #include "RobloxModLoader/memory/symbol_resolver.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <array>
 #include <cstddef>
@@ -724,11 +725,51 @@ namespace
 		bool run_self_test{false};
 		bool parse_success{true};
 		std::string error_message;
+		bool has_trace_signal_connect{false};
+		std::uintptr_t trace_signal_connect_focus{0};
 	};
 
 	void print_usage(std::ostream& os)
 	{
-		os << "Usage: offline_abi_resolver_tests [--stage <RTTI|Reflection|DataModel|Instance|Signal|Job>]... <exe>...\n";
+		os << "Usage: offline_abi_resolver_tests [--stage <RTTI|Reflection|DataModel|Instance|Signal|Job>]... [--trace-signal-connect <0xVA>] <exe>...\n";
+	}
+
+	std::optional<std::uintptr_t> parse_address(const std::string_view str)
+	{
+		if (str.empty())
+			return std::nullopt;
+
+		std::size_t idx = 0;
+		int base = 10;
+		if (str.starts_with("0x") || str.starts_with("0X"))
+		{
+			base = 16;
+			idx = 2;
+			if (idx == str.size())
+				return std::nullopt;
+		}
+		else
+		{
+			bool all_digits = true;
+			for (const char c : str)
+			{
+				if (!std::isdigit(static_cast<unsigned char>(c)))
+				{
+					all_digits = false;
+					break;
+				}
+			}
+			base = all_digits ? 10 : 16;
+		}
+
+		std::uintptr_t val = 0;
+		const char* first = str.data() + idx;
+		const char* last = str.data() + str.size();
+		const auto [ptr, ec] = std::from_chars(first, last, val, base);
+		if (ec != std::errc{} || ptr != last)
+			return std::nullopt;
+
+		return val;
 	}
 
 	CommandLineOptions parse_command_line(const int argc, const char* const* argv)
@@ -757,6 +798,27 @@ namespace
 				}
 				stage_flag_used = true;
 				opts.selected_stages |= *parsed;
+			}
+			else if (arg == "--trace-signal-connect")
+			{
+				if (i + 1 >= argc)
+				{
+					opts.parse_success = false;
+					opts.error_message = "Error: --trace-signal-connect option requires an address value.";
+					return opts;
+				}
+				const std::string_view addr_str = argv[++i];
+				const auto parsed_addr = parse_address(addr_str);
+				if (!parsed_addr.has_value())
+				{
+					opts.parse_success = false;
+					opts.error_message = "Error: Invalid address format for --trace-signal-connect: '" + std::string(addr_str) + "'.";
+					return opts;
+				}
+				opts.has_trace_signal_connect = true;
+				stage_flag_used = true;
+				opts.trace_signal_connect_focus = *parsed_addr;
+				opts.selected_stages |= Stage::Signal;
 			}
 			else if (arg == "--self-test" || arg == "--test")
 			{
@@ -882,6 +944,56 @@ namespace
 			const char* argv[] = {"offline_abi_resolver_tests"};
 			const auto opts = parse_command_line(1, argv);
 			check(!opts.parse_success, "No args fails parse");
+		}
+
+		// 9. Trace signal connect - valid hex with 0x
+		{
+			const char* argv[] = {"offline_abi_resolver_tests", "--trace-signal-connect", "0x1414e9b60", "dummy.exe"};
+			const auto opts = parse_command_line(4, argv);
+			check(opts.parse_success, "Trace signal connect hex parse success");
+			check(opts.has_trace_signal_connect, "Trace signal connect flag set");
+			check(opts.trace_signal_connect_focus == 0x1414e9b60, "Trace signal connect focus parsed correctly");
+			check(has_stage(opts.selected_stages, Stage::Signal), "Trace signal connect implies Signal stage");
+			check(opts.selected_stages == Stage::Signal, "Trace signal connect selects only Signal stage");
+		}
+
+		// 10. Trace signal connect - valid decimal
+		{
+			const char* argv[] = {"offline_abi_resolver_tests", "--trace-signal-connect", "5390637920", "dummy.exe"};
+			const auto opts = parse_command_line(4, argv);
+			check(opts.parse_success, "Trace signal connect decimal parse success");
+			check(opts.has_trace_signal_connect, "Trace signal connect flag set");
+			check(opts.trace_signal_connect_focus == 0x1414e9b60, "Trace signal connect decimal focus parsed correctly");
+		}
+
+		// 11. Trace signal connect - focus with restrictive stage
+		{
+			const char* argv[] = {"offline_abi_resolver_tests", "--stage", "RTTI", "--trace-signal-connect", "0x1414e9b60", "dummy.exe"};
+			const auto opts = parse_command_line(6, argv);
+			check(opts.parse_success, "Trace signal connect with restrictive stage parse success");
+			check(has_stage(opts.selected_stages, Stage::Signal), "Focus requires Signal stage even when stage flag restricts");
+			check(has_stage(opts.selected_stages, Stage::RTTI), "RTTI stage preserved");
+		}
+
+		// 12. Trace signal connect - missing value
+		{
+			const char* argv[] = {"offline_abi_resolver_tests", "--trace-signal-connect"};
+			const auto opts = parse_command_line(2, argv);
+			check(!opts.parse_success, "Trace signal connect missing value fails parse");
+		}
+
+		// 13. Trace signal connect - invalid address
+		{
+			const char* argv[] = {"offline_abi_resolver_tests", "--trace-signal-connect", "0xinvalid", "dummy.exe"};
+			const auto opts = parse_command_line(4, argv);
+			check(!opts.parse_success, "Trace signal connect invalid address fails parse");
+		}
+
+		// 14. Trace signal connect - trailing garbage
+		{
+			const char* argv[] = {"offline_abi_resolver_tests", "--trace-signal-connect", "0x123xyz", "dummy.exe"};
+			const auto opts = parse_command_line(4, argv);
+			check(!opts.parse_success, "Trace signal connect trailing garbage fails parse");
 		}
 
 		if (failures == 0)
@@ -1039,6 +1151,7 @@ int main(const int argc, char** argv)
 		const auto member_vfts = gather_rtti_vfts(class_vft_map, "RBX::Reflection::MemberDescriptor", "class RBX::Reflection::MemberDescriptor");
 		const auto property_vfts = gather_rtti_vfts(class_vft_map, "RBX::Reflection::PropertyDescriptor", "class RBX::Reflection::PropertyDescriptor");
 		const auto function_vfts = gather_rtti_vfts(class_vft_map, "RBX::Reflection::FunctionDescriptor", "class RBX::Reflection::FunctionDescriptor");
+		const auto type_vfts = gather_rtti_vfts(class_vft_map, "RBX::Reflection::Type", "class RBX::Reflection::Type");
 		const auto yield_function_vfts = gather_rtti_vfts(class_vft_map, "RBX::Reflection::YieldFunctionDescriptor", "class RBX::Reflection::YieldFunctionDescriptor");
 		const auto event_vfts = gather_event_family_rtti_vfts(rtti_index, "RBX::Reflection::EventDescriptor", "class RBX::Reflection::EventDescriptor");
 		auto callback_vfts = gather_rtti_vfts(class_vft_map, "RBX::Reflection::SyncCallbackDescriptor", "class RBX::Reflection::SyncCallbackDescriptor");
@@ -1081,6 +1194,7 @@ int main(const int argc, char** argv)
 					  << ",member:" << member_vfts.size()
 					  << ",property:" << property_vfts.size()
 					  << ",function:" << function_vfts.size()
+					  << ",type:" << type_vfts.size()
 					  << ",yield:" << yield_function_vfts.size()
 					  << ",event:" << event_vfts.size()
 					  << ",callback:" << callback_vfts.size()
@@ -1128,6 +1242,7 @@ int main(const int argc, char** argv)
 		if (member_vfts.empty()) prereq_errors.push_back(CompatibilityError{.capability = "Reflection.MemberDescriptorRTTI", .failure = CompatibilityFailure::missing_signature});
 		if (property_vfts.empty()) prereq_errors.push_back(CompatibilityError{.capability = "Reflection.PropertyDescriptorRTTI", .failure = CompatibilityFailure::missing_signature});
 		if (function_vfts.empty()) prereq_errors.push_back(CompatibilityError{.capability = "Reflection.FunctionDescriptorRTTI", .failure = CompatibilityFailure::missing_signature});
+		if (type_vfts.empty()) prereq_errors.push_back(CompatibilityError{.capability = "Reflection.TypeRTTI", .failure = CompatibilityFailure::missing_signature});
 		if (yield_function_vfts.empty()) prereq_errors.push_back(CompatibilityError{.capability = "Reflection.YieldFunctionDescriptorRTTI", .failure = CompatibilityFailure::missing_signature});
 		if (event_vfts.empty()) prereq_errors.push_back(CompatibilityError{.capability = "Reflection.EventDescriptorRTTI", .failure = CompatibilityFailure::missing_signature});
 		if (callback_vfts.empty()) prereq_errors.push_back(CompatibilityError{.capability = "Reflection.CallbackDescriptorRTTI", .failure = CompatibilityFailure::missing_signature});
@@ -1173,6 +1288,7 @@ int main(const int argc, char** argv)
 				.member_vfts = member_vfts,
 				.property_vfts = property_vfts,
 				.function_vfts = function_vfts,
+				.type_vfts = type_vfts,
 				.yield_function_vfts = yield_function_vfts,
 				.event_vfts = event_vfts,
 				.callback_vfts = callback_vfts,
@@ -1202,6 +1318,11 @@ int main(const int argc, char** argv)
 						  << ", security_offset=" << ev.security_offset
 						  << ", property_type_offset=" << ev.property_type_offset
 						  << ", property_functionality_offset=" << ev.property_functionality_offset
+						  << ", type_tag_offset=" << ev.type_tag_offset
+						  << ", type_id_offset=" << ev.type_id_offset
+						  << ", type_is_float_offset=" << ev.type_is_float_offset
+						  << ", type_is_number_offset=" << ev.type_is_number_offset
+						  << ", type_is_enum_offset=" << ev.type_is_enum_offset
 						  << ", signature_offset=" << ev.signature_offset
 						  << ", function_kind_offset=" << ev.function_kind_offset
 						  << ", function_invoke_func_ptr_offset=" << ev.function_invoke_func_ptr_offset
@@ -1277,9 +1398,50 @@ int main(const int argc, char** argv)
 		{
 			std::vector<CompatibilityError> sig_diag;
 			std::cout << "[RUN] exe=" << exe_path << " stage=SignalLayout" << std::endl;
+			rml::roblox::internals::SignalConnectTrace trace{};
+			if (opts.has_trace_signal_connect)
+			{
+				trace.focus_function_address = opts.trace_signal_connect_focus;
+			}
+
 			auto res = rml::roblox::internals::resolve_signal_layout(
 				code, code_address, runtime_function_table, module_base,
-				signal_disconnect_address, signal_slot_free_address, &sig_diag);
+				signal_disconnect_address, signal_slot_free_address, &sig_diag,
+				opts.has_trace_signal_connect ? &trace : nullptr);
+
+			if (opts.has_trace_signal_connect)
+			{
+				std::cout << "[TRACE] focus=0x" << std::hex << trace.focus_function_address
+						  << std::dec << " total_callers=" << trace.total_connect_callers
+						  << " valid_candidates=" << trace.valid_connect_candidates << "\n";
+				for (const auto& cand : trace.candidates)
+				{
+					std::cout << "[TRACE-CANDIDATE] fn=0x" << std::hex << cand.function_address
+							  << " event_signal=0x" << cand.event_signal_offset
+							  << " slot_source=0x" << cand.slot_source_offset
+							  << " slot_wrapper_ptr=0x" << cand.slot_wrapper_ptr_offset
+							  << " slot_wrapper_rep=0x" << cand.slot_wrapper_rep_offset
+							  << " slot_weak=0x" << cand.slot_weak_offset
+							  << " alloc_size=0x" << cand.allocation_size
+							  << " insert_helper=0x" << cand.insert_helper_address
+							  << " signal_head=0x" << cand.signal_head_offset
+							  << " slot_strong=0x" << cand.slot_strong_offset
+							  << " slot_next=0x" << cand.slot_next_offset
+							  << std::dec
+							  << " decoded=" << cand.decoded_instructions
+							  << " event_fields=" << cand.event_field_reads
+							  << " signal_addresses=" << cand.signal_address_derivations
+							  << " signal_reads=" << cand.signal_object_reads
+							  << " allocations=" << cand.allocation_calls
+							  << " source_stores=" << cand.source_stores
+							  << " wrapper_stores=" << cand.wrapper_stores
+							  << " insert_calls=" << cand.insert_calls
+							  << " weak_increments=" << cand.weak_increments
+							  << " decode_failed=" << (cand.decode_failed ? 1 : 0)
+							  << " valid=" << (cand.valid ? 1 : 0) << "\n";
+				}
+			}
+
 			if (res.has_value())
 			{
 				const auto& ev = res.value();
@@ -1287,7 +1449,7 @@ int main(const int argc, char** argv)
 						  << " capability=SignalLayout"
 						  << " matched_calls=" << ev.matched_calls
 						  << " supporting_calls=" << ev.supporting_calls
-						  << "fields={"
+						  << " fields={"
 						  << "event_signal_offset=" << ev.event_signal_offset
 						  << ", "
 						  << "signal_head_offset=" << ev.signal_head_offset
