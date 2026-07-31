@@ -97,3 +97,29 @@ jobs:
 
       - name: Build and test every Rust target
         run: cargo test --locked --all-targets --verbose
+
+      - name: Configure native RML
+        run: >
+          cmake -S rml -B rml/build/ci -A x64
+          -DROBLOX_MODLOADER_BUILD_MANAGED_PROJECTS=OFF
+          -DROBLOX_MODLOADER_USE_CMAKE_CSHARP=OFF
+          -DROBLOX_MODLOADER_BUILD_PROXY_GENERATOR=OFF
+          -DROBLOX_MODLOADER_BUILD_PROXY_DLL=OFF
+          -DROBLOX_MODLOADER_BUILD_DUMPER=OFF
+          -DROBLOX_MODLOADER_BUILD_EXAMPLES=OFF
+      - name: Build native RML and tests
+        run: >
+          cmake --build rml/build/ci --config Release --target
+          roblox_modloader
+          instance_child_reorder_tests
+          hierarchy_capture_fast_path_tests
+          serialized_property_event_gate_tests
+          foreground_activation_policy_tests
+          job_registry_tests
+          reflection_runtime_resolver_tests
+          datamodel_rtti_capability_tests
+          offline_abi_resolver_tests
+      - name: Test native RML
+        run: >
+          ctest --test-dir rml/build/ci -C Release --output-on-failure
+          -R "^(instance_child_reorder|hierarchy_capture_fast_path|serialized_property_event_gate|foreground_activation_policy|job_registry|reflection_runtime_resolver|datamodel_rtti_capability|offline_abi_resolver)$"
