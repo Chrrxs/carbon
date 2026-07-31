@@ -322,7 +322,7 @@ static int cmd_bridge_request(
     std::vector<uint8_t> request_body;
     BYTE chunk[8192];
     DWORD bytes_read = 0;
-    const size_t MAX_REQUEST_BODY = 100 * 1024 * 1024;
+    const size_t MAX_REQUEST_BODY = 512 * 1024 * 1024;
     while (true) {
         if (!ReadFile(hStdin, chunk, sizeof(chunk), &bytes_read, NULL) || bytes_read == 0) {
             break;
@@ -1138,27 +1138,8 @@ static int cmd_inject(
     // for Studio's resumed engine thread. The bridge attestation performed by
     // Carbon is the authoritative readiness gate; this wait is only an
     // opportunity to reclaim the remote path allocation on the fast path.
-    DWORD waitResult = WaitForSingleObject(hThread.get(), 1000);
+    const DWORD waitResult = WaitForSingleObject(hThread.get(), 1000);
     if (waitResult == WAIT_OBJECT_0) {
-        DWORD remoteResult = 0;
-        if (!GetExitCodeThread(hThread.get(), &remoteResult)) {
-            std::cerr << "GetExitCodeThread failed: " << GetLastError() << "\n";
-            VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
-            return 1;
-        }
-        if (remoteResult == 0) {
-            bool modulesInspected = false;
-            const bool moduleLoaded = process_has_module(pid, loader_path, modulesInspected);
-            if (!modulesInspected) {
-                VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
-                return 1;
-            }
-            if (!moduleLoaded) {
-                std::cerr << "LoadLibraryW returned null for the Carbon RML loader\n";
-                VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
-                return 1;
-            }
-        }
         VirtualFreeEx(hProcess.get(), remoteMem, 0, MEM_RELEASE);
         return 0;
     }

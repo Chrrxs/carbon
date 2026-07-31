@@ -3,6 +3,9 @@
 #include "RobloxModLoader/internal/common.hpp"
 #include "utils/directory.hpp"
 
+#include <cstdlib>
+#include <string>
+
 #ifdef _WIN32
 	#include <windows.h>
 	#define RML_LOAD_LIB(p) LoadLibraryW(p)
@@ -55,10 +58,25 @@ namespace rml::dotnet
 
 		auto runtime_path = utils::directory::get_runtime_directory();
 
-		constexpr get_hostfxr_parameters params{
+		std::filesystem::path dotnet_root;
+#ifdef _WIN32
+		std::wstring dotnet_root_buffer(32768, L'\0');
+		const auto dotnet_root_length =
+		    GetEnvironmentVariableW(L"DOTNET_ROOT", dotnet_root_buffer.data(), static_cast<DWORD>(dotnet_root_buffer.size()));
+		if (dotnet_root_length > 0 && dotnet_root_length < dotnet_root_buffer.size())
+		{
+			dotnet_root_buffer.resize(dotnet_root_length);
+			dotnet_root = dotnet_root_buffer;
+		}
+#else
+		if (const auto* configured_dotnet_root = std::getenv("DOTNET_ROOT"))
+			dotnet_root = configured_dotnet_root;
+#endif
+
+		const get_hostfxr_parameters params{
 		    .size = sizeof(get_hostfxr_parameters),
 		    .assembly_path = nullptr,
-		    .dotnet_root = nullptr,
+		    .dotnet_root = dotnet_root.empty() ? nullptr : dotnet_root.c_str(),
 		};
 
 		using get_hostfxr_path_fn = int (*)(char_t*, size_t*, const get_hostfxr_parameters*);

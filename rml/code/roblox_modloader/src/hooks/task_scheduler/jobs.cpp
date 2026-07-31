@@ -29,7 +29,7 @@ RBX::TaskScheduler::StepResult rml::Hooks::on_job_step(void** this_ptr, const RB
 		return *kind;
 	}();
 
-	if (rml::has_task_scheduler() && !rml::task_scheduler().is_shutdown())
+	if (rml::has_task_scheduler() && !rml::task_scheduler().is_shutdown() && rml::task_scheduler().has_jobs_for_kind(detected_kind))
 	{
 		try
 		{
@@ -52,8 +52,7 @@ RBX::TaskScheduler::StepResult rml::Hooks::on_job_step(void** this_ptr, const RB
 
 	if (const auto it = g_hooking->m_jobs_hook.find(detected_kind); it != g_hooking->m_jobs_hook.end() && it->second)
 	{
-		return it->second->get_original<decltype(&on_job_step)>(
-			job_execution_step_index(detected_kind))(this_ptr, time_metrics);
+		return it->second->get_original<decltype(&on_job_step)>(job_execution_step_index(detected_kind))(this_ptr, time_metrics);
 	}
 
 	LOG_WARN("[hooks::on_job_step] No hook found for job kind {}, returning Stepped", std::to_underlying(detected_kind));

@@ -5,11 +5,47 @@
 #include "member.hpp"
 #include "type.hpp"
 
+#include <cstddef>
+#include <type_traits>
 #include <vector>
 
 namespace RBX::Reflection
 {
 	typedef std::vector<Variant> EventArguments;
+
+	class EventArgumentsView final
+	{
+	public:
+		constexpr EventArgumentsView(const Variant* data, const std::size_t size) noexcept :
+		    m_data(data),
+		    m_size(size)
+		{
+		}
+
+		[[nodiscard]] constexpr const Variant* begin() const noexcept
+		{
+			return m_data;
+		}
+		[[nodiscard]] constexpr const Variant* end() const noexcept
+		{
+			return m_size == 0 ? m_data : m_data + m_size;
+		}
+		[[nodiscard]] constexpr std::size_t size() const noexcept
+		{
+			return m_size;
+		}
+		[[nodiscard]] constexpr const Variant& operator[](const std::size_t index) const noexcept
+		{
+			return m_data[index];
+		}
+
+	private:
+		const Variant* m_data;
+		std::size_t m_size;
+	};
+
+	static_assert(sizeof(EventArgumentsView) == sizeof(void*) * 2);
+	static_assert(std::is_trivially_copyable_v<EventArgumentsView>);
 
 	class GenericSlotWrapper
 	{
@@ -19,20 +55,11 @@ namespace RBX::Reflection
 		{
 			return false;
 		}
-		virtual void deliver(const EventArguments& args) = 0;
-		virtual void reserved_slot_3()
-		{
-		}
+		virtual void deliver_owned(const EventArguments& args) = 0;
+		virtual void deliver_view(const EventArgumentsView& args) = 0;
 		virtual EventArguments* build_args(EventArguments& out)
 		{
 			return ::new (&out) EventArguments();
-		}
-
-		virtual void reserved_slot_5()
-		{
-		}
-		virtual void reserved_slot_6()
-		{
 		}
 	};
 

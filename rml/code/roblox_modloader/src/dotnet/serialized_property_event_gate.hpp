@@ -11,9 +11,9 @@ namespace RBX::Reflection
 
 namespace rml::dotnet::detail
 {
-	template<typename Visitor>
+	template<typename Arguments, typename Visitor>
 	bool visit_serialized_property_descriptor_argument(
-	    const RBX::Reflection::EventArguments& args,
+	    const Arguments& args,
 	    const RBX::Reflection::Type* expected_type,
 	    Visitor&& visitor)
 	{

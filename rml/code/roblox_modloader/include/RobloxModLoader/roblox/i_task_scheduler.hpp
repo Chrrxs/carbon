@@ -1,6 +1,15 @@
 #pragma once
 #include "job.hpp"
 
+#include <chrono>
+#include <cstdint>
+#include <expected>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
 namespace RBX {
     enum class DataModelType;
     class DataModel;
@@ -12,6 +21,7 @@ namespace rml {
     public:
         using JobId = std::uint64_t;
         using JobPtr = std::unique_ptr<IJob>;
+        using JobHandle = std::shared_ptr<IJob>;
 
         struct JobStats {
             std::uint64_t executions = 0;
@@ -38,9 +48,9 @@ namespace rml {
 
         virtual void execute_jobs_for_kind(const JobExecutionContext &context) noexcept = 0;
 
-        virtual std::optional<std::reference_wrapper<IJob> > get_job(JobId job_id) const noexcept = 0;
+        virtual JobHandle get_job(JobId job_id) const noexcept = 0;
 
-        virtual std::optional<std::reference_wrapper<IJob> > get_job(std::string_view job_name) const noexcept = 0;
+        virtual JobHandle get_job(std::string_view job_name) const noexcept = 0;
 
         virtual std::vector<JobId> get_jobs_by_kind(JobKind kind) const noexcept = 0;
 

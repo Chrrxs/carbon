@@ -47,12 +47,18 @@ namespace rml::jobs {
                 LOG_ERROR("[JobBase::execute] Unknown exception in job '{}'", m_name);
             }
 
-            m_state.store(JobState::Finished, std::memory_order_release);
+            auto state = m_state.load(std::memory_order_acquire);
+            while (state != JobState::Destroyed &&
+                   !m_state.compare_exchange_weak(state, JobState::Finished,
+                                                  std::memory_order_release,
+                                                  std::memory_order_acquire)) {
+            }
         }
 
         void destroy() noexcept override {
-            m_state.store(JobState::Destroyed, std::memory_order_release);
-            destroy_impl();
+            if (m_state.exchange(JobState::Destroyed, std::memory_order_acq_rel) != JobState::Destroyed) {
+                destroy_impl();
+            }
         }
 
         std::string_view get_name() const noexcept override {
@@ -82,18 +88,10 @@ namespace rml::jobs {
 
         virtual void destroy_impl() noexcept = 0;
 
-        void set_priority(JobPriority priority) noexcept {
-            m_priority = priority;
-        }
-
-        void set_target_kind(JobKind kind) noexcept {
-            m_target_kind = kind;
-        }
-
     private:
         const std::string m_name;
-        std::atomic<JobPriority> m_priority;
-        std::atomic<JobKind> m_target_kind;
+        const JobPriority m_priority;
+        const JobKind m_target_kind;
         const bool m_thread_safe;
         std::atomic<JobState> m_state;
     };

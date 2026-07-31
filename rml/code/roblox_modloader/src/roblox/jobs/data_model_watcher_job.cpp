@@ -4,94 +4,143 @@
 #include "RobloxModLoader/internal/common.hpp"
 #include "RobloxModLoader/luau/script_manager.hpp"
 #include "RobloxModLoader/roblox/data_model.hpp"
-#include "RobloxModLoader/roblox/script_context.hpp"
 #include "RobloxModLoader/roblox/internals_profile.hpp"
+#include "RobloxModLoader/roblox/script_context.hpp"
 #include "RobloxModLoader/roblox/task_scheduler.hpp"
 #include "RobloxModLoader/roblox/waiting_hybrid_scripts_job.hpp"
-#include "pointers.hpp"
 #include "dotnet/dotnet_mod_loader.hpp"
+#include "pointers.hpp"
+
+#include <utility>
+#include <vector>
 
 namespace rml::jobs
 {
 	DataModelWatcherJob::DataModelWatcherJob() noexcept :
-	    JobBase(JOB_NAME, JobPriority::High, JobKind::WaitingHybridScripts, true)
+	    JobBase(JOB_NAME, JobPriority::High, JobKind::WaitingHybridScripts, false)
 	{
 	}
 
 	bool DataModelWatcherJob::should_execute_impl(const JobExecutionContext& context) noexcept
 	{
-		const auto data_model = RBX::DataModel::from_job(
-			context.job_as<RBX::ScriptContextFacets::WaitingHybridScriptsJob>());
+		const auto job = context.job_as<RBX::ScriptContextFacets::WaitingHybridScriptsJob>();
+		if (!job)
+		{
+			return false;
+		}
+
+		const auto now = std::chrono::steady_clock::now();
+		if (!m_job_cadence.should_check(job, now, CHANGE_CHECK_INTERVAL))
+		{
+			return false;
+		}
+		auto& resolution = m_job_resolutions[job];
+
+		const auto data_model = RBX::DataModel::from_job(job);
 		if (!data_model)
 		{
+			resolution.data_model = nullptr;
+			resolution.type.reset();
 			return false;
 		}
 
-		const auto type_res = data_model->get_type();
-		if (!type_res)
+		const auto marker_priority = studio_marker_priority(data_model);
+
+		RBX::DataModelType type{};
+		if (resolution.data_model == data_model && resolution.type)
 		{
-			LOG_ERROR("DataModelWatcherJob: Failed to resolve DataModel type");
-			return false;
+			type = *resolution.type;
 		}
+		else
+		{
+			const auto type_res = data_model->get_type();
+			if (!type_res)
+			{
+				resolution.data_model = nullptr;
+				resolution.type.reset();
+				LOG_ERROR("DataModelWatcherJob: Failed to resolve DataModel type");
+				return false;
+			}
+			type = *type_res;
+			resolution.data_model = data_model;
+			resolution.type = type;
+		}
+		resolution.marker_priority = marker_priority;
 
-		const auto type = *type_res;
-		const auto now = std::chrono::steady_clock::now();
-		const auto current_data_model = rml::task_scheduler().get_data_model_by_type(type);
+		auto& scheduler = rml::task_scheduler();
+		scheduler.run_maintenance();
+		const auto current_data_model = scheduler.get_data_model_by_type(type);
 		if (current_data_model == data_model)
+		{
 			m_data_model_last_time_stepped[type] = now;
+			m_data_model_marker_priorities[type] = marker_priority;
+		}
+		check_and_cleanup_stale_data_models(now);
 
 		if (!current_data_model)
+		{
 			return true;
-		if (now - m_last_check <= CHANGE_CHECK_INTERVAL)
-			return false;
+		}
 		if (current_data_model == data_model)
-			return true;
+		{
+			return false;
+		}
 
 		const auto last_step = m_data_model_last_time_stepped.find(type);
-		const bool current_is_stale =
-			last_step == m_data_model_last_time_stepped.end() ||
-			now - last_step->second > STALE_DATA_MODEL_THRESHOLD;
-		return current_is_stale ||
-			studio_marker_priority(data_model) > studio_marker_priority(current_data_model);
+		const bool current_is_stale = last_step == m_data_model_last_time_stepped.end() || now - last_step->second > STALE_DATA_MODEL_THRESHOLD;
+		const auto current_priority = m_data_model_marker_priorities.find(type);
+		return detail::should_prefer_data_model_candidate(current_is_stale,
+		    marker_priority,
+		    current_priority != m_data_model_marker_priorities.end() ? current_priority->second : 0);
 	}
 
 	void DataModelWatcherJob::execute_impl(const JobExecutionContext& context)
 	{
-		m_last_check = std::chrono::steady_clock::now();
-
-		const auto job            = context.job_as<RBX::ScriptContextFacets::WaitingHybridScriptsJob>();
-		const auto new_data_model = RBX::DataModel::from_job(job);
-		if (!new_data_model)
+		const auto job = context.job_as<RBX::ScriptContextFacets::WaitingHybridScriptsJob>();
+		const auto resolution = m_job_resolutions.find(job);
+		if (resolution == m_job_resolutions.end() || !resolution->second.data_model || !resolution->second.type)
 		{
 			return;
 		}
 
-		const auto new_type_res = new_data_model->get_type();
-		if (!new_type_res)
-		{
-			LOG_ERROR("DataModelWatcherJob: Failed to resolve new DataModel type");
-			return;
-		}
-
-		const auto data_model_type = *new_type_res;
+		const auto now = std::chrono::steady_clock::now();
+		auto* const new_data_model = resolution->second.data_model;
+		const auto data_model_type = *resolution->second.type;
 		const auto old_data_model = rml::task_scheduler().get_data_model_by_type(data_model_type);
 		if (old_data_model == new_data_model)
 		{
 			return;
 		}
 
+		if (old_data_model)
+		{
+			for (auto& [cached_job, cached_resolution] : m_job_resolutions)
+			{
+				if (cached_resolution.data_model == old_data_model)
+				{
+					cached_resolution.data_model = nullptr;
+					cached_resolution.type.reset();
+					m_job_cadence.make_due(cached_job, now);
+				}
+			}
+		}
+
 		m_data_models[data_model_type] = new_data_model;
-		m_data_model_last_time_stepped[data_model_type] = m_last_check;
-		check_and_cleanup_stale_data_models();
-		on_data_model_changed(old_data_model, new_data_model, job->get_script_context());
+		m_data_model_last_time_stepped[data_model_type] = now;
+		m_data_model_marker_priorities[data_model_type] = resolution->second.marker_priority;
+		on_data_model_changed(old_data_model, new_data_model, data_model_type, job->get_script_context());
 	}
 
 	void DataModelWatcherJob::destroy_impl() noexcept
 	{
+		m_job_resolutions.clear();
+		m_job_cadence.clear();
+		m_data_models.clear();
+		m_data_model_last_time_stepped.clear();
+		m_data_model_marker_priorities.clear();
 	}
 
-	std::uint8_t DataModelWatcherJob::studio_marker_priority(
-		const RBX::DataModel* data_model) noexcept
+	std::uint8_t DataModelWatcherJob::studio_marker_priority(const RBX::DataModel* data_model) noexcept
 	{
 		constexpr std::string_view core_gui_name = "CoreGui";
 		constexpr std::string_view studio_route_marker = "__CarbonStudioRoute";
@@ -128,7 +177,7 @@ namespace rml::jobs
 		return 0;
 	}
 
-	void DataModelWatcherJob::on_data_model_changed(const RBX::DataModel* old_data_model, RBX::DataModel* new_data_model, RBX::ScriptContext* script_context)
+	void DataModelWatcherJob::on_data_model_changed(const RBX::DataModel* old_data_model, RBX::DataModel* new_data_model, const RBX::DataModelType data_model_type, RBX::ScriptContext* script_context)
 	{
 		if (!rml::has_task_scheduler())
 		{
@@ -141,23 +190,11 @@ namespace rml::jobs
 			return;
 		}
 
-		const auto type_res = new_data_model->get_type();
-		if (!type_res)
-		{
-			LOG_ERROR("DataModelWatcherJob: Failed to resolve DataModel type during change notification");
-			return;
-		}
+		LOG_INFO("Resolved DataModel type {} from capability offset 0x{:X}",
+		    static_cast<int>(data_model_type),
+		    static_cast<std::uintptr_t>(get_roblox_internals_profile().datamodel().type_offset()));
 
-		const auto data_model_type = *type_res;
-		LOG_INFO(
-			"Resolved DataModel type {} from capability offset 0x{:X}",
-			static_cast<int>(data_model_type),
-			static_cast<std::uintptr_t>(get_roblox_internals_profile().datamodel().type_offset()));
-
-		LOG_INFO("DataModel changed from 0x{:X} to 0x{:X} by {}",
-		    old_data_model ? reinterpret_cast<uintptr_t>(old_data_model) : 0,
-		    new_data_model ? reinterpret_cast<uintptr_t>(new_data_model) : 0,
-		    std::to_underlying(data_model_type));
+		LOG_INFO("DataModel changed from 0x{:X} to 0x{:X} by {}", old_data_model ? reinterpret_cast<uintptr_t>(old_data_model) : 0, new_data_model ? reinterpret_cast<uintptr_t>(new_data_model) : 0, std::to_underlying(data_model_type));
 
 		rml::task_scheduler().set_data_model(data_model_type, new_data_model, script_context);
 
@@ -172,7 +209,7 @@ namespace rml::jobs
 			{
 				rml::dotnet::g_dotnet_mod_loader->notify_data_model_changed(reinterpret_cast<uint64_t>(old_data_model), reinterpret_cast<uint64_t>(new_data_model), static_cast<int>(data_model_type));
 			}
-			catch (const std::exception &e)
+			catch (const std::exception& e)
 			{
 				LOG_WARN("Failed to notify managed mods of DataModel change: {}", e.what());
 			}
@@ -190,34 +227,48 @@ namespace rml::jobs
 		// 	}
 		// }
 
-		// Execute Luau scripts that registered for this DataModel context
+		// Start scripts only for a live context. Unloads retire the prior engine
+		// instead of creating work against the cleared DataModel registry entry.
 #if RML_ENABLE_LUAU
 		try
 		{
-			if (luau::g_script_manager)
+			if (new_data_model)
 			{
-				luau::g_script_manager->execute_scripts_for_context(data_model_type);
+				if (luau::g_script_manager)
+				{
+					luau::g_script_manager->execute_scripts_for_context(data_model_type);
+				}
+				LOG_INFO("Successfully triggered mod scripts for DataModel type: {}", static_cast<int>(data_model_type));
 			}
-			LOG_INFO("Successfully triggered mod scripts for DataModel type: {}", static_cast<int>(data_model_type));
+			else
+			{
+				rml::task_scheduler().cleanup_script_engine(data_model_type);
+			}
 		}
 		catch (const std::exception& e)
 		{
-			LOG_ERROR("Failed to execute mod scripts for DataModel type {}: {}", static_cast<int>(data_model_type), e.what());
+			LOG_ERROR("Failed to update mod scripts for DataModel type {}: {}", static_cast<int>(data_model_type), e.what());
 		}
 #endif
 	}
 
-	void DataModelWatcherJob::check_and_cleanup_stale_data_models()
+	void DataModelWatcherJob::check_and_cleanup_stale_data_models(const std::chrono::steady_clock::time_point now)
 	{
-		const auto now                 = std::chrono::high_resolution_clock::now();
-		constexpr auto stale_threshold = std::chrono::seconds{5};
+		if (now < m_next_stale_cleanup)
+		{
+			return;
+		}
+		m_next_stale_cleanup = now + STALE_CLEANUP_INTERVAL;
 
-		std::vector<RBX::DataModelType> stale_types;
+		m_job_cadence.prune(now, JOB_CACHE_RETENTION, [this](const void* job) {
+			m_job_resolutions.erase(job);
+		});
+
+		std::vector<std::pair<RBX::DataModelType, const RBX::DataModel*>> stale_data_models;
 		for (auto it = m_data_model_last_time_stepped.begin(); it != m_data_model_last_time_stepped.end();)
 		{
 			const auto& [data_model_type, last_time] = *it;
-
-			if (const auto time_since_last_step = now - last_time; time_since_last_step <= stale_threshold)
+			if (now - last_time <= STALE_DATA_MODEL_THRESHOLD)
 			{
 				++it;
 				continue;
@@ -225,37 +276,23 @@ namespace rml::jobs
 
 			const auto current_data_model = rml::task_scheduler().get_data_model_by_type(data_model_type);
 			const auto tracked_data_model = m_data_models.find(data_model_type);
-
-			bool should_cleanup = false;
-
-			if (current_data_model)
-			{
-				if (tracked_data_model != m_data_models.end() && tracked_data_model->second != current_data_model)
-				{
-					should_cleanup = true;
-				}
-			}
-			else
-			{
-				should_cleanup = true;
-			}
-
-			if (!should_cleanup)
+			const auto* const tracked_data_model_ptr = tracked_data_model != m_data_models.end() ? tracked_data_model->second : nullptr;
+			if (!detail::should_cleanup_stale_data_model(current_data_model, tracked_data_model_ptr))
 			{
 				++it;
 				continue;
 			}
 
 			LOG_INFO("Detected stale DataModel type: {}, cleaning up", static_cast<int>(data_model_type));
-
-			stale_types.push_back(data_model_type);
+			stale_data_models.emplace_back(data_model_type, tracked_data_model_ptr);
 			m_data_models.erase(data_model_type);
+			m_data_model_marker_priorities.erase(data_model_type);
 			it = m_data_model_last_time_stepped.erase(it);
 		}
 
-		for (const auto& stale_type : stale_types)
+		for (const auto& [stale_type, stale_data_model] : stale_data_models)
 		{
-			rml::task_scheduler().cleanup_data_model(stale_type);
+			on_data_model_changed(stale_data_model, nullptr, stale_type, nullptr);
 		}
 	}
 }

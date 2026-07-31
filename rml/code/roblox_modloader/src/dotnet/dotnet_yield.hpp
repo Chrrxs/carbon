@@ -24,8 +24,8 @@ namespace rml::dotnet
 
 		~YieldResult()
 		{
-			for (char* owned : m_strings)
-				std::free(owned);
+			for (const auto& value : m_values)
+				release_interop_value(value);
 		}
 
 		void take_values(const RBX::Reflection::Variant* result)
@@ -41,12 +41,12 @@ namespace rml::dotnet
 				if (const RBX::Reflection::Tuple* tuple = shared ? shared->get() : nullptr)
 				{
 					for (const auto& value : tuple->values)
-						m_values.push_back(TypeMarshaler::encode_variant(value, &m_strings));
+						append(TypeMarshaler::encode_variant(value));
 				}
 				return;
 			}
 
-			m_values.push_back(TypeMarshaler::encode_variant(*result, &m_strings));
+			append(TypeMarshaler::encode_variant(*result));
 		}
 
 		void take_error(const RBX::Reflection::Variant*)
@@ -72,14 +72,39 @@ namespace rml::dotnet
 
 		[[nodiscard]] InteropVariant to_interop()
 		{
-			const InteropVariant value = m_values.empty() ? null_value() : (m_values.size() == 1 ? m_values.front() : tuple_value(m_values));
-			m_strings.clear();
+			if (m_values.empty())
+				return null_value();
+			if (m_values.size() == 1)
+			{
+				const auto value = m_values.front();
+				m_values.clear();
+				return value;
+			}
+
+			const auto value = tuple_value(m_values);
+			if (value.tag == InteropValueTag::Tuple)
+				m_values.clear();
 			return value;
 		}
 
 	private:
+		void append(const InteropVariant value)
+		{
+			try
+			{
+				m_values.push_back(value);
+			}
+			catch (...)
+			{
+				release_interop_value(value);
+				throw;
+			}
+		}
+
+	public:
+
+	private:
 		std::vector<InteropVariant> m_values;
-		InteropStringPool m_strings;
 		bool m_errored = false;
 		std::string m_error_message;
 	};

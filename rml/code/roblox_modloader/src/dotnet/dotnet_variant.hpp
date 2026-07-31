@@ -10,7 +10,6 @@
 
 namespace rml::dotnet
 {
-	using InteropStringPool = std::vector<char*>;
 
 	[[nodiscard]] inline InteropVariant null_value() noexcept
 	{
@@ -71,13 +70,6 @@ namespace rml::dotnet
 		return out;
 	}
 
-	[[nodiscard]] inline InteropVariant string_value(const char* text, InteropStringPool& pool)
-	{
-		const auto out = string_value(text);
-		if (out.as_string)
-			pool.push_back(out.as_string);
-		return out;
-	}
 
 	[[nodiscard]] inline InteropVariant bytes_value(const std::span<const std::byte> bytes)
 	{
@@ -117,6 +109,35 @@ namespace rml::dotnet
 		out.tag = InteropValueTag::Tuple;
 		out.as_instance = reinterpret_cast<uintptr_t>(buf);
 		return out;
+	}
+
+	inline void release_interop_value(const InteropVariant& value) noexcept
+	{
+		switch (value.tag)
+		{
+		case InteropValueTag::String:
+			std::free(value.as_string);
+			return;
+		case InteropValueTag::Bytes:
+		case InteropValueTag::Blittable:
+		case InteropValueTag::InstanceArray:
+			std::free(reinterpret_cast<void*>(value.as_instance));
+			return;
+		case InteropValueTag::Tuple:
+		{
+			auto* const allocation = reinterpret_cast<std::byte*>(value.as_instance);
+			if (!allocation)
+				return;
+			const auto count = *reinterpret_cast<const std::uint64_t*>(allocation);
+			const auto* elements = reinterpret_cast<const InteropVariant*>(allocation + sizeof(std::uint64_t));
+			for (std::uint64_t index = 0; index < count; ++index)
+				release_interop_value(elements[index]);
+			std::free(allocation);
+			return;
+		}
+		default:
+			return;
+		}
 	}
 
 	[[nodiscard]] inline InteropVariant blittable_value(const void* bytes, const size_t size)

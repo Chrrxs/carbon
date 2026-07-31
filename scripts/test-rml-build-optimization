@@ -113,34 +113,35 @@ if ! grep -Fq -- 'cached managed artifact is missing in $BuildDir' "$BUILD_SCRIP
 fi
 
 HELPER_SOURCE="${SCRIPT_DIR}/carbon-studio-helper.cpp"
-if ! grep -Fq -- 'GetExitCodeThread(hThread.get(), &loadResult)' "$HELPER_SOURCE"; then
-	echo "FAIL: Carbon studio helper does not verify the remote LoadLibraryW result" >&2
+if ! grep -Fq -- 'WaitForSingleObject(hThread.get(), 1000)' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper does not use the bounded opportunistic injector wait" >&2
 	failure=1
 fi
 
-if ! grep -Fq -- 'LoadLibraryW failed in the Roblox Studio process' "$HELPER_SOURCE"; then
-	echo "FAIL: Carbon studio helper does not report a rejected remote DLL load" >&2
+if ! grep -Fq -- 'if (waitResult == WAIT_TIMEOUT)' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper does not preserve the remote loader allocation after timeout" >&2
+	failure=1
+fi
+
+if grep -Fq -- 'GetExitCodeThread(hThread.get(), &loadResult)' "$HELPER_SOURCE"; then
+	echo "FAIL: Carbon studio helper must use bridge attestation instead of blocking on LoadLibraryW" >&2
 	failure=1
 fi
 
 
-if ! grep -Fq -- 'Usage: carbon-studio-helper <launch|inject|terminate|focus|bridge-request> [args...]' "$HELPER_SOURCE"; then
+if ! grep -Fq -- '<launch|inject|terminate|focus|bridge-request> [args...]' "$HELPER_SOURCE"; then
 	echo "FAIL: Carbon studio helper usage does not mention bridge-request command" >&2
 	failure=1
 fi
 
-if ! grep -Fq -- 'Usage: carbon-studio-helper bridge-request <port> <method> <path_b64> <content_type_or_dash> <range_or_dash> <timeout_ms>' "$HELPER_SOURCE"; then
+if ! grep -Fq -- 'Usage: carbon-studio-helper bridge-request <port> <method> ' "$HELPER_SOURCE" ||
+	! grep -Fq -- '<path_b64> <content_type_or_dash> <range_or_dash> <timeout_ms>' "$HELPER_SOURCE"; then
 	echo "FAIL: Carbon studio helper bridge-request usage is missing" >&2
 	failure=1
 fi
 
-if ! grep -Fq -- 'process_has_module(pid, loader_path, modulesInspected)' "$HELPER_SOURCE" ||
-	! grep -Fq -- 'LoadLibraryW returned null for the Carbon RML loader' "$HELPER_SOURCE"; then
-	echo "FAIL: Carbon studio helper does not verify a zero remote LoadLibraryW result against loaded modules" >&2
-	failure=1
-fi
-
-if ! grep -Fq -- 'Usage: carbon-studio-helper focus <pid> <filetime> <studio_b64> <restore_0_or_1>' "$HELPER_SOURCE"; then
+if ! grep -Fq -- 'Usage: carbon-studio-helper focus <pid> <filetime> ' "$HELPER_SOURCE" ||
+	! grep -Fq -- '<studio_b64> <restore_0_or_1>' "$HELPER_SOURCE"; then
 	echo "FAIL: Carbon studio helper focus usage is missing" >&2
 	failure=1
 fi

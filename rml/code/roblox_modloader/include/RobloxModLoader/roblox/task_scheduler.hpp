@@ -2,6 +2,9 @@
 #include "job.hpp"
 #include "i_task_scheduler.hpp"
 
+#include <atomic>
+#include <chrono>
+
 #if RML_ENABLE_LUAU
 #include "RobloxModLoader/luau/script_engine_registry.hpp"
 #endif
@@ -27,6 +30,7 @@ namespace RBX {
 
         using JobPtr = rml::ITaskScheduler::JobPtr;
         using JobId = rml::ITaskScheduler::JobId;
+        using JobHandle = rml::ITaskScheduler::JobHandle;
         using JobStats = rml::ITaskScheduler::JobStats;
 
         TaskScheduler();
@@ -49,9 +53,9 @@ namespace RBX {
 
         void execute_jobs_for_kind(const rml::JobExecutionContext &context) noexcept override;
 
-        std::optional<std::reference_wrapper<rml::IJob> > get_job(JobId job_id) const noexcept override;
+        JobHandle get_job(JobId job_id) const noexcept override;
 
-        std::optional<std::reference_wrapper<rml::IJob> > get_job(std::string_view job_name) const noexcept override;
+        JobHandle get_job(std::string_view job_name) const noexcept override;
 
         std::vector<JobId> get_jobs_by_kind(rml::JobKind kind) const noexcept override;
 
@@ -75,6 +79,10 @@ namespace RBX {
 
         void cleanup_data_model(DataModelType data_model_type) override;
 
+        [[nodiscard]] bool has_jobs_for_kind(rml::JobKind kind) const noexcept;
+
+        void run_maintenance() noexcept;
+
 #if RML_ENABLE_LUAU
         std::shared_ptr<rml::luau::ScriptEngine> get_script_engine(DataModelType data_model_type);
 
@@ -86,11 +94,14 @@ namespace RBX {
 #endif
 
     private:
+        void initialize_job_vtable_mappings() noexcept;
+
         std::unique_ptr<rml::JobRegistry> m_job_registry;
         std::unique_ptr<rml::DataModelRegistry> m_data_model_registry;
 #if RML_ENABLE_LUAU
         std::unique_ptr<rml::luau::ScriptEngineRegistry> m_script_engine_registry;
 #endif
+        std::atomic<std::chrono::steady_clock::time_point> m_next_maintenance;
     };
 }
 

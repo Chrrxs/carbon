@@ -40,8 +40,6 @@ namespace rml::luau {
 
         void cleanup_orphaned_script_engines(const DataModelLookup &data_model_lookup);
 
-        void maybe_cleanup_orphaned_script_engines(const DataModelLookup &data_model_lookup);
-
         void shutdown() noexcept;
 
     private:
@@ -58,6 +56,5 @@ namespace rml::luau {
         std::mutex m_cleanup_threads_mutex;
         std::vector<TrackedCleanup> m_cleanup_threads;
 
-        std::atomic<std::uint64_t> m_step_counter{0};
     };
 }

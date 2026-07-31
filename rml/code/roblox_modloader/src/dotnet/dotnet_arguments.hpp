@@ -8,17 +8,20 @@
 #include "interop_registry.hpp"
 #include "type_marshaler.hpp"
 
+#include <array>
 #include <cstddef>
 #include <deque>
 #include <new>
 #include <string>
+#include <string_view>
 
 namespace rml::dotnet
 {
-	inline constexpr std::size_t kEngineReturnSlotTailBytes = 56;
+	inline constexpr std::size_t kEngineReturnSlotTailBytes =
+	    sizeof(RBX::Reflection::Variant) - sizeof(uint64_t);
 
 	static_assert(sizeof(uint64_t) + kEngineReturnSlotTailBytes >= TypeMarshaler::kMaxBlittableEngineTypeBytes,
-	    "EngineReturnSlot tail must leave enough contiguous room after Arguments::return_value for the largest blittable engine return type");
+	    "EngineReturnSlot tail must leave enough contiguous room after Arguments::return_value for the largest engine return type");
 
 	using EngineReturnSlot = EngineScratch<kEngineReturnSlotTailBytes>;
 
@@ -29,15 +32,22 @@ namespace rml::dotnet
 		uint32_t m_count;
 
 		const RBX::Reflection::SignatureDescriptor* m_signature{nullptr};
+		// Most reflected native wrappers accept std::string; GetAttribute accepts std::string_view.
+		bool m_string_view_arguments{false};
 
 		mutable std::deque<std::string> m_string_storage;
+		mutable std::array<std::string_view, 7> m_string_views;
 
 	public:
-		DotNetArguments(const InteropVariant* args, const uint32_t count,
-		    const RBX::Reflection::SignatureDescriptor* signature = nullptr) noexcept :
+		DotNetArguments(
+		    const InteropVariant* args,
+		    const uint32_t count,
+		    const RBX::Reflection::SignatureDescriptor* signature = nullptr,
+		    const bool string_view_arguments = false) noexcept :
 		    m_args(args),
 		    m_count(count),
-		    m_signature(signature)
+		    m_signature(signature),
+		    m_string_view_arguments(string_view_arguments)
 		{
 			return_value = 0;
 		}
@@ -148,7 +158,13 @@ namespace rml::dotnet
 			const auto& v = m_args[index - 1];
 
 			if (v.tag == InteropValueTag::String)
-				return &m_string_storage.emplace_back(v.as_string ? v.as_string : "");
+			{
+				if (!m_string_view_arguments)
+					return &m_string_storage.emplace_back(v.as_string ? v.as_string : "");
+				auto& view = m_string_views[static_cast<std::size_t>(index - 1)];
+				view = v.as_string ? v.as_string : "";
+				return &view;
+			}
 
 			return reinterpret_cast<void*>(v.as_uint64);
 		}

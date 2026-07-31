@@ -155,8 +155,27 @@ if (BUILD_TESTING)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
     )
     add_test(NAME foreground_activation_policy COMMAND foreground_activation_policy_tests)
-    add_executable(datamodel_rtti_capability_tests EXCLUDE_FROM_ALL
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/reflection_runtime_resolver_tests.cpp"
+
+    add_executable(job_registry_tests EXCLUDE_FROM_ALL
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/job_registry_tests.cpp"
+            "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/job_registry.cpp"
+    )
+    target_include_directories(job_registry_tests PRIVATE
+            "${ROBLOX_MODLOADER_SOURCE_DIR}"
+            "${ROBLOX_MODLOADER_INCLUDE_DIR}"
+    )
+    setup_core_dependencies(job_registry_tests PRIVATE)
+    setup_luau_dependencies(job_registry_tests PRIVATE)
+    target_link_libraries(job_registry_tests PRIVATE rml_thirdparty)
+    target_compile_definitions(job_registry_tests PRIVATE ROBLOX_MODLOADER_STATIC_DEFINE)
+    target_compile_features(job_registry_tests PRIVATE cxx_std_23)
+    set_target_properties(job_registry_tests PROPERTIES
+            FOLDER "Tests"
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+    )
+    add_test(NAME job_registry COMMAND job_registry_tests)
+
+    set(RML_ABI_RESOLVER_TEST_SOURCES
             "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/reflection/runtime_layout_resolver.cpp"
             "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/reflection/capabilities.cpp"
             "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/datamodel_layout_resolver.cpp"
@@ -167,20 +186,27 @@ if (BUILD_TESTING)
             "${ROBLOX_MODLOADER_SOURCE_DIR}/memory/symbol_resolver.cpp"
             "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/utils/name.cpp"
     )
-    target_include_directories(datamodel_rtti_capability_tests PRIVATE
-            "${ROBLOX_MODLOADER_SOURCE_DIR}"
-            "${ROBLOX_MODLOADER_INCLUDE_DIR}"
-    )
-    setup_core_dependencies(datamodel_rtti_capability_tests PRIVATE)
-    setup_luau_dependencies(datamodel_rtti_capability_tests PRIVATE)
-    target_link_libraries(datamodel_rtti_capability_tests PRIVATE Zydis rml_thirdparty)
-    target_compile_definitions(datamodel_rtti_capability_tests PRIVATE ROBLOX_MODLOADER_STATIC_DEFINE)
-    target_compile_features(datamodel_rtti_capability_tests PRIVATE cxx_std_23)
-    set_target_properties(datamodel_rtti_capability_tests PROPERTIES
-            FOLDER "Tests"
-            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
-    )
-    add_test(NAME reflection_runtime_resolver COMMAND datamodel_rtti_capability_tests)
+    foreach (RML_ABI_TEST_TARGET IN ITEMS reflection_runtime_resolver_tests datamodel_rtti_capability_tests)
+        add_executable(${RML_ABI_TEST_TARGET} EXCLUDE_FROM_ALL
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/${RML_ABI_TEST_TARGET}.cpp"
+                ${RML_ABI_RESOLVER_TEST_SOURCES}
+        )
+        target_include_directories(${RML_ABI_TEST_TARGET} PRIVATE
+                "${ROBLOX_MODLOADER_SOURCE_DIR}"
+                "${ROBLOX_MODLOADER_INCLUDE_DIR}"
+        )
+        setup_core_dependencies(${RML_ABI_TEST_TARGET} PRIVATE)
+        setup_luau_dependencies(${RML_ABI_TEST_TARGET} PRIVATE)
+        target_link_libraries(${RML_ABI_TEST_TARGET} PRIVATE Zydis rml_thirdparty)
+        target_compile_definitions(${RML_ABI_TEST_TARGET} PRIVATE ROBLOX_MODLOADER_STATIC_DEFINE)
+        target_compile_features(${RML_ABI_TEST_TARGET} PRIVATE cxx_std_23)
+        set_target_properties(${RML_ABI_TEST_TARGET} PROPERTIES
+                FOLDER "Tests"
+                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+        )
+    endforeach ()
+    add_test(NAME reflection_runtime_resolver COMMAND reflection_runtime_resolver_tests)
+    add_test(NAME datamodel_rtti_capability COMMAND datamodel_rtti_capability_tests)
     add_executable(offline_abi_resolver_tests EXCLUDE_FROM_ALL
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/offline_abi_resolver_tests.cpp"
             "${ROBLOX_MODLOADER_SOURCE_DIR}/roblox/reflection/runtime_layout_resolver.cpp"
@@ -205,7 +231,7 @@ if (BUILD_TESTING)
             FOLDER "Tests"
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
     )
-    add_test(NAME offline_abi_resolver COMMAND offline_abi_resolver_tests)
+    add_test(NAME offline_abi_resolver COMMAND offline_abi_resolver_tests --self-test)
 endif ()
 
 include(GenerateExportHeader)

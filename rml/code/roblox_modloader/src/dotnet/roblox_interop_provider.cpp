@@ -84,7 +84,19 @@ namespace rml::dotnet
 		{
 		}
 
-		void deliver(const RBX::Reflection::EventArguments& args) override
+		void deliver_owned(const RBX::Reflection::EventArguments& args) override
+		{
+			deliver_impl(args);
+		}
+
+		void deliver_view(const RBX::Reflection::EventArgumentsView& args) override
+		{
+			deliver_impl(args);
+		}
+
+	private:
+		template<typename Arguments>
+		void deliver_impl(const Arguments& args)
 		{
 			if (!m_callback)
 				return;
@@ -603,12 +615,19 @@ namespace rml::dotnet
 		return instance;
 	}
 
-	void invoke_reflection_function(RBX::Reflection::DescribedBase* instance, const RBX::Reflection::FunctionDescriptor& descriptor, const InteropVariant* args, const uint32_t arg_count, InteropVariant& out)
+	void invoke_reflection_function(
+	    RBX::Reflection::DescribedBase* instance,
+	    const RBX::Reflection::FunctionDescriptor& descriptor,
+	    const std::string_view function_name,
+	    const InteropVariant* args,
+	    const uint32_t arg_count,
+	    InteropVariant& out)
 	{
-		DotNetArguments arguments{args, arg_count};
+		const auto* signature = descriptor.get_signature();
+		const bool string_view_arguments = function_name == "GetAttribute";
+		DotNetArguments arguments{args, arg_count, signature, string_view_arguments};
 		const auto function = RBX::Function(descriptor, instance);
 		const auto ret = function.invoke(arguments);
-		const auto* signature = descriptor.get_signature();
 		const auto* type = signature ? signature->first_result_type() : nullptr;
 		TypeMarshaler::encode_return_value(type, ret, reinterpret_cast<uintptr_t>(&arguments.return_value), out);
 	}
@@ -670,7 +689,7 @@ namespace rml::dotnet
 					return;
 
 				InteropVariant local_result{};
-				invoke_reflection_function(instance, *descriptor, args, arg_count, out_result ? *out_result : local_result);
+				invoke_reflection_function(instance, *descriptor, function_name, args, arg_count, out_result ? *out_result : local_result);
 			}
 			catch (const std::exception& e)
 			{
@@ -718,7 +737,7 @@ namespace rml::dotnet
 				}
 
 				InteropVariant result{};
-				invoke_reflection_function(instance, *descriptor, args, arg_count, result);
+				invoke_reflection_function(instance, *descriptor, function_name, args, arg_count, result);
 				callback(state, &result, nullptr);
 			}
 			catch (const std::exception& e)
@@ -1085,7 +1104,7 @@ namespace rml::dotnet
 						event_args = build_event_fire_args(descriptor, args, arg_count);
 				}
 
-				wrapper->deliver(event_args);
+				wrapper->deliver_owned(event_args);
 				release_fire_args(event_args);
 			}
 			catch (const std::exception& e)

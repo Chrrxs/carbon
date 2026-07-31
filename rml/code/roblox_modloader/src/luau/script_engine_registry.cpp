@@ -104,13 +104,6 @@ namespace rml::luau
 		}
 	}
 
-	void ScriptEngineRegistry::maybe_cleanup_orphaned_script_engines(const DataModelLookup& data_model_lookup)
-	{
-		if (m_step_counter.fetch_add(1, std::memory_order_relaxed) % 500 == 0)
-		{
-			cleanup_orphaned_script_engines(data_model_lookup);
-		}
-	}
 
 	void ScriptEngineRegistry::shutdown() noexcept
 	{

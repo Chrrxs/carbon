@@ -1,9 +1,11 @@
 #include "RobloxModLoader/roblox/task_scheduler.hpp"
 
 #include "RobloxModLoader/internal/common.hpp"
+#include "RobloxModLoader/internal/memory/rtti_scanner.hpp"
 #include "data_model_registry.hpp"
 #include "job_registry.hpp"
 
+#include <array>
 #include <cassert>
 
 RML_LOG_SCOPE("TaskScheduler");
@@ -14,12 +16,15 @@ namespace RBX
 {
 	TaskScheduler::TaskScheduler() :
 	    m_job_registry(std::make_unique<rml::JobRegistry>()),
-	    m_data_model_registry(std::make_unique<rml::DataModelRegistry>())
+	    m_data_model_registry(std::make_unique<rml::DataModelRegistry>()),
 #if RML_ENABLE_LUAU
-	    , m_script_engine_registry(std::make_unique<rml::luau::ScriptEngineRegistry>())
+	    m_script_engine_registry(std::make_unique<rml::luau::ScriptEngineRegistry>()),
 #endif
+	    m_next_maintenance(std::chrono::steady_clock::now() + std::chrono::seconds{2})
 	{
 		s_active_task_scheduler = this;
+		initialize_job_vtable_mappings();
+
 
 		RML_INFO("TaskScheduler initialized successfully.");
 	}
@@ -49,20 +54,14 @@ namespace RBX
 	void TaskScheduler::execute_jobs_for_kind(const rml::JobExecutionContext& context) noexcept
 	{
 		m_job_registry->execute_jobs_for_kind(context);
-
-#if RML_ENABLE_LUAU
-		m_script_engine_registry->maybe_cleanup_orphaned_script_engines([this](const DataModelType data_model_type) {
-			return m_data_model_registry->get_data_model_by_type(data_model_type);
-		});
-#endif
 	}
 
-	std::optional<std::reference_wrapper<rml::IJob> > TaskScheduler::get_job(const JobId job_id) const noexcept
+	TaskScheduler::JobHandle TaskScheduler::get_job(const JobId job_id) const noexcept
 	{
 		return m_job_registry->get_job(job_id);
 	}
 
-	std::optional<std::reference_wrapper<rml::IJob> > TaskScheduler::get_job(const std::string_view job_name) const noexcept
+	TaskScheduler::JobHandle TaskScheduler::get_job(const std::string_view job_name) const noexcept
 	{
 		return m_job_registry->get_job(job_name);
 	}
@@ -114,6 +113,26 @@ namespace RBX
 	{
 		return m_job_registry->get_vtable_for_job_kind(kind);
 	}
+	bool TaskScheduler::has_jobs_for_kind(const rml::JobKind kind) const noexcept
+	{
+		return m_job_registry->has_jobs_for_kind(kind);
+	}
+
+	void TaskScheduler::run_maintenance() noexcept
+	{
+		const auto now = std::chrono::steady_clock::now();
+		auto next = m_next_maintenance.load(std::memory_order_acquire);
+		if (now < next || !m_next_maintenance.compare_exchange_strong(next, now + std::chrono::seconds{2}, std::memory_order_acq_rel, std::memory_order_acquire))
+		{
+			return;
+		}
+
+		m_job_registry->cleanup_destroyed_jobs();
+#if RML_ENABLE_LUAU
+		cleanup_orphaned_script_engines();
+#endif
+	}
+
 
 	void TaskScheduler::set_data_model(const DataModelType type, DataModel* data_model, ScriptContext* script_context)
 	{
@@ -153,6 +172,32 @@ namespace RBX
 		});
 	}
 #endif
+	void TaskScheduler::initialize_job_vtable_mappings() noexcept
+	{
+		static constexpr std::array<std::pair<std::string_view, rml::JobKind>, 4> known_job_classes{{{"RBX::HeartbeatTask", rml::JobKind::Heartbeat}, {"RBX::PhysicsJob", rml::JobKind::Physics}, {"RBX::ScriptContextFacets::WaitingHybridScriptsJob", rml::JobKind::WaitingHybridScripts}, {"RBX::Studio::RenderJob", rml::JobKind::Render}}};
+
+		std::size_t mapped_count = 0;
+		for (const auto& [class_name, job_kind] : known_job_classes)
+		{
+			const auto rtti = rml::memory::rtti::RTTIManager::get_class_rtti(class_name);
+			if (!rtti)
+			{
+				RML_WARN("RTTI for '{}' not found, skipping vtable mapping", class_name);
+				continue;
+			}
+			const auto vtable = rtti->get_virtual_function_table();
+			if (!vtable)
+			{
+				RML_WARN("Failed to get vtable for '{}'", class_name);
+				continue;
+			}
+			m_job_registry->register_job_kind_vtable(job_kind, vtable);
+			++mapped_count;
+			RML_INFO("Mapped vtable for '{}' (kind: {}) -> 0x{:X}", class_name, std::to_underlying(job_kind), reinterpret_cast<std::uintptr_t>(vtable));
+		}
+		RML_INFO("Initialized vtable mappings: {}/{} job types mapped", mapped_count, known_job_classes.size());
+	}
+
 }
 
 namespace rml

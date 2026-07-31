@@ -7,6 +7,8 @@
 #include "spdlog/spdlog.h"
 #include "type_marshaler.hpp"
 
+
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -22,15 +24,52 @@ namespace rml::dotnet
 		{
 		}
 
-		void deliver(const RBX::EventArguments& args) override
+		void deliver_owned(const RBX::Reflection::EventArguments& args) override
+		{
+			deliver_impl(args, "owned");
+		}
+
+		void deliver_view(const RBX::Reflection::EventArgumentsView& args) override
+		{
+			deliver_impl(args, "view");
+		}
+
+	private:
+
+		struct EncodedArguments final
+		{
+			std::vector<InteropVariant> values;
+
+			~EncodedArguments()
+			{
+				for (const auto& value : values)
+					release_interop_value(value);
+			}
+		};
+
+		static void append_encoded(std::vector<InteropVariant>& values, const InteropVariant value)
+		{
+			try
+			{
+				values.push_back(value);
+			}
+			catch (...)
+			{
+				release_interop_value(value);
+				throw;
+			}
+		}
+
+		template<typename Arguments>
+		void deliver_impl(const Arguments& args, const char* kind)
 		{
 			if (!m_callback)
 				return;
 
 			try
 			{
-				std::vector<char*> owned_strings;
-				std::vector<InteropVariant> interop_args;
+				EncodedArguments encoded;
+				auto& interop_args = encoded.values;
 				interop_args.reserve(args.size());
 
 				for (const auto& arg : args)
@@ -40,34 +79,35 @@ namespace rml::dotnet
 						if (const auto* tuple = arg.try_cast<std::shared_ptr<const RBX::Reflection::Tuple>>()->get())
 						{
 							for (const auto& value : tuple->values)
-								interop_args.push_back(TypeMarshaler::encode_variant(value, &owned_strings));
+								append_encoded(interop_args, TypeMarshaler::encode_variant(value));
 						}
 						continue;
 					}
 
-					interop_args.push_back(TypeMarshaler::encode_variant(arg, &owned_strings));
+					append_encoded(interop_args, TypeMarshaler::encode_variant(arg));
 				}
 
 				m_callback(m_state, interop_args.data(), static_cast<uint32_t>(interop_args.size()));
 
-				for (auto* str : owned_strings)
-				{
-					free(str);
-				}
 			}
 			catch (const std::exception& ex)
 			{
-				RML_ERROR_AT("ManagedEventSlot", "Exception while dispatching event: {}", ex.what());
+				RML_ERROR_AT(
+				    "ManagedEventSlot",
+				    "Exception while dispatching {} {}-argument event: {}",
+				    kind,
+				    args.size(),
+				    ex.what());
 			}
 			catch (...)
 			{
-				RML_ERROR_AT("ManagedEventSlot", "Unknown exception while dispatching event");
+				RML_ERROR_AT("ManagedEventSlot", "Unknown exception while dispatching {} event", kind);
 			}
 		}
 
-	private:
 		ManagedEventCallback m_callback;
 		void* m_state;
+
 	};
 
 	struct ManagedEventConnection

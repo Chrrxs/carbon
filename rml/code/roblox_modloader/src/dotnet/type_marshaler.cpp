@@ -20,11 +20,6 @@ RML_LOG_SCOPE("Interop");
 
 namespace rml::dotnet
 {
-	template<size_t N>
-	struct blittable_blob
-	{
-		std::byte data[N];
-	};
 
 	namespace
 	{
@@ -86,19 +81,60 @@ namespace rml::dotnet
 			if (!tuple || !utils::memory::is_valid_pointer(reinterpret_cast<uintptr_t>(tuple)) || tuple->values.empty())
 				return null_value();
 
-			InteropStringPool strings;
 			std::vector<InteropVariant> values;
 			values.reserve(tuple->values.size());
-			for (const auto& value : tuple->values)
-				values.push_back(TypeMarshaler::encode_variant(value, &strings));
+			bool transferred = false;
+			const auto release_values = [&]() noexcept {
+				if (!transferred)
+				for (const auto& value : values)
+					release_interop_value(value);
+			};
+			struct ScopeExit final
+			{
+				decltype(release_values)& release;
+				~ScopeExit() { release(); }
+			} guard{release_values};
 
-			return tuple_value(values);
+			for (const auto& value : tuple->values)
+			{
+				const auto encoded = TypeMarshaler::encode_variant(value);
+				try
+				{
+					values.push_back(encoded);
+				}
+				catch (...)
+				{
+					release_interop_value(encoded);
+					throw;
+				}
+			}
+
+			auto out = tuple_value(values);
+			transferred = out.tag == InteropValueTag::Tuple;
+			return out;
 		}
 
 		using TupleSharedPtr = std::shared_ptr<const RBX::Reflection::Tuple>;
 		using InstancesSharedPtr = std::shared_ptr<RBX::Instances>;
 		using BufferStorage = std::vector<std::byte>;
 		using BufferSharedPtr = std::shared_ptr<BufferStorage>;
+
+		void destroy_variant_value(RBX::Reflection::Variant& variant) noexcept
+		{
+			const auto* ops = static_cast<const void* const*>(variant.value_ops());
+			if (ops && ops[2])
+				reinterpret_cast<void (*)(void*)>(const_cast<void*>(ops[2]))(variant.storage());
+		}
+
+		struct VariantValueGuard final
+		{
+			RBX::Reflection::Variant& value;
+
+			~VariantValueGuard()
+			{
+				destroy_variant_value(value);
+			}
+		};
 
 		[[nodiscard]] InteropVariant marshal_instances(const RBX::Instances* instances) noexcept
 		{
@@ -168,6 +204,18 @@ namespace rml::dotnet
 		const void* g_tuple_ops[3] = {reinterpret_cast<const void*>(&copy_tuple_storage), reinterpret_cast<const void*>(&copy_tuple_storage), reinterpret_cast<const void*>(&destroy_tuple_storage)};
 		const void* g_instances_ops[3] = {reinterpret_cast<const void*>(&copy_instances_storage), reinterpret_cast<const void*>(&copy_instances_storage), reinterpret_cast<const void*>(&destroy_instances_storage)};
 		const void* g_buffer_ops[3] = {reinterpret_cast<const void*>(&copy_buffer_storage), reinterpret_cast<const void*>(&copy_buffer_storage), reinterpret_cast<const void*>(&destroy_buffer_storage)};
+
+		bool set_property_variant(const RBX::Reflection::PropertyDescriptor& descriptor, RBX::Reflection::DescribedBase* instance, const RBX::Reflection::Type& type, const void* value, const size_t size)
+		{
+			if (!value || size > TypeMarshaler::kMaxBlittableEngineTypeBytes)
+				return false;
+
+			RBX::Reflection::Variant variant;
+			variant.set_type_and_ops(&type, g_trivial_ops);
+			std::memcpy(variant.storage(), value, size);
+			descriptor.set_variant(instance, variant);
+			return true;
+		}
 
 		[[nodiscard]] int tag_to_type_id(const InteropValueTag tag) noexcept
 		{
@@ -279,6 +327,9 @@ namespace rml::dotnet
 		if (const auto stride = sequence_stride(type_name); stride != 0)
 			return {MarshalKind::Sequence, stride};
 
+		if (type_name && *type_name == "Variant")
+			return {MarshalKind::Variant, 0};
+
 		if (type_name && *type_name == "buffer")
 			return {MarshalKind::Buffer, 0};
 
@@ -294,12 +345,15 @@ namespace rml::dotnet
 		return {MarshalKind::Unsupported, 0};
 	}
 
-	InteropVariant TypeMarshaler::encode_variant(const RBX::Reflection::Variant& variant, InteropStringPool* strings)
+	InteropVariant TypeMarshaler::encode_variant(const RBX::Reflection::Variant& variant)
 	{
 		if (variant.is_void())
 			return null_value();
 
 		const auto& type = variant.type();
+		const auto* variant_type_name = type.name();
+		if (variant_type_name && *variant_type_name == "null")
+			return null_value();
 		const auto [kind, byte_size] = classify(type);
 		switch (kind)
 		{
@@ -320,9 +374,7 @@ namespace rml::dotnet
 			const auto* instance = variant.try_cast<RBX::Instance*>();
 			return instance ? instance_value(reinterpret_cast<uintptr_t>(*instance)) : null_value();
 		}
-		case MarshalKind::String:
-			return strings ? string_value(variant.try_cast<std::string>()->c_str(), *strings) :
-			                 string_value(variant.try_cast<std::string>()->c_str());
+		case MarshalKind::String: return string_value(variant.try_cast<std::string>()->c_str());
 		case MarshalKind::Buffer:
 		{
 			// RBX::LuauBuffer owns its bytes through a shared allocation whose
@@ -337,8 +389,8 @@ namespace rml::dotnet
 			if (header->end < header->begin || header->capacity < header->end)
 				return null_value();
 			const auto size = static_cast<size_t>(header->end - header->begin);
-			if (size > static_cast<size_t>(INT32_MAX) ||
-			    (size != 0 && !utils::memory::is_valid_pointer(reinterpret_cast<uintptr_t>(header->begin))))
+			if (size > static_cast<size_t>(INT32_MAX)
+			    || (size != 0 && !utils::memory::is_valid_pointer(reinterpret_cast<uintptr_t>(header->begin))))
 				return null_value();
 			return bytes_value(std::span<const std::byte>(header->begin, size));
 		}
@@ -370,7 +422,8 @@ namespace rml::dotnet
 	InteropVariant TypeMarshaler::encode_property(const RBX::Reflection::PropertyDescriptor* descriptor, const RBX::Reflection::DescribedBase* instance)
 	{
 		const auto* type_ptr = descriptor ? descriptor->type() : nullptr;
-		if (!type_ptr) return null_value();
+		if (!type_ptr)
+			return null_value();
 		const auto& type = *type_ptr;
 		const auto [kind, byte_size] = classify(type);
 
@@ -387,7 +440,9 @@ namespace rml::dotnet
 		{
 			const auto* desc_name = descriptor ? descriptor->name() : nullptr;
 			const auto* type_name = type.name();
-			RML_WARN("Unsupported property type '{}' for get_property('{}')", type_name ? type_name->c_str() : "", desc_name ? desc_name->c_str() : "");
+			RML_WARN("Unsupported property type '{}' for get_property('{}')",
+			    type_name ? type_name->c_str() : "",
+			    desc_name ? desc_name->c_str() : "");
 			return null_value();
 		}
 
@@ -395,6 +450,7 @@ namespace rml::dotnet
 		descriptor->get_variant(instance, variant);
 		if (variant.is_void())
 			return null_value();
+		const VariantValueGuard guard{variant};
 
 		if (kind == MarshalKind::Sequence)
 			return pack_sequence(variant.try_cast<std::byte>(), byte_size);
@@ -408,7 +464,8 @@ namespace rml::dotnet
 	bool TypeMarshaler::decode_property(const RBX::Reflection::PropertyDescriptor* descriptor, RBX::Reflection::DescribedBase* instance, const InteropVariant& value)
 	{
 		const auto* type_ptr = descriptor ? descriptor->type() : nullptr;
-		if (!type_ptr) return false;
+		if (!type_ptr)
+			return false;
 		const auto& type = *type_ptr;
 		const auto plan = classify(type);
 
@@ -442,9 +499,7 @@ namespace rml::dotnet
 			header.end = keys + static_cast<size_t>(count < 0 ? 0 : count) * plan.byte_size;
 			header.capacity = header.end;
 
-			RBX::Property property(*descriptor, instance);
-			property.set(*reinterpret_cast<const blittable_blob<sizeof(engine_vector_header)>*>(&header));
-			return true;
+			return set_property_variant(*descriptor, instance, type, &header, sizeof(header));
 		}
 
 		if (plan.kind == MarshalKind::Blittable)
@@ -452,21 +507,7 @@ namespace rml::dotnet
 			if (value.tag != InteropValueTag::Blittable || value.as_instance == 0)
 				return false;
 
-			const auto* bytes = reinterpret_cast<const void*>(value.as_instance);
-			RBX::Property property(*descriptor, instance);
-
-			switch (plan.byte_size)
-			{
-			case 4: property.set(*static_cast<const blittable_blob<4>*>(bytes)); return true;
-			case 6: property.set(*static_cast<const blittable_blob<6>*>(bytes)); return true;
-			case 8: property.set(*static_cast<const blittable_blob<8>*>(bytes)); return true;
-			case 12: property.set(*static_cast<const blittable_blob<12>*>(bytes)); return true;
-			case 16: property.set(*static_cast<const blittable_blob<16>*>(bytes)); return true;
-			case 24: property.set(*static_cast<const blittable_blob<24>*>(bytes)); return true;
-			case 48: property.set(*static_cast<const blittable_blob<48>*>(bytes)); return true;
-			case 60: property.set(*static_cast<const blittable_blob<60>*>(bytes)); return true;
-			default: return false;
-			}
+			return set_property_variant(*descriptor, instance, type, reinterpret_cast<const void*>(value.as_instance), plan.byte_size);
 		}
 
 		if (plan.kind == MarshalKind::Bool)
@@ -474,8 +515,7 @@ namespace rml::dotnet
 			bool decoded = false;
 			if (!read_bool(value, decoded))
 				return false;
-			RBX::Property(*descriptor, instance).set<bool>(decoded);
-			return true;
+			return set_property_variant(*descriptor, instance, type, &decoded, sizeof(decoded));
 		}
 
 		if (plan.kind == MarshalKind::Float)
@@ -483,8 +523,8 @@ namespace rml::dotnet
 			double decoded = 0.0;
 			if (!read_double(value, decoded))
 				return false;
-			RBX::Property(*descriptor, instance).set<float>(static_cast<float>(decoded));
-			return true;
+			const auto typed_value = static_cast<float>(decoded);
+			return set_property_variant(*descriptor, instance, type, &typed_value, sizeof(typed_value));
 		}
 
 		if (plan.kind == MarshalKind::Double)
@@ -492,8 +532,7 @@ namespace rml::dotnet
 			double decoded = 0.0;
 			if (!read_double(value, decoded))
 				return false;
-			RBX::Property(*descriptor, instance).set<double>(decoded);
-			return true;
+			return set_property_variant(*descriptor, instance, type, &decoded, sizeof(decoded));
 		}
 
 		if (plan.kind == MarshalKind::Enum || plan.kind == MarshalKind::Number)
@@ -502,17 +541,18 @@ namespace rml::dotnet
 			if (!read_int64(value, decoded))
 				return false;
 
-			RBX::Property property(*descriptor, instance);
 			if (type.type_id() == RBX::Reflection::TypeId::Int64 || type.type_id() == RBX::Reflection::TypeId::Integer)
-				property.set<int64_t>(decoded);
-			else
-				property.set<int>(static_cast<int>(decoded));
-			return true;
+				return set_property_variant(*descriptor, instance, type, &decoded, sizeof(decoded));
+
+			const auto typed_value = static_cast<int>(decoded);
+			return set_property_variant(*descriptor, instance, type, &typed_value, sizeof(typed_value));
 		}
 
 		const auto* desc_name = descriptor ? descriptor->name() : nullptr;
 		const auto* type_name = type.name();
-		RML_WARN("Unsupported property type '{}' for set_property('{}')", type_name ? type_name->c_str() : "", desc_name ? desc_name->c_str() : "");
+		RML_WARN("Unsupported property type '{}' for set_property('{}')",
+		    type_name ? type_name->c_str() : "",
+		    desc_name ? desc_name->c_str() : "");
 		return false;
 	}
 
@@ -524,8 +564,8 @@ namespace rml::dotnet
 		const auto plan = classify(*type);
 		out.set_type_and_ops(type,
 		    plan.kind == MarshalKind::InstanceArray ? g_instances_ops :
-		    plan.kind == MarshalKind::Buffer        ? g_buffer_ops :
-		                                               value_ops);
+		        plan.kind == MarshalKind::Buffer    ? g_buffer_ops :
+		                                              value_ops);
 		void* const storage = out.storage();
 
 		switch (plan.kind)
@@ -572,8 +612,8 @@ namespace rml::dotnet
 				return false;
 
 			const auto* bytes = reinterpret_cast<const InteropBytes*>(value.as_instance);
-			if (bytes->size > static_cast<uint64_t>(INT32_MAX) ||
-			    (bytes->size != 0 && !utils::memory::is_valid_pointer(reinterpret_cast<uintptr_t>(bytes->data))))
+			if (bytes->size > static_cast<uint64_t>(INT32_MAX)
+			    || (bytes->size != 0 && !utils::memory::is_valid_pointer(reinterpret_cast<uintptr_t>(bytes->data))))
 			{
 				return false;
 			}
@@ -643,6 +683,14 @@ namespace rml::dotnet
 			auto* slot = reinterpret_cast<std::shared_ptr<const RBX::Reflection::Tuple>*>(return_slot_address);
 			out = marshal_tuple(slot ? slot->get() : nullptr);
 			std::destroy_at(slot);
+			return;
+		}
+		case MarshalKind::Variant:
+		{
+			auto* slot = reinterpret_cast<RBX::Reflection::Variant*>(return_slot_address);
+			out = slot ? encode_variant(*slot) : null_value();
+			if (slot)
+				destroy_variant_value(*slot);
 			return;
 		}
 		case MarshalKind::InstanceArray:

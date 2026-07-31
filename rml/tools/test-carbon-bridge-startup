@@ -83,15 +83,15 @@ for _ in $(seq 1 60); do
 		fi
 	done < <(find "$REGISTRY" -maxdepth 1 -type f -name '*.json' -printf '%f\n' 2>/dev/null || true)
 	if [[ -n "$new_record" ]]; then
-		endpoint=$(jq -r '.wslEndpoint // .endpoint' "$REGISTRY/$new_record")
+		endpoint=$(jq -r '.endpoint' "$REGISTRY/$new_record")
 		token=$(jq -r '.token' "$REGISTRY/$new_record")
-		if ! diagnostic=$(curl --fail --silent --show-error \
-			--connect-timeout 5 \
-			--max-time 15 \
-			-H "Authorization: Bearer $token" \
-			-X POST \
-			--data '' \
-			"${endpoint%/}/v1/diagnostics/rejected-yield"); then
+		if ! diagnostic=$(CARBON_TEST_ENDPOINT="${endpoint%/}/v1/diagnostics/rejected-yield" \
+			CARBON_TEST_TOKEN="$token" \
+			powershell.exe -NoProfile -Command '
+				$headers = @{ Authorization = "Bearer $env:CARBON_TEST_TOKEN" }
+				(Invoke-WebRequest -UseBasicParsing -Method Post `
+					-Uri $env:CARBON_TEST_ENDPOINT -Headers $headers -TimeoutSec 15).Content
+			' | tr -d '\r'); then
 			echo "FAIL: rejected-yield diagnostic did not answer within 15 seconds" >&2
 			exit 1
 		fi
