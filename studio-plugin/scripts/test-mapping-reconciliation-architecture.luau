@@ -5,6 +5,7 @@ local fs = require("@lune/fs")
 local core = fs.readFile("src/Core/init.luau")
 local reconciler = fs.readFile("src/Core/MappingReconciler.luau")
 local client = fs.readFile("src/Client/init.luau")
+local app = fs.readFile("src/App/init.luau")
 
 assert(
 	not string.find(core, "Watcher", 1, true)
@@ -40,12 +41,18 @@ assert(
 		and string.find(reconciler, "function MappingReconciler:prime(client, project)", 1, true),
 	"managed connection must bind the disposable build's mapped identities before the first filesystem update"
 )
+assert(
+	string.find(core, "self.reconciler = reconciler or MappingReconciler.new()", 1, true)
+		and string.find(app, "self.managedReloadReconciler = self.core.reconciler", 1, true)
+		and string.find(app, "Core.new(self.host, self.port, expectedWorktree, self.managedReloadReconciler)", 1, true),
+	"managed reload must preserve mapped identity state so removed mappings are deleted from Studio"
+)
 
 local startupCapture = assert(string.find(core, "self.client:requestManifestCapture(nil, true):expect()", 1, true))
 local startupReconcile = assert(string.find(core, "local report = self:__reconcileMappings()", startupCapture, true))
 assert(
-	startupCapture < startupReconcile and string.find(client, '"capture/request?forceFull=true"', 1, true),
-	"an untrusted or retained-ledger attach must fully capture Studio before mapped reconciliation"
+	startupCapture < startupReconcile and string.find(client, 'table.insert(query, "forceFull=true")', 1, true),
+	"an ordinary untrusted attach must fully capture Studio before mapped reconciliation"
 )
 
 local primeStart = assert(string.find(reconciler, "function MappingReconciler:prime", 1, true))

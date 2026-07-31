@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::{
 	io::Result,
 	net::TcpListener,
-	sync::{atomic::AtomicBool, mpsc::Receiver, Arc, OnceLock},
+	sync::{
+		atomic::{AtomicBool, AtomicU8, Ordering},
+		mpsc::Receiver,
+		Arc, OnceLock,
+	},
 	time::Duration,
 };
 
@@ -31,11 +35,18 @@ mod unsubscribe;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeControl {
 	Shutdown,
+	Reload,
 }
+
+const MAX_AUTOMATIC_RELOAD_RETRIES: u8 = 3;
 
 #[derive(Clone)]
 pub struct ServeControlSender {
 	sender: crossbeam_channel::Sender<ServeControl>,
+	reload_pending: Arc<AtomicBool>,
+	reload_again: Arc<AtomicBool>,
+	reload_failed: Arc<AtomicBool>,
+	reload_retry_attempts: Arc<AtomicU8>,
 }
 
 impl ServeControlSender {
@@ -43,17 +54,103 @@ impl ServeControlSender {
 		&self,
 		control: ServeControl,
 	) -> std::result::Result<(), crossbeam_channel::TrySendError<ServeControl>> {
-		self.sender.try_send(control)
+		if control == ServeControl::Reload {
+			self.reload_failed.store(false, Ordering::Release);
+			self.reload_retry_attempts.store(0, Ordering::Release);
+		}
+		self.try_enqueue(control)
+	}
+
+	fn try_enqueue(
+		&self,
+		control: ServeControl,
+	) -> std::result::Result<(), crossbeam_channel::TrySendError<ServeControl>> {
+		if control == ServeControl::Reload && self.reload_pending.swap(true, Ordering::AcqRel) {
+			self.reload_again.store(true, Ordering::Release);
+			return Ok(());
+		}
+		match self.sender.try_send(control) {
+			Ok(()) => Ok(()),
+			Err(error) => {
+				if control == ServeControl::Reload {
+					self.reload_pending.store(false, Ordering::Release);
+				}
+				Err(error)
+			}
+		}
 	}
 
 	pub fn send(&self, control: ServeControl) -> std::result::Result<(), crossbeam_channel::SendError<ServeControl>> {
-		self.sender.send(control)
+		if control == ServeControl::Reload {
+			self.reload_failed.store(false, Ordering::Release);
+			self.reload_retry_attempts.store(0, Ordering::Release);
+		}
+		if control == ServeControl::Reload && self.reload_pending.swap(true, Ordering::AcqRel) {
+			self.reload_again.store(true, Ordering::Release);
+			return Ok(());
+		}
+		match self.sender.send(control) {
+			Ok(()) => Ok(()),
+			Err(error) => {
+				if control == ServeControl::Reload {
+					self.reload_pending.store(false, Ordering::Release);
+				}
+				Err(error)
+			}
+		}
+	}
+
+	pub fn fail_reload(&self, retry: bool) {
+		self.reload_pending.store(false, Ordering::Release);
+		self.reload_failed.store(retry, Ordering::Release);
+		if self.reload_again.swap(false, Ordering::AcqRel) {
+			self.reload_failed.store(false, Ordering::Release);
+			let _ = self.try_send(ServeControl::Reload);
+			return;
+		}
+		if !retry {
+			return;
+		}
+		let attempt = self.reload_retry_attempts.fetch_add(1, Ordering::AcqRel) + 1;
+		if attempt > MAX_AUTOMATIC_RELOAD_RETRIES {
+			self.reload_failed.store(false, Ordering::Release);
+			return;
+		}
+		let retry = self.clone();
+		std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(100 * (1_u64 << (attempt - 1))));
+			retry.retry_failed_reload();
+		});
+	}
+
+	pub fn retry_failed_reload(&self) {
+		if self.reload_failed.swap(false, Ordering::AcqRel) {
+			let _ = self.try_enqueue(ServeControl::Reload);
+		}
+	}
+
+	pub fn acknowledge_reload(&self) {
+		self.reload_failed.store(false, Ordering::Release);
+		self.reload_pending.store(false, Ordering::Release);
+		self.reload_retry_attempts.store(0, Ordering::Release);
+		if self.reload_again.swap(false, Ordering::AcqRel) {
+			let _ = self.try_send(ServeControl::Reload);
+		}
 	}
 }
 
 pub fn serve_control_channel() -> (ServeControlSender, crossbeam_channel::Receiver<ServeControl>) {
 	let (sender, receiver) = crossbeam_channel::unbounded();
-	(ServeControlSender { sender }, receiver)
+	(
+		ServeControlSender {
+			sender,
+			reload_pending: Arc::new(AtomicBool::new(false)),
+			reload_again: Arc::new(AtomicBool::new(false)),
+			reload_failed: Arc::new(AtomicBool::new(false)),
+			reload_retry_attempts: Arc::new(AtomicU8::new(0)),
+		},
+		receiver,
+	)
 }
 
 #[derive(Debug, Clone, Serialize, FromOne)]
@@ -62,6 +159,7 @@ pub enum Message {
 	RestartRequired(RestartRequired),
 	ExecuteCode(ExecuteCode),
 	Disconnect(Disconnect),
+	ManagedReload(ManagedReload),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +182,15 @@ pub struct ExecuteCode {
 #[derive(Debug, Clone, Serialize)]
 pub struct Disconnect {
 	pub message: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedReload {
+	pub transition_id: String,
+	pub project_name: String,
+	pub source_generation: String,
+	pub worktree_id: String,
+	pub session_token: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -110,6 +217,13 @@ impl Server {
 			port,
 			external_stop_requested: Arc::new(AtomicBool::new(false)),
 		}
+	}
+
+	pub fn external_stop_requested(&self) -> bool {
+		self.external_stop_requested.load(Ordering::Acquire)
+	}
+	pub(crate) fn external_stop_signal(&self) -> Arc<AtomicBool> {
+		Arc::clone(&self.external_stop_requested)
 	}
 
 	#[actix_web::main]
@@ -179,13 +293,15 @@ impl Server {
 			}
 		});
 
-		self.run_with_listener_control(listener, control_receiver, move |ServeControl::Shutdown| {
-			if let Ok(mut lock) = shutdown.lock() {
-				if let Some(f) = lock.take() {
-					f();
+		self.run_with_listener_control(listener, control_receiver, move |control| match control {
+			ServeControl::Shutdown | ServeControl::Reload => {
+				if let Ok(mut lock) = shutdown.lock() {
+					if let Some(f) = lock.take() {
+						f();
+					}
 				}
+				true
 			}
-			true
 		})
 		.await
 	}
@@ -320,7 +436,7 @@ pub fn format_address(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 	fn test_core() -> Arc<Core> {
 		let temp_dir = std::env::temp_dir().join(format!("carbon-test-server-{}", uuid::Uuid::new_v4()));
@@ -332,12 +448,127 @@ mod tests {
 	}
 
 	#[test]
-	fn serve_control_forwards_shutdown() {
-		let (sender, receiver) = serve_control_channel();
+	fn managed_reload_serialization_is_camel_case() {
+		let reload = ManagedReload {
+			transition_id: "tx-123".into(),
+			project_name: "RenamedGame".into(),
+			source_generation: "gen-234".into(),
+			worktree_id: "wt-456".into(),
+			session_token: "tok-789".into(),
+		};
+		let json = serde_json::to_value(&reload).unwrap();
+		assert_eq!(json["transitionId"], "tx-123");
+		assert_eq!(json["projectName"], "RenamedGame");
+		assert_eq!(json["sourceGeneration"], "gen-234");
+		assert_eq!(json["worktreeId"], "wt-456");
+		assert_eq!(json["sessionToken"], "tok-789");
 
+		let message = Message::ManagedReload(reload);
+		let msg_json = serde_json::to_value(&message).unwrap();
+		assert_eq!(msg_json["ManagedReload"]["transitionId"], "tx-123");
+		assert_eq!(msg_json["ManagedReload"]["projectName"], "RenamedGame");
+		assert_eq!(msg_json["ManagedReload"]["sourceGeneration"], "gen-234");
+		assert_eq!(msg_json["ManagedReload"]["worktreeId"], "wt-456");
+		assert_eq!(msg_json["ManagedReload"]["sessionToken"], "tok-789");
+	}
+
+	#[test]
+	fn serve_control_latches_reload_behind_shutdown_and_replays_inflight_change() {
+		let (sender, receiver) = serve_control_channel();
 		sender.send(ServeControl::Shutdown).unwrap();
+		sender.try_send(ServeControl::Reload).unwrap();
+		sender.try_send(ServeControl::Reload).unwrap();
+
 		assert_eq!(receiver.recv().unwrap(), ServeControl::Shutdown);
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
 		assert!(receiver.try_recv().is_err());
+
+		sender.acknowledge_reload();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+		sender.acknowledge_reload();
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[test]
+	fn failed_reload_retries_on_the_next_duplicate_event() {
+		let (sender, receiver) = serve_control_channel();
+		sender.try_send(ServeControl::Reload).unwrap();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+
+		sender.fail_reload(true);
+		assert!(receiver.try_recv().is_err());
+		sender.retry_failed_reload();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+
+		sender.acknowledge_reload();
+		sender.retry_failed_reload();
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[test]
+	fn permanent_reload_failure_waits_for_a_new_source_revision() {
+		let (sender, receiver) = serve_control_channel();
+		sender.try_send(ServeControl::Reload).unwrap();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+
+		sender.fail_reload(false);
+		std::thread::sleep(Duration::from_millis(150));
+		assert!(receiver.try_recv().is_err());
+
+		sender.try_send(ServeControl::Reload).unwrap();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+	}
+
+	#[test]
+	fn transient_reload_retries_are_bounded_until_a_new_source_revision() {
+		let (sender, receiver) = serve_control_channel();
+		sender.try_send(ServeControl::Reload).unwrap();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+
+		for _ in 0..3 {
+			sender.fail_reload(true);
+			assert_eq!(
+				receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+				ServeControl::Reload
+			);
+		}
+		sender.fail_reload(true);
+		assert!(receiver.recv_timeout(Duration::from_millis(150)).is_err());
+
+		sender.try_send(ServeControl::Reload).unwrap();
+		assert_eq!(receiver.recv().unwrap(), ServeControl::Reload);
+	}
+
+	#[test]
+	fn server_control_reload_callback_false_keeps_server_live_and_true_stops() {
+		let core = test_core();
+		let port = get_free_port("127.0.0.1", 20000);
+		let server = Server::new(core, "127.0.0.1", port);
+		let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+		let (control_sender, control_receiver) = serve_control_channel();
+		let call_count = Arc::new(AtomicUsize::new(0));
+		let call_count_cb = call_count.clone();
+		let callback_sender = control_sender.clone();
+		let handle = std::thread::spawn(move || {
+			server.start_with_listener_control(listener, control_receiver, move |control| {
+				let count = call_count_cb.fetch_add(1, Ordering::SeqCst);
+				match control {
+					ServeControl::Reload if count == 0 => {
+						callback_sender.fail_reload(true);
+						false
+					}
+					ServeControl::Reload => {
+						callback_sender.acknowledge_reload();
+						true
+					}
+					ServeControl::Shutdown => true,
+				}
+			})
+		});
+		std::thread::sleep(Duration::from_millis(50));
+		control_sender.send(ServeControl::Reload).unwrap();
+		assert!(handle.join().unwrap().is_ok());
+		assert_eq!(call_count.load(Ordering::SeqCst), 2);
 	}
 
 	#[test]

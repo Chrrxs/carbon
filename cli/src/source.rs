@@ -61,6 +61,8 @@ pub struct SourceDetails {
 	worktree_id: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	session_token: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	managed_reload_transition_id: Option<String>,
 }
 
 impl SourceDetails {
@@ -76,6 +78,7 @@ impl SourceDetails {
 			source_generation: None,
 			worktree_id: None,
 			session_token: None,
+			managed_reload_transition_id: None,
 		}
 	}
 
@@ -102,6 +105,11 @@ impl SourceDetails {
 
 	pub fn with_session_token(mut self, session_token: String) -> Self {
 		self.session_token = Some(session_token);
+		self
+	}
+
+	pub fn with_managed_reload_transition(mut self, transition_id: String) -> Self {
+		self.managed_reload_transition_id = Some(transition_id);
 		self
 	}
 }
@@ -137,6 +145,16 @@ mod tests {
 		assert_eq!(value["sessionToken"], "session");
 		assert_eq!(value["sourceRootRef"], serde_json::to_value(root).unwrap());
 		assert!(value.get("worktreeId").is_none());
+	}
+
+	#[test]
+	fn managed_reload_details_publish_the_pending_transition() {
+		let value = serde_json::to_value(
+			SourceDetails::new("Reloaded".to_owned(), vec![], true)
+				.with_managed_reload_transition("transition-1".to_owned()),
+		)
+		.unwrap();
+		assert_eq!(value["managedReloadTransitionId"], "transition-1");
 	}
 
 	#[test]

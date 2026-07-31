@@ -30,7 +30,7 @@ Mapped source is one-way and filesystem-authoritative:
 - Studio drift beneath a mapping never writes back and is overwritten by the next valid filesystem update;
 - that reconciliation removes invalid Studio-only descendants and reports each removal explicitly;
 - invalid mapped source leaves the last valid realization active; and
-- a project-file change hard-faults the session, disconnects Studio, and requires `serve` to restart.
+- a project-file change reconnects automatically, applies the replacement mapping topology, and is acknowledged only after a transition-bound full capture proves it.
 
 The plugin does not write Studio changes into mapped files or project mappings.
 

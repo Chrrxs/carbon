@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mode="$1"
+project="$2"
+backup="$3"
+temporary="${project}.qualification-reload.$$"
+project_dir="$(dirname -- "$project")"
+mapped_dir="${project_dir}/qualification-manifest-reload"
+case "$mode" in
+  trigger)
+    cp -- "$project" "$backup"
+    command -v jq >/dev/null 2>&1 || {
+      printf 'jq is required to rewrite the qualification project name\n' >&2
+      exit 1
+    }
+    mkdir -p -- "$mapped_dir"
+    printf 'return "carbon-managed-reload-module"\n' > "${mapped_dir}/equip_weapon.luau"
+    jq '.name += "-Reloaded" | .tree.ServerStorage.DevUtils = {"$path": "qualification-manifest-reload"}' "$project" > "$temporary"
+    mv -- "$temporary" "$project"
+    printf 'manifest reload with project rename and mapped subtree triggered atomically\n'
+    ;;
+  restore)
+    if [[ ! -f "$backup" ]]; then
+      rm -f -- "${mapped_dir}/equip_weapon.luau"
+      rmdir -- "$mapped_dir" 2>/dev/null || true
+      printf 'manifest restore skipped; no backup was created\n'
+      exit 0
+    fi
+    cp -- "$backup" "$temporary"
+    mv -- "$temporary" "$project"
+    rm -f -- "$backup"
+    printf 'manifest restored atomically\n'
+    ;;
+  *)
+    printf 'usage: %s trigger|restore PROJECT BACKUP\n' "$0" >&2
+    exit 2
+    ;;
+esac

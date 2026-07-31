@@ -91,9 +91,11 @@ cause chain, and recovery command. After inspecting or restarting the broker,
 explicitly select direct lifecycle for a subsequent attempt with
 `CARBON_STUDIO_LIFECYCLE=direct carbon serve`.
 
-Mapping topology is frozen
-for the session, so restart `serve` after changing the project file. Filesystem
-edits beneath a mapping reconcile authoritatively; Studio edits beneath a
+Project-file changes reload automatically in the existing `serve` process.
+Carbon first captures authored Studio state, then reconnects the plugin to the
+replacement mapping contract; the reload is complete only after Studio applies
+and proves that topology with a transition-bound capture. Filesystem edits
+beneath a mapping reconcile authoritatively, while Studio edits beneath a
 mapping never write back to source.
 
 ## Canonical files

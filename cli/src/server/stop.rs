@@ -12,27 +12,23 @@ use crate::{
 };
 
 const DISCONNECTED_STOP_MESSAGE: &str = "Studio disconnected; latest committed manifest retained";
-const RESTART_REQUIRED_STOP_MESSAGE: &str = "Serve requires hard restart; latest committed manifest retained";
+const PENDING_RELOAD_STOP_MESSAGE: &str = "Synchronization reload incomplete; latest committed manifest retained";
 
-fn settle_stop<RestartRequired, Connected, Capture>(
-	restart_required: RestartRequired,
-	connected: Connected,
-	capture: Capture,
-) -> Result<String>
+fn settle_stop<Pending, Connected, Capture>(pending: Pending, connected: Connected, capture: Capture) -> Result<String>
 where
-	RestartRequired: Fn() -> bool,
+	Pending: Fn() -> bool,
 	Connected: Fn() -> bool,
 	Capture: FnOnce() -> Result<String>,
 {
-	if restart_required() {
-		return Ok(RESTART_REQUIRED_STOP_MESSAGE.to_owned());
+	if pending() {
+		return Ok(PENDING_RELOAD_STOP_MESSAGE.to_owned());
 	}
 	if !connected() {
 		return Ok(DISCONNECTED_STOP_MESSAGE.to_owned());
 	}
 	match capture() {
 		Ok(message) => Ok(message),
-		Err(_) if restart_required() => Ok(RESTART_REQUIRED_STOP_MESSAGE.to_owned()),
+		Err(_) if pending() => Ok(PENDING_RELOAD_STOP_MESSAGE.to_owned()),
 		Err(_) if !connected() => Ok(DISCONNECTED_STOP_MESSAGE.to_owned()),
 		Err(error) => Err(error),
 	}
@@ -50,11 +46,11 @@ async fn main(
 	};
 	stop_requested.store(true, Ordering::Release);
 
-	info!("Carbon stop requested; settling the committed manifest boundary before shutdown");
+	info!("Carbon stop requested; capturing the connected Studio place before shutdown");
 	let shutdown_core = Arc::clone(core.get_ref());
 	let capture = actix_web::rt::task::spawn_blocking(move || {
 		settle_stop(
-			|| shutdown_core.requires_hard_restart(),
+			|| shutdown_core.has_pending_managed_reload(),
 			|| shutdown_core.queue().has_subscribers(),
 			|| shutdown_core.capture_before_shutdown(),
 		)
@@ -69,9 +65,9 @@ async fn main(
 
 	match capture {
 		Ok(Ok(message)) => {
-			info!("Carbon stop manifest boundary settled: {message}");
+			info!("Automatic Capture Manifest completed before Carbon stop: {message}");
 			HttpResponse::Ok().body(format!(
-				"Manifest boundary settled: {message}. Carbon stopped successfully"
+				"Capture Manifest completed: {message}. Carbon stopped successfully"
 			))
 		}
 		Ok(Err(capture_error)) => {
@@ -146,26 +142,6 @@ mod tests {
 	}
 
 	#[test]
-	fn stop_retains_the_latest_capture_when_serve_requires_restart() {
-		let capture_calls = Cell::new(0);
-		let message = settle_stop(
-			|| true,
-			|| true,
-			|| {
-				capture_calls.set(capture_calls.get() + 1);
-				anyhow::bail!("capture must not run")
-			},
-		)
-		.unwrap();
-
-		assert_eq!(
-			message,
-			"Serve requires hard restart; latest committed manifest retained"
-		);
-		assert_eq!(capture_calls.get(), 0);
-	}
-
-	#[test]
 	fn stop_tolerates_a_disconnect_while_capture_starts() {
 		let connected = Cell::new(true);
 		let message = settle_stop(
@@ -179,5 +155,22 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(message, "Studio disconnected; latest committed manifest retained");
+	}
+
+	#[test]
+	fn stop_retains_the_latest_capture_during_managed_reload() {
+		let capture_calls = Cell::new(0);
+		let message = settle_stop(
+			|| true,
+			|| true,
+			|| {
+				capture_calls.set(capture_calls.get() + 1);
+				anyhow::bail!("capture must not run")
+			},
+		)
+		.unwrap();
+
+		assert_eq!(message, PENDING_RELOAD_STOP_MESSAGE);
+		assert_eq!(capture_calls.get(), 0);
 	}
 }

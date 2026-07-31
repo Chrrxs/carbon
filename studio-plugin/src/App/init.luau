@@ -85,6 +85,7 @@ function App.new()
 	local self = setmetatable({}, App)
 
 	self.core = nil
+	self.managedReloadReconciler = nil
 	self.connectionMarker = nil
 	self.liveSessionMarker = nil
 	self.lastUpdate = os.clock()
@@ -355,8 +356,9 @@ function App:connect()
 	local project = Value({})
 	local canceled = false
 	local loading = true
+	local expectedWorktree = self.managedWorktree and self.managedWorktree.project
 
-	self.core = Core.new(self.host, self.port, self.managedWorktree and self.managedWorktree.project)
+	self.core = Core.new(self.host, self.port, expectedWorktree, self.managedReloadReconciler)
 
 	task.spawn(function()
 		task.wait(0.2)
@@ -426,6 +428,7 @@ function App:connect()
 
 	self.core:onReady(function(projectDetails)
 		loading = false
+		self.managedReloadReconciler = nil
 		project:set(projectDetails)
 
 		self.lastSync:set(os.time())
@@ -472,6 +475,17 @@ function App:connect()
 		if Core.wasExitGraceful(err) or canceled then
 			self:disconnect()
 			self:home()
+			return
+		end
+
+		if err.kind == "ManagedReload" then
+			-- The replacement manifest may remove mappings that are absent from its
+			-- own hierarchy. Carry the old source-ID bindings across this one managed
+			-- reconnect so reconciliation can delete those obsolete Studio objects.
+			self.managedReloadReconciler = self.core.reconciler
+			self:disconnect()
+			task.wait(RECONNECT_INTERVAL)
+			self:connect()
 			return
 		end
 

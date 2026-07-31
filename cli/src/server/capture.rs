@@ -9,11 +9,14 @@ use crate::core::Core;
 pub(crate) struct CaptureOptions {
 	#[serde(default)]
 	force_full: bool,
+	#[serde(default)]
+	managed_reload_transition_id: Option<String>,
 }
 
 #[post("/capture/request")]
 pub(crate) async fn initiate(options: web::Query<CaptureOptions>, core: Data<Arc<Core>>) -> impl Responder {
-	match core.begin_manifest_capture_mode(options.force_full) {
+	match core.begin_manifest_capture_mode_transition(options.force_full, options.managed_reload_transition_id.clone())
+	{
 		Ok(capture_status) => HttpResponse::Ok().json(capture_status),
 		Err(error) => HttpResponse::Conflict().body(format!("{error:#}")),
 	}

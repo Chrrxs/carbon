@@ -463,10 +463,21 @@ end
 
 function Client:requestManifestCapture(
 	onStatus: ((status: Types.ManifestCaptureStatus) -> ())?,
-	forceFull: boolean?
+	forceFull: boolean?,
+	managedReloadTransitionId: string?
 ): Promise.TypedPromise<Types.ManifestCaptureStatus>
 	Log.trace("Client request: Capture Manifest")
-	local endpoint = if forceFull == true then "capture/request?forceFull=true" else "capture/request"
+	local query = {}
+	if forceFull == true then
+		table.insert(query, "forceFull=true")
+	end
+	if managedReloadTransitionId ~= nil then
+		table.insert(query, `managedReloadTransitionId={HttpService:UrlEncode(managedReloadTransitionId)}`)
+	end
+	local endpoint = "capture/request"
+	if #query > 0 then
+		endpoint ..= `?{table.concat(query, "&")}`
+	end
 	return Http.post(self:getUrl(endpoint)):andThen(function(response)
 		local started = HttpService:JSONDecode(response.Body) :: Types.ManifestCaptureStatus
 		local lastMessage = nil

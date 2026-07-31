@@ -28,14 +28,14 @@ local Core = {
 }
 Core.__index = Core
 
-function Core.new(host: string?, port: number?, expectedWorktree: Types.Project?)
+function Core.new(host: string?, port: number?, expectedWorktree: Types.Project?, reconciler: any?)
 	local self = setmetatable({}, Core)
 	self.project = nil
 	self.status = Core.Status.Disconnected
 	self.expectedWorktree = expectedWorktree
 	self.client = Client.new(host or Config.HOST, port or Config:get("Port"))
 	self.executor = Executor.new()
-	self.reconciler = MappingReconciler.new()
+	self.reconciler = reconciler or MappingReconciler.new()
 	self.tree = self.reconciler.tree
 	self.privilegedCapabilities = nil
 
@@ -109,6 +109,7 @@ function Core:run(): Promise.Promise
 		local project = self.client:fetchDetails():expect()
 		self:__verifyProject(project):expect()
 		self.project = project
+		local managedReloadTransitionId = self.expectedWorktree and self.expectedWorktree.managedReloadTransitionId
 
 		local trustedBuiltPlace = InitialReconciliation.isTrustedBuiltPlace(project, self.expectedWorktree)
 		if not self.expectedWorktree then
@@ -164,7 +165,28 @@ function Core:run(): Promise.Promise
 			return reject(Error.new(Error.ManifestIdentityUnsupported))
 		end
 
-		if trustedBuiltPlace then
+		if managedReloadTransitionId ~= nil then
+			-- The replacement Core describes a new mapping contract. Reconcile that
+			-- contract before capturing so Studio can prove the replacement topology;
+			-- the transition-bound capture is the server's acknowledgement boundary.
+			if privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then
+				local identityBootstrap = self.client:bootstrapManifestIdentities():expect()
+				if identityBootstrap.authoritative ~= true then
+					return reject(Error.new(Error.ManifestIdentityRejected))
+				end
+			end
+			Log.trace("Reconciling replacement filesystem mappings before managed reload acknowledgement..")
+			local report = self:__reconcileMappings()
+			self.tree = self.reconciler.tree
+			Log.debug("Managed reload mapping reconciliation:", report.instances, "instances")
+
+			local captureStatus = self.client:requestManifestCapture(nil, true, managedReloadTransitionId):expect()
+			self:__advanceSourceGeneration(captureStatus.sourceGeneration)
+			self.expectedWorktree.managedReloadTransitionId = nil
+			project = self.client:fetchDetails():expect()
+			self:__verifyProject(project):expect()
+			self.project = project
+		elseif trustedBuiltPlace then
 			if privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then
 				local identityBootstrap = self.client:bootstrapManifestIdentities():expect()
 				if identityBootstrap.authoritative ~= true then
@@ -319,6 +341,12 @@ function Core:__verifyProject(project: Types.Project): Promise.Promise
 				Error.new(Error.WorktreeContract, "source generation does not match; rebuild the place")
 			)
 		end
+		if
+			expected.managedReloadTransitionId ~= nil
+			and project.managedReloadTransitionId ~= expected.managedReloadTransitionId
+		then
+			return Promise.reject(Error.new(Error.WorktreeContract, "managed reload transition does not match"))
+		end
 	end
 	return Promise.resolve()
 end
@@ -373,6 +401,34 @@ function Core:__startSyncLoop()
 			elseif kind == "RestartRequired" then
 				self.status = Core.Status.Disconnecting
 				return reject(Error.new(Error.RestartRequired, data.message))
+			elseif kind == "ManagedReload" then
+				local valid = type(data) == "table"
+					and type(data.transitionId) == "string"
+					and data.transitionId ~= ""
+					and type(data.projectName) == "string"
+					and data.projectName ~= ""
+					and type(data.sourceGeneration) == "string"
+					and data.sourceGeneration ~= ""
+					and type(data.worktreeId) == "string"
+					and type(data.sessionToken) == "string"
+					and self.expectedWorktree ~= nil
+					and self.expectedWorktree.worktreeId ~= nil
+					and self.expectedWorktree.sessionToken ~= nil
+					and data.worktreeId == self.expectedWorktree.worktreeId
+					and data.sessionToken == self.expectedWorktree.sessionToken
+
+				if valid then
+					-- The old generation was captured before the transition. Trust
+					-- the authenticated replacement generation so reconnect does not
+					-- race a redundant pre-reconciliation capture against source sync.
+					self.expectedWorktree.name = data.projectName
+					self.expectedWorktree.sourceGeneration = data.sourceGeneration
+					self.expectedWorktree.managedReloadTransitionId = data.transitionId
+					self.status = Core.Status.Disconnecting
+					return reject(Error.new(Error.ManagedReload, data.transitionId))
+				else
+					return reject(Error.new(Error.UnknownEvent, kind, data))
+				end
 			elseif kind == "ExecuteCode" then
 				self.executor:execute(data.code)
 			elseif kind == "Disconnect" then
