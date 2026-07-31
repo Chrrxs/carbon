@@ -2976,6 +2976,22 @@ impl Serialize for MappingWireProperties<'_> {
 	}
 }
 
+struct MappingWireAttributes<'a>(&'a Attributes);
+
+impl Serialize for MappingWireAttributes<'_> {
+	fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		use serde::ser::SerializeMap;
+		let mut map = serializer.serialize_map(Some(self.0.len()))?;
+		for (name, value) in self.0 {
+			map.serialize_entry(name, &MappingWireVariant(value))?;
+		}
+		map.end()
+	}
+}
+
 struct MappingWireVariant<'a>(&'a Variant);
 
 impl Serialize for MappingWireVariant<'_> {
@@ -4288,6 +4304,50 @@ mod tests {
 	fn temp(name: &str) -> PathBuf {
 		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
 		std::env::temp_dir().join(format!("carbon-artifact-{name}-{unique}"))
+	}
+
+	#[derive(Deserialize)]
+	struct WireSourcePage {
+		instances: Vec<WirePropertySnapshot>,
+	}
+
+	#[derive(Deserialize)]
+	struct WirePropertySnapshot {
+		properties: BTreeMap<String, WireVariant>,
+	}
+
+	#[derive(Deserialize)]
+	enum WireVariant {
+		Attributes(BTreeMap<String, WireVariant>),
+		BinaryString(serde_bytes::ByteBuf),
+	}
+	#[test]
+	fn mapping_source_page_encodes_nested_binary_attributes_as_msgpack_bytes() {
+		let payload = b"captured-binary-attribute".to_vec();
+		let nested = Attributes::new().with("Binary", BinaryString::from(payload.clone()));
+		let attributes = Attributes::new().with("Nested", Variant::Attributes(nested));
+		let page = SourcePage {
+			instances: vec![PropertySnapshot {
+				id: Ref::new(),
+				properties: UstrMap::from_iter([(Ustr::from("Attributes"), Variant::Attributes(attributes))]),
+			}],
+			cursor: None,
+			done: true,
+			encoded_bytes: 0,
+		};
+
+		let encoded = rmp_serde::to_vec_named(&MappingSourcePage(&page)).unwrap();
+		let decoded: WireSourcePage = rmp_serde::from_slice(&encoded).unwrap();
+		let WireVariant::Attributes(attributes) = &decoded.instances[0].properties["Attributes"] else {
+			panic!("top-level Attributes lost its tagged map representation");
+		};
+		let WireVariant::Attributes(nested) = &attributes["Nested"] else {
+			panic!("nested Attributes lost its tagged map representation");
+		};
+		let WireVariant::BinaryString(bytes) = &nested["Binary"] else {
+			panic!("nested BinaryString lost its tagged binary representation");
+		};
+		assert_eq!(bytes.as_ref(), payload);
 	}
 
 	fn fixture(root: Ref, child: Ref, properties: UstrMap<Variant>) -> Snapshot {

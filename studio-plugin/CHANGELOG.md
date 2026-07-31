@@ -8,6 +8,10 @@ All notable Carbon Studio plugin changes are documented here.
 
 - Studio-owned reflection descriptors now come automatically from the exact installed Studio build; the bundled database only supplies Carbon-specific adapters and historical aliases.
 
+### Fixed
+
+- Managed Studio launches now bind to the bridge for the exact spawned session before capability negotiation and retry transient startup handoff failures instead of stalling.
+
 ## [0.1.0] - 2026-07-17
 
 ### Added

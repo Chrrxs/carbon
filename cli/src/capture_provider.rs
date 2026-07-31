@@ -16,7 +16,7 @@ use std::{
 
 use crate::privileged_bridge::Bridge;
 use rbx_dom_weak::{
-	types::{Attributes, Ref},
+	types::{Attributes, Ref, Variant},
 	Ustr,
 };
 
@@ -367,7 +367,16 @@ fn semantic_shell_property_value(property: &CaptureShellProperty) -> Cow<'_, [u8
 		return Cow::Borrowed(&property.value);
 	};
 	for name in CAPTURE_TRANSIENT_ATTRIBUTE_NAMES {
-		attributes.remove(*name);
+		if *name != "__MCPPlaceId"
+			|| attributes.get(*name).is_some_and(|value| match value {
+				Variant::String(value) => uuid::Uuid::parse_str(value).is_ok(),
+				Variant::BinaryString(value) => {
+					std::str::from_utf8(value.as_ref()).is_ok_and(|value| uuid::Uuid::parse_str(value).is_ok())
+				}
+				_ => false,
+			}) {
+			attributes.remove(*name);
+		}
 	}
 	let mut normalized = Vec::new();
 	if attributes.to_writer(&mut normalized).is_err() {
@@ -1254,11 +1263,11 @@ mod tests {
 
 	#[test]
 	fn semantic_fingerprint_ignores_transport_attributes_but_covers_authored_attributes() {
-		fn encoded_attributes(project: &str, authored: &str) -> Vec<u8> {
+		fn encoded_attributes(project: &str, mcp_place_id: &str, authored: &str) -> Vec<u8> {
 			let attributes = rbx_dom_weak::types::Attributes::new()
 				.with("__StudioWorktree_CarbonProject", project)
 				.with("__StudioWorktree_CarbonGeneration", format!("generation-{project}"))
-				.with("__MCPPlaceId", format!("mcp-{project}"))
+				.with("__MCPPlaceId", mcp_place_id)
 				.with("Authored", authored);
 			let mut bytes = Vec::new();
 			attributes.to_writer(&mut bytes).unwrap();
@@ -1270,17 +1279,23 @@ mod tests {
 			owner_ordinal: 1,
 			property: "Attributes".to_owned(),
 			type_name: "BinaryString".to_owned(),
-			value: encoded_attributes("before", "keep"),
+			value: encoded_attributes("before", "11111111-2222-3333-4444-555555555555", "keep"),
 		}];
 		let fingerprint = original.semantic_fingerprint();
 
 		let mut transport_changed = original.clone();
-		transport_changed.shell_properties[0].value = encoded_attributes("after", "keep");
+		transport_changed.shell_properties[0].value =
+			encoded_attributes("after", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "keep");
 		assert_eq!(fingerprint, transport_changed.semantic_fingerprint());
 
-		let mut authored_changed = original;
-		authored_changed.shell_properties[0].value = encoded_attributes("before", "changed");
+		let mut authored_changed = original.clone();
+		authored_changed.shell_properties[0].value =
+			encoded_attributes("before", "11111111-2222-3333-4444-555555555555", "changed");
 		assert_ne!(fingerprint, authored_changed.semantic_fingerprint());
+
+		let mut authored_marker = original;
+		authored_marker.shell_properties[0].value = encoded_attributes("before", "authored-collision", "keep");
+		assert_ne!(fingerprint, authored_marker.semantic_fingerprint());
 	}
 
 	#[test]

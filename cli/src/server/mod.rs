@@ -322,6 +322,7 @@ impl Server {
 			loop {
 				match control_receiver.try_recv() {
 					Ok(control) => {
+						let graceful_stop = control == ServeControl::Shutdown;
 						let callback = Arc::clone(&control_callback);
 						let should_stop = actix_web::rt::task::spawn_blocking(move || {
 							callback.lock().unwrap_or_else(|error| error.into_inner())(control)
@@ -329,6 +330,11 @@ impl Server {
 						.await
 						.unwrap_or(true);
 						if should_stop {
+							if graceful_stop {
+								// Match `/stop`'s response grace so a concurrent request can
+								// flush after both shutdown sources converge on one capture.
+								actix_web::rt::time::sleep(Duration::from_millis(50)).await;
+							}
 							handle.stop(false).await;
 							break;
 						}
@@ -352,7 +358,6 @@ impl Server {
 		let stop_handle: StopHandle = Arc::new(OnceLock::new());
 		let app_stop_handle = stop_handle.clone();
 		let stop_requested = Arc::clone(&self.external_stop_requested);
-
 		let server = HttpServer::new(move || {
 			let mut msgpack_config = MsgPackConfig::default();
 			msgpack_config.limit(MAX_PAYLOAD_SIZE);

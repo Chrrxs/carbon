@@ -19,7 +19,7 @@ use std::{
 	path::PathBuf,
 	sync::{
 		atomic::{AtomicBool, AtomicU8, Ordering},
-		Arc, Mutex, MutexGuard, RwLock,
+		Arc, Condvar, Mutex, MutexGuard, RwLock,
 	},
 	thread::{self, Builder},
 	time::{Duration, Instant, SystemTime},
@@ -78,6 +78,7 @@ pub struct Core {
 	qualification_export: Mutex<Option<QualificationExport>>,
 	restart_required: Arc<AtomicBool>,
 	managed_reload_transition: Mutex<Option<String>>,
+	shutdown_coordinator: ShutdownCoordinator,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +156,80 @@ impl ManifestCaptureStatus {
 			),
 			"running" => Ok(None),
 			state => anyhow::bail!("serve returned unknown Capture Manifest state '{state}'"),
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+enum ShutdownResult {
+	Success(String),
+	Error(String),
+}
+
+enum ShutdownCoordinatorState {
+	Unstarted,
+	InProgress,
+	Done(ShutdownResult),
+}
+
+pub(crate) struct ShutdownCoordinator {
+	state: Mutex<ShutdownCoordinatorState>,
+	condvar: Condvar,
+}
+
+impl ShutdownCoordinator {
+	pub fn new() -> Self {
+		Self {
+			state: Mutex::new(ShutdownCoordinatorState::Unstarted),
+			condvar: Condvar::new(),
+		}
+	}
+
+	pub fn execute_or_await<F>(&self, run: F) -> Result<String>
+	where
+		F: FnOnce() -> Result<String>,
+	{
+		let mut guard = self.state.lock().unwrap();
+		loop {
+			match &*guard {
+				ShutdownCoordinatorState::Done(result) => {
+					return match result {
+						ShutdownResult::Success(msg) => Ok(msg.clone()),
+						ShutdownResult::Error(err) => Err(anyhow::anyhow!("{err}")),
+					};
+				}
+				ShutdownCoordinatorState::InProgress => {
+					guard = self.condvar.wait(guard).unwrap();
+				}
+				ShutdownCoordinatorState::Unstarted => {
+					*guard = ShutdownCoordinatorState::InProgress;
+					drop(guard);
+
+					let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+						Ok(Ok(msg)) => ShutdownResult::Success(msg),
+						Ok(Err(err)) => ShutdownResult::Error(format!("{err:#}")),
+						Err(payload) => {
+							let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+								(*s).to_string()
+							} else if let Some(s) = payload.downcast_ref::<String>() {
+								s.clone()
+							} else {
+								"shutdown capture panicked".to_string()
+							};
+							ShutdownResult::Error(msg)
+						}
+					};
+
+					let mut guard = self.state.lock().unwrap();
+					*guard = ShutdownCoordinatorState::Done(result.clone());
+					self.condvar.notify_all();
+
+					return match result {
+						ShutdownResult::Success(msg) => Ok(msg),
+						ShutdownResult::Error(err) => Err(anyhow::anyhow!("{err}")),
+					};
+				}
+			}
 		}
 	}
 }
@@ -377,6 +452,29 @@ mod manifest_capture_retry_tests {
 		.unwrap_err();
 		assert!(error.downcast_ref::<project::ProjectSynchronizationPending>().is_some());
 		assert_eq!(waits.get(), 1);
+
+	}
+
+	#[test]
+	fn shutdown_capture_joins_an_active_manual_capture() {
+		let operation = |worker_active| {
+			Some(ManifestCaptureOperation {
+				request_id: "manual-capture".to_owned(),
+				client_id: 7,
+				source_generation: "served-generation".to_owned(),
+				state: "running".to_owned(),
+				message: Some("committing".to_owned()),
+				phase: Arc::new(AtomicU8::new(CAPTURE_COMMITTING)),
+				worker_active,
+			})
+		};
+		let active = operation(true);
+
+		let status = joinable_manifest_capture_status(&active).unwrap();
+		assert_eq!(status.request_id, "manual-capture");
+		assert_eq!(status.state, "running");
+
+		assert!(joinable_manifest_capture_status(&operation(false)).is_none());
 	}
 }
 
@@ -469,6 +567,22 @@ struct ManifestCaptureOperation {
 	message: Option<String>,
 	phase: Arc<AtomicU8>,
 	worker_active: bool,
+}
+
+fn manifest_capture_status(operation: &ManifestCaptureOperation) -> ManifestCaptureStatus {
+	ManifestCaptureStatus {
+		request_id: operation.request_id.clone(),
+		state: operation.state.clone(),
+		source_generation: operation.source_generation.clone(),
+		message: operation.message.clone(),
+	}
+}
+
+fn joinable_manifest_capture_status(operation: &Option<ManifestCaptureOperation>) -> Option<ManifestCaptureStatus> {
+	operation
+		.as_ref()
+		.filter(|capture| capture.worker_active)
+		.map(manifest_capture_status)
 }
 
 #[derive(Clone)]
@@ -669,6 +783,7 @@ impl Core {
 			qualification_export: Mutex::new(None),
 			restart_required,
 			managed_reload_transition: Mutex::new(None),
+			shutdown_coordinator: ShutdownCoordinator::new(),
 		})
 	}
 
@@ -775,7 +890,7 @@ impl Core {
 	}
 
 	pub fn begin_manifest_capture(self: &Arc<Self>) -> Result<ManifestCaptureStatus> {
-		self.begin_manifest_capture_mode(false)
+		self.begin_manifest_capture_mode_internal(false, false, None)
 	}
 
 	pub(crate) fn begin_managed_reload_transition(&self, transition_id: String) -> Result<()> {
@@ -837,11 +952,16 @@ impl Core {
 	}
 
 	pub fn capture_before_shutdown(self: &Arc<Self>) -> Result<String> {
-		wait_for_shutdown_capture(
+		self.shutdown_coordinator
+			.execute_or_await(|| self.do_capture_before_shutdown())
+	}
+
+	fn do_capture_before_shutdown(self: &Arc<Self>) -> Result<String> {
+		let capture_result = wait_for_shutdown_capture(
 			|| {
-				let status = self.begin_manifest_capture()?;
+				let status = self.begin_manifest_capture_mode_internal(false, true, None)?;
 				crate::carbon_info!(
-					"Automatic Capture Manifest {} started for served generation {}",
+					"Automatic shutdown is waiting for Capture Manifest {} for served generation {}",
 					status.request_id,
 					status.source_generation
 				);
@@ -849,11 +969,49 @@ impl Core {
 			},
 			|request_id| self.manifest_capture_status(request_id),
 			|| thread::sleep(SHUTDOWN_CAPTURE_POLL_INTERVAL),
-		)
+		);
+
+		match capture_result {
+			Ok(message) => Ok(message),
+			Err(error) => {
+				if self.is_studio_disconnected_error(&error) && self.has_valid_manifest_fallback() {
+					let message = format!(
+						"Studio is disconnected; retained valid manifest {}",
+						self.manifest_path.display()
+					);
+					crate::carbon_info!("{message}");
+					Ok(message)
+				} else {
+					Err(error)
+				}
+			}
+		}
+	}
+
+	fn is_studio_disconnected_error(&self, error: &anyhow::Error) -> bool {
+		if !self.queue.has_subscribers() {
+			return true;
+		}
+		let message = format!("{error:#}");
+		[
+			"disconnected",
+			"no connected client listener",
+			"exact connected Studio route",
+			"connected Studio place",
+			"connected Studio RML bridge",
+			"RML bridge is unavailable",
+			"bridge identity changed",
+		]
+		.iter()
+		.any(|keyword| message.contains(keyword))
+	}
+
+	fn has_valid_manifest_fallback(&self) -> bool {
+		artifact_store::validated_artifact_receipt(&self.manifest_path).is_ok()
 	}
 
 	pub(crate) fn begin_manifest_capture_mode(self: &Arc<Self>, force_full: bool) -> Result<ManifestCaptureStatus> {
-		self.begin_manifest_capture_mode_transition(force_full, None)
+		self.begin_manifest_capture_mode_internal(force_full, false, None)
 	}
 
 	pub(crate) fn begin_manifest_capture_mode_transition(
@@ -861,6 +1019,20 @@ impl Core {
 		force_full: bool,
 		managed_reload_transition_id: Option<String>,
 	) -> Result<ManifestCaptureStatus> {
+		self.begin_manifest_capture_mode_internal(force_full, false, managed_reload_transition_id)
+	}
+
+	fn begin_manifest_capture_mode_internal(
+		self: &Arc<Self>,
+		force_full: bool,
+		join_active: bool,
+		managed_reload_transition_id: Option<String>,
+	) -> Result<ManifestCaptureStatus> {
+		if join_active {
+			if let Some(status) = joinable_manifest_capture_status(&self.manifest_capture.lock().unwrap()) {
+				return Ok(status);
+			}
+		}
 		ensure!(
 			self.live_policy.is_some(),
 			"Capture Manifest requires an active served project"
@@ -886,20 +1058,28 @@ impl Core {
 		let source_generation = self.source_generation();
 		let request_id = uuid::Uuid::new_v4().simple().to_string();
 		let phase = Arc::new(AtomicU8::new(CAPTURE_COLLECTING));
-		{
+		let joined_status = {
 			let mut operation = self.manifest_capture.lock().unwrap();
-			if operation.as_ref().is_some_and(|capture| capture.worker_active) {
-				anyhow::bail!("another Capture Manifest operation is already running");
+			if let Some(status) = joinable_manifest_capture_status(&operation) {
+				if !join_active {
+					anyhow::bail!("another Capture Manifest operation is already running");
+				}
+				Some(status)
+			} else {
+				*operation = Some(ManifestCaptureOperation {
+					request_id: request_id.clone(),
+					client_id,
+					source_generation: source_generation.clone(),
+					state: "running".to_owned(),
+					message: Some("RML is acquiring one native Studio snapshot lease".to_owned()),
+					phase: phase.clone(),
+					worker_active: true,
+				});
+				None
 			}
-			*operation = Some(ManifestCaptureOperation {
-				request_id: request_id.clone(),
-				client_id,
-				source_generation: source_generation.clone(),
-				state: "running".to_owned(),
-				message: Some("RML is acquiring one native Studio snapshot lease".to_owned()),
-				phase: phase.clone(),
-				worker_active: true,
-			});
+		};
+		if let Some(status) = joined_status {
+			return Ok(status);
 		}
 		let core = Arc::clone(self);
 		let worker_request_id = request_id.clone();
@@ -1897,12 +2077,7 @@ impl Core {
 			operation.state = "failed".to_owned();
 			operation.message = Some("Studio disconnected before Capture Manifest completed".to_owned());
 		}
-		Ok(ManifestCaptureStatus {
-			request_id: operation.request_id.clone(),
-			state: operation.state.clone(),
-			source_generation: operation.source_generation.clone(),
-			message: operation.message.clone(),
-		})
+		Ok(manifest_capture_status(operation))
 	}
 
 	pub fn fail_manifest_capture(&self, request_id: &str, message: String) {

@@ -78,7 +78,6 @@ public sealed class DiscoveryRegistryTests : IDisposable
                 rmlBuildVersion = "test",
                 bridgeId,
                 endpoint = "http://127.0.0.1:1/",
-                wslEndpoint = (string?)null,
                 token = "secret",
                 processId,
             }));

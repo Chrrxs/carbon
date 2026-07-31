@@ -155,6 +155,99 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(message, "Studio disconnected; latest committed manifest retained");
+
+	}
+
+	#[test]
+	fn concurrent_shutdown_signal_and_stop_convergence() {
+		use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+		let coordinator = Arc::new(crate::core::ShutdownCoordinator::new());
+		let capture_calls = Arc::new(AtomicUsize::new(0));
+		let cleanup_started = Arc::new(AtomicBool::new(false));
+
+		let mut handles = Vec::new();
+		for _ in 0..10 {
+			let coordinator = Arc::clone(&coordinator);
+			let capture_calls = Arc::clone(&capture_calls);
+			let cleanup_started = Arc::clone(&cleanup_started);
+			handles.push(std::thread::spawn(move || {
+				let result = coordinator.execute_or_await(|| {
+					capture_calls.fetch_add(1, Ordering::SeqCst);
+					std::thread::sleep(Duration::from_millis(50));
+					Ok("Capture Manifest completed".to_owned())
+				});
+				assert!(
+					!cleanup_started.load(Ordering::SeqCst),
+					"cleanup occurred before capture settled"
+				);
+				result
+			}));
+		}
+
+		for handle in handles {
+			let message = handle.join().unwrap().unwrap();
+			assert_eq!(message, "Capture Manifest completed");
+		}
+
+		assert_eq!(capture_calls.load(Ordering::SeqCst), 1);
+		cleanup_started.store(true, Ordering::SeqCst);
+
+		let idempotent = coordinator
+			.execute_or_await(|| {
+				capture_calls.fetch_add(1, Ordering::SeqCst);
+				Ok("Re-run should not happen".to_owned())
+			})
+			.unwrap();
+		assert_eq!(idempotent, "Capture Manifest completed");
+		assert_eq!(capture_calls.load(Ordering::SeqCst), 1);
+	}
+
+	#[test]
+	fn disconnected_with_last_manifest_success() {
+		let directory = std::env::temp_dir().join(format!("carbon-stop-disconnected-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&directory).unwrap();
+		let manifest_path = directory.join("place.carbon");
+		let tree = crate::core::tree::Tree::new(
+			crate::core::snapshot::Snapshot::new()
+				.with_id(rbx_dom_weak::types::Ref::new())
+				.with_class("DataModel")
+				.with_name("DisconnectedTest"),
+		);
+		crate::artifact_store::extract_tree(&tree, "DisconnectedTest".to_owned(), &manifest_path).unwrap();
+
+		let core = Arc::new(Core::new_artifact(&manifest_path).unwrap());
+		assert!(core.queue().single_listener_id().is_err());
+
+		let result = core.capture_before_shutdown().unwrap();
+		assert!(result.contains("Studio is disconnected; retained valid manifest"));
+		assert!(result.contains("place.carbon"));
+
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn disconnected_no_manifest_failure() {
+		let directory = std::env::temp_dir().join(format!("carbon-stop-no-manifest-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&directory).unwrap();
+		let manifest_path = directory.join("place.carbon");
+		let tree = crate::core::tree::Tree::new(
+			crate::core::snapshot::Snapshot::new()
+				.with_id(rbx_dom_weak::types::Ref::new())
+				.with_class("DataModel")
+				.with_name("NoManifestTest"),
+		);
+		crate::artifact_store::extract_tree(&tree, "NoManifestTest".to_owned(), &manifest_path).unwrap();
+
+		let core = Arc::new(Core::new_artifact(&manifest_path).unwrap());
+		assert!(core.queue().single_listener_id().is_err());
+
+		std::fs::remove_file(&manifest_path).unwrap();
+
+		let error = core.capture_before_shutdown().unwrap_err();
+		assert!(error.to_string().contains("active served project"), "{error:#}");
+
+		std::fs::remove_dir_all(directory).unwrap();
 	}
 
 	#[test]

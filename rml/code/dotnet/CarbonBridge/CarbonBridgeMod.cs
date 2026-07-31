@@ -3,7 +3,6 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -42,7 +41,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private static readonly TimeSpan AttestedManagedSnapshotQuietPeriod = TimeSpan.FromMilliseconds(250);
     internal static readonly TimeSpan ManagedSnapshotRetryPeriod = TimeSpan.FromMilliseconds(100);
     internal static readonly TimeSpan ManagedSnapshotReadinessTimeout = TimeSpan.FromSeconds(30);
-    internal static readonly TimeSpan ProvisionalDataModelLease = TimeSpan.FromSeconds(2);
 
 
     [DllImport("roblox_modloader.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -269,13 +267,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private CancellationTokenSource? _shutdown;
     private HttpListener? _listener;
     private Task? _listenerTask;
-    private TcpListener? _wslProxy;
-    private Task? _wslProxyTask;
     private Timer? _launchHydratedDefaultsTimer;
     private CaptureLeaseManager? _captureLeases;
     private DataModel? _dataModel;
     private nuint _detachedEditDataModelHandle;
-    private long _provisionalDataModelAttachedAt;
 
     private SerializedPropertyAccess.EngineThreadPump? _engineThreadPump;
     private Timer? _managedSnapshotTimer;
@@ -284,7 +279,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private string _token = string.Empty;
     private string _bridgeId = string.Empty;
     private string _endpoint = string.Empty;
-    private string? _wslEndpoint;
     private string _discoveryPath = string.Empty;
     private string _routeDiscoveryPath = string.Empty;
     private long _changeSequence;
@@ -343,14 +337,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         _listener.Prefixes.Add(_endpoint);
         _listener.Start();
         _listenerTask = Task.Run(() => ListenAsync(_shutdown.Token));
-        _wslEndpoint = StartWslProxy(port, _shutdown.Token);
-
         _discoveryPath = DiscoveryPath();
         Directory.CreateDirectory(IOPath.GetDirectoryName(_discoveryPath)!);
         WriteDiscovery(null);
-        Logger.Info(_wslEndpoint is null
-            ? $"Carbon bridge listening on {_endpoint}"
-            : $"Carbon bridge listening on {_endpoint} (WSL proxy {_wslEndpoint})");
+        Logger.Info($"Carbon bridge listening on {_endpoint}");
         return 0;
     }
 
@@ -368,12 +358,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
             if (_dataModel is { } currentDataModel)
             {
-                var attachedFor = _provisionalDataModelAttachedAt == 0
-                    ? TimeSpan.Zero
-                    : Stopwatch.GetElapsedTime(_provisionalDataModelAttachedAt);
-                if (!ShouldReplaceProvisionalEditDataModel(
-                        currentDataModel.Equals(dataModel),
-                        attachedFor))
+                if (!ShouldReplaceUnauthenticatedEditDataModel(
+                        currentDataModel.Equals(dataModel)))
                 {
                     return;
                 }
@@ -383,9 +369,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
         if (provisionalDataModelToDetach is not null)
         {
-            Logger.Info(
-                $"Replacing unauthenticated DataModel after {ProvisionalDataModelLease.TotalSeconds:F0} seconds");
-            DetachDataModel(provisionalDataModelToDetach);
+            Logger.Info("Replacing unauthenticated DataModel selected by the native scheduler");
+            DetachDataModel(provisionalDataModelToDetach, nativeTreeAvailable: false);
         }
 
 
@@ -404,7 +389,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         lock (_engineStateLock)
         {
             _dataModel = dataModel;
-            _provisionalDataModelAttachedAt = Stopwatch.GetTimestamp();
         }
         // Exact-property requests identify every snapshot node by Studio's
         // debug identity. DataModel itself is not a descendant, so it never
@@ -532,7 +516,9 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
     public void OnDataModelUnloaded(DataModel dataModel, DataModelType dataModelType)
     {
-        DetachDataModel(dataModel);
+        // Native teardown can be reported after the underlying Instance tree
+        // has already been destroyed.
+        DetachDataModel(dataModel, nativeTreeAvailable: false);
     }
 
     public override void OnUnload()
@@ -546,19 +532,11 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         _launchHydratedDefaultsTimer?.Dispose();
         _launchHydratedDefaultsTimer = null;
         _captureLeases?.CancelActive();
-        _wslProxy?.Stop();
         _listener?.Stop();
         _listener?.Close();
         try
         {
             _listenerTask?.Wait(TimeSpan.FromSeconds(2));
-        }
-        catch
-        {
-        }
-        try
-        {
-            _wslProxyTask?.Wait(TimeSpan.FromSeconds(2));
         }
         catch
         {
@@ -588,7 +566,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         _captureDirtyPages.Dispose();
     }
 
-    private void DetachDataModel(DataModel dataModel)
+    private void DetachDataModel(DataModel dataModel, bool nativeTreeAvailable = true)
     {
         if (_dataModel is not { } currentDataModel || !currentDataModel.Equals(dataModel))
         {
@@ -600,11 +578,21 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         // generation while the old serializer is still returning.
         _captureLeases?.CancelActive();
 
+        // EventManager disconnects independent native connection holders by
+        // stable handle, so this also clears its managed subscription table
+        // after the Instance itself has gone away.
         dataModel.DescendantAdded -= OnDescendantAdded;
         dataModel.DescendantRemoving -= OnDescendantRemoving;
         ArmLaunchHydratedDefaultsTimer(Timeout.InfiniteTimeSpan);
         Interlocked.Exchange(ref _managedSnapshotPending, 0);
-        DestroyLiveSessionMarker();
+        if (nativeTreeAvailable)
+        {
+            DestroyLiveSessionMarker();
+        }
+        else
+        {
+            _liveSessionMarker = null;
+        }
         _propertyObservation?.Dispose();
         _propertyObservation = null;
         _captureDirtyPages.Reset();
@@ -623,7 +611,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _studioIdentity = null;
             _detachedEditDataModelHandle = InstanceHierarchy.RuntimeHandle(dataModel);
             _dataModel = null;
-            _provisionalDataModelAttachedAt = 0;
             Interlocked.Exchange(ref _excludedEditCameraHandle, 0);
         }
 
@@ -1273,18 +1260,34 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                     pendingHandles = new(_pendingLaunchHydratedRootDefaultRefreshes);
                     _pendingLaunchHydratedRootDefaultRefreshes.Clear();
                 }
-                var roots = dataModel.GetChildren()
-                    .Where(instance => pendingHandles.Contains(
-                        InstanceHierarchy.RuntimeHandle(instance)))
-                    .ToArray();
-                var (defaults, failures) = CaptureLaunchHydratedRootDefaults(roots);
-                lock (_managedHierarchyLock)
+                if (pendingHandles.Count == 0)
                 {
-                    RefreshPendingLaunchHydratedRootDefaults(
-                        _launchHydratedRootDefaults,
-                        defaults,
-                        pendingHandles);
-                    _launchHydratedDefaultFailures = failures;
+                    return true;
+                }
+
+                try
+                {
+                    var roots = dataModel.GetChildren()
+                        .Where(instance => pendingHandles.Contains(
+                            InstanceHierarchy.RuntimeHandle(instance)))
+                        .ToArray();
+                    var (defaults, failures) = CaptureLaunchHydratedRootDefaults(roots);
+                    lock (_managedHierarchyLock)
+                    {
+                        RefreshPendingLaunchHydratedRootDefaults(
+                            _launchHydratedRootDefaults,
+                            defaults,
+                            pendingHandles);
+                        _launchHydratedDefaultFailures = failures;
+                    }
+                }
+                catch
+                {
+                    lock (_managedHierarchyLock)
+                    {
+                        _pendingLaunchHydratedRootDefaultRefreshes.UnionWith(pendingHandles);
+                    }
+                    throw;
                 }
                 return true;
             }, cancellationToken);
@@ -1295,8 +1298,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         catch (Exception error)
         {
             Logger.Info($"Managed launch defaults refresh deferred: {error.Message}");
+            ArmLaunchHydratedDefaultsTimer(ManagedSnapshotRetryPeriod);
         }
     }
+
 
     private void OnItemChanged(Instance instance, string propertyName)
     {
@@ -1554,10 +1559,9 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         IsEditDataModelCandidate(dataModelType)
         && !hasAuthenticatedEditDataModel;
 
-    internal static bool ShouldReplaceProvisionalEditDataModel(
-        bool sameDataModel,
-        TimeSpan attachedFor) =>
-        !sameDataModel && attachedFor >= ProvisionalDataModelLease;
+    internal static bool ShouldReplaceUnauthenticatedEditDataModel(
+        bool sameDataModel) =>
+        !sameDataModel;
 
 
     internal static bool IsManagedBaselineReadyMarker(
@@ -2589,92 +2593,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         }
     }
 
-    private string? StartWslProxy(int loopbackPort, CancellationToken cancellationToken)
-    {
-        var address = FindWslAddress();
-        if (address is null)
-        {
-            return null;
-        }
-
-        try
-        {
-            _wslProxy = new TcpListener(address, 0);
-            _wslProxy.Start();
-            var proxyPort = ((IPEndPoint)_wslProxy.LocalEndpoint).Port;
-            _wslProxyTask = Task.Run(() => ProxyWslAsync(loopbackPort, cancellationToken));
-            return $"http://{address}:{proxyPort}/";
-        }
-        catch (Exception ex)
-        {
-            _wslProxy?.Stop();
-            _wslProxy = null;
-            ReportWarning($"Carbon bridge could not start its WSL proxy: {ex.Message}");
-            return null;
-        }
-    }
-
-    private async Task ProxyWslAsync(int loopbackPort, CancellationToken cancellationToken)
-    {
-        while (!cancellationToken.IsCancellationRequested && _wslProxy is { } listener)
-        {
-            TcpClient incoming;
-            try
-            {
-                incoming = await listener.AcceptTcpClientAsync(cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (SocketException) when (cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-
-            _ = Task.Run(() => ProxyConnectionAsync(incoming, loopbackPort, cancellationToken), cancellationToken);
-        }
-    }
-
-    private static async Task ProxyConnectionAsync(
-        TcpClient incoming,
-        int loopbackPort,
-        CancellationToken cancellationToken)
-    {
-        using (incoming)
-        using (var outgoing = new TcpClient(AddressFamily.InterNetwork))
-        using (var connectionShutdown = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
-        {
-            try
-            {
-                incoming.NoDelay = true;
-                outgoing.NoDelay = true;
-                await outgoing.ConnectAsync(IPAddress.Loopback, loopbackPort, connectionShutdown.Token);
-                var inbound = incoming.GetStream();
-                var outbound = outgoing.GetStream();
-                var upload = inbound.CopyToAsync(outbound, connectionShutdown.Token);
-                var download = outbound.CopyToAsync(inbound, connectionShutdown.Token);
-                await Task.WhenAny(upload, download);
-                connectionShutdown.Cancel();
-                try
-                {
-                    await Task.WhenAll(upload, download);
-                }
-                catch (OperationCanceledException)
-                {
-                }
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (SocketException)
-            {
-            }
-            catch (IOException)
-            {
-            }
-        }
-    }
 
     private async Task HandleAsync(HttpListenerContext context, CancellationToken cancellationToken)
     {
@@ -6941,7 +6859,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             rmlBuildVersion,
             bridgeId = _bridgeId,
             endpoint = _endpoint,
-            wslEndpoint = _wslEndpoint,
             token = _token,
             processId = Environment.ProcessId,
             studioSessionId = identity?.StudioSessionId,
@@ -7105,28 +7022,6 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         return ((IPEndPoint)listener.LocalEndpoint).Port;
     }
 
-    private static IPAddress? FindWslAddress()
-    {
-        foreach (var network in NetworkInterface.GetAllNetworkInterfaces())
-        {
-            if (!network.Name.Contains("WSL", StringComparison.OrdinalIgnoreCase)
-                && !network.Description.Contains("WSL", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            foreach (var unicast in network.GetIPProperties().UnicastAddresses)
-            {
-                if (unicast.Address.AddressFamily == AddressFamily.InterNetwork
-                    && !IPAddress.IsLoopback(unicast.Address))
-                {
-                    return unicast.Address;
-                }
-            }
-        }
-
-        return null;
-    }
 
     internal sealed record EngineWork(
         long Generation,

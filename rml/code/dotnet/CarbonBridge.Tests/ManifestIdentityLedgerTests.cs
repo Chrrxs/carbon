@@ -72,6 +72,7 @@ public sealed class ManifestIdentityLedgerTests
             ManifestIdentityAttributeCodec.Decode(serialized, "Workspace", "Workspace"));
     }
 
+
     [Fact]
     public void SerializedAttributesRejectWrongMarkerTypeDuplicateAndMalformedBlobs()
     {
@@ -114,6 +115,10 @@ public sealed class ManifestIdentityLedgerTests
         var baseline = SerializeAttributes(
         [
             new("Canonical", 0x02, StringValue("keep")),
+        ]);
+        var authoredMarkerBaseline = SerializeAttributes(
+        [
+            new("Canonical", 0x02, StringValue("keep")),
             new("__MCPPlaceId", 0x02, StringValue("authored-value")),
         ]);
         var transportOnly = SerializeAttributes(
@@ -134,6 +139,9 @@ public sealed class ManifestIdentityLedgerTests
 
         Assert.True(ManifestIdentityAttributeCodec.MatchesIgnoringTransportMcpPlaceId(
             baseline,
+            transportOnly));
+        Assert.False(ManifestIdentityAttributeCodec.MatchesIgnoringTransportMcpPlaceId(
+            authoredMarkerBaseline,
             transportOnly));
         Assert.False(ManifestIdentityAttributeCodec.MatchesIgnoringTransportMcpPlaceId(
             baseline,

@@ -35,6 +35,7 @@ internal static class ManifestIdentityAttributeCodec
         }
     }
 
+
     internal static bool MatchesIgnoringTransportMcpPlaceId(
         ReadOnlySpan<byte> baseline,
         ReadOnlySpan<byte> live)
@@ -49,7 +50,12 @@ internal static class ManifestIdentityAttributeCodec
             {
                 return false;
             }
-            baselineAttributes.Remove("__MCPPlaceId");
+            if (baselineAttributes.TryGetValue("__MCPPlaceId", out var baselineTransport)
+                && baselineTransport.TypeId == 0x02
+                && StringValueIsUuid(baselineTransport.Value))
+            {
+                baselineAttributes.Remove("__MCPPlaceId");
+            }
             if (baselineAttributes.Count != liveAttributes.Count)
             {
                 return false;

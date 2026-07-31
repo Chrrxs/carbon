@@ -9,7 +9,6 @@ use std::{
 	collections::{HashMap, HashSet},
 	env, fs,
 	io::{self, Read, Write},
-	net::Ipv4Addr,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 	sync::{mpsc, Arc},
@@ -28,7 +27,6 @@ struct Discovery {
 	rml_build_version: String,
 	bridge_id: String,
 	endpoint: String,
-	wsl_endpoint: Option<String>,
 	token: String,
 	process_id: u32,
 	#[serde(default)]
@@ -689,6 +687,22 @@ impl Bridge {
 		connect_timeout: Duration,
 		request_timeout: Duration,
 	) -> Result<Self> {
+		Self::from_path_with_timeouts_for_platform(
+			path,
+			expected_bridge_id,
+			connect_timeout,
+			request_timeout,
+			env::var_os("WSL_DISTRO_NAME").is_some(),
+		)
+	}
+
+	fn from_path_with_timeouts_for_platform(
+		path: &Path,
+		expected_bridge_id: Option<&str>,
+		connect_timeout: Duration,
+		request_timeout: Duration,
+		is_wsl: bool,
+	) -> Result<Self> {
 		let bytes = fs::read(path).with_context(|| format!("RML Carbon bridge is unavailable ({})", path.display()))?;
 		let discovery: Discovery = serde_json::from_slice(&bytes)
 			.with_context(|| format!("invalid RML Carbon bridge discovery file: {}", path.display()))?;
@@ -716,10 +730,8 @@ impl Bridge {
 		anyhow::ensure!(!discovery.token.is_empty(), "RML bridge discovery token is empty");
 
 		let loopback_port = parse_loopback_port(&discovery.endpoint)?;
-		let is_wsl = env::var_os("WSL_DISTRO_NAME").is_some();
-		let use_helper = is_wsl;
 
-		if use_helper {
+		if is_wsl {
 			let endpoint = discovery.endpoint.clone();
 			let transport = Transport::Helper {
 				port: loopback_port,
@@ -734,14 +746,7 @@ impl Bridge {
 				transport,
 			})
 		} else {
-			let endpoint = if is_wsl {
-				match discovery.wsl_endpoint.as_deref() {
-					Some(endpoint) => validate_wsl_endpoint(endpoint)?,
-					None => discovery.endpoint.clone(),
-				}
-			} else {
-				discovery.endpoint.clone()
-			};
+			let endpoint = discovery.endpoint.clone();
 			let client = Client::builder()
 				.connect_timeout(connect_timeout)
 				.timeout(request_timeout)
@@ -1109,47 +1114,6 @@ fn is_ready_bridge(discovery: &Discovery, capabilities: &Capabilities, process_i
 		&& capabilities.engine_generation != 0
 }
 
-fn validate_wsl_endpoint(endpoint: &str) -> Result<String> {
-	let gateway = wsl_default_gateway().context("WSL host gateway is unavailable")?;
-	let parsed = reqwest::Url::parse(endpoint).context("invalid RML WSL bridge endpoint")?;
-	anyhow::ensure!(parsed.scheme() == "http", "RML WSL bridge must use HTTP");
-	anyhow::ensure!(
-		parsed.host_str() == Some(&gateway.to_string()),
-		"RML WSL bridge host is not the WSL gateway"
-	);
-	anyhow::ensure!(parsed.port().is_some(), "RML WSL bridge endpoint has no port");
-	anyhow::ensure!(parsed.path() == "/", "RML WSL bridge endpoint has an invalid path");
-	anyhow::ensure!(
-		parsed.query().is_none() && parsed.fragment().is_none(),
-		"RML WSL bridge endpoint has extra data"
-	);
-	anyhow::ensure!(
-		parsed.username().is_empty() && parsed.password().is_none(),
-		"RML WSL bridge endpoint has credentials"
-	);
-	Ok(endpoint.to_owned())
-}
-
-fn wsl_default_gateway() -> Option<Ipv4Addr> {
-	parse_wsl_default_gateway(&fs::read_to_string("/proc/net/route").ok()?)
-}
-
-fn parse_wsl_default_gateway(routes: &str) -> Option<Ipv4Addr> {
-	for line in routes.lines().skip(1) {
-		let fields: Vec<_> = line.split_whitespace().collect();
-		if fields.len() < 4 || fields[1] != "00000000" {
-			continue;
-		}
-		let flags = u16::from_str_radix(fields[3], 16).ok()?;
-		if flags & 0x2 == 0 {
-			continue;
-		}
-		let raw = u32::from_str_radix(fields[2], 16).ok()?;
-		return Some(Ipv4Addr::from(raw.to_le_bytes()));
-	}
-	None
-}
-
 fn validate_bridge_id(bridge_id: &str) -> Result<()> {
 	anyhow::ensure!(
 		bridge_id.len() == 32 && bridge_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -1360,7 +1324,6 @@ mod tests {
 			rml_build_version: crate::rml::BUILD_VERSION.to_owned(),
 			bridge_id: "0123456789abcdef0123456789abcdef".to_owned(),
 			endpoint: "http://127.0.0.1:1234/".to_owned(),
-			wsl_endpoint: None,
 			token: "secret".to_owned(),
 			process_id: 42,
 			studio_session_id: None,
@@ -1424,7 +1387,6 @@ mod tests {
 			"rmlBuildVersion": crate::rml::BUILD_VERSION,
 			"bridgeId": "0123456789abcdef0123456789abcdef",
 			"endpoint": "http://example.com/",
-			"wslEndpoint": null,
 			"token": "secret",
 			"processId": 1
 		}))
@@ -1446,7 +1408,6 @@ mod tests {
 				"rmlBuildVersion": crate::rml::BUILD_VERSION,
 				"bridgeId": "0123456789abcdef0123456789abcdef",
 				"endpoint": "http://127.0.0.1:1/",
-				"wslEndpoint": null,
 				"token": "secret",
 				"processId": 1
 			}))
@@ -1478,7 +1439,6 @@ mod tests {
 				"rmlBuildVersion": "0.0.0+different-worktree",
 				"bridgeId": "0123456789abcdef0123456789abcdef",
 				"endpoint": "http://127.0.0.1:1/",
-				"wslEndpoint": null,
 				"token": "secret",
 				"processId": 1
 			}))
@@ -1517,12 +1477,6 @@ mod tests {
 			studio_route_key("studio-session", "studio-instance"),
 			studio_route_key("studio-session", "other-instance")
 		);
-	}
-
-	#[test]
-	fn parses_the_wsl_default_gateway() {
-		let routes = "Iface\tDestination\tGateway\tFlags\neth0\t00000000\t015019AC\t0003\n";
-		assert_eq!(parse_wsl_default_gateway(routes), Some(Ipv4Addr::new(172, 25, 80, 1)));
 	}
 
 	#[test]
@@ -1657,10 +1611,7 @@ mod tests {
 			writer: &mut dyn Write,
 		) -> Result<HelperExecutionResult> {
 			assert_eq!(request.method, "GET");
-			assert_eq!(
-				BASE64_STANDARD.decode(request.path_b64).unwrap(),
-				b"/v1/capabilities"
-			);
+			assert_eq!(BASE64_STANDARD.decode(request.path_b64).unwrap(), b"/v1/capabilities");
 			assert_eq!(request.port, 1234);
 			assert_eq!(request.stdin_payload, b"CBRQ0001\x06\x00\x00\x00secret");
 			let mut cursor = io::Cursor::new(&self.raw_stdout);
@@ -1690,9 +1641,8 @@ mod tests {
 	}
 
 	#[test]
-	fn backend_selection_uses_helper_when_wsl_and_wsl_endpoint_present() {
-		let (mut discovery, _) = discovery_and_capabilities(true, 1);
-		discovery.wsl_endpoint = Some("http://172.25.80.1:1234/".to_owned());
+	fn backend_selection_uses_helper_under_wsl() {
+		let (discovery, _) = discovery_and_capabilities(true, 1);
 		let path = env::temp_dir().join(format!(
 			"carbon-backend-selection-{}-{}.json",
 			std::process::id(),
@@ -1700,53 +1650,20 @@ mod tests {
 		));
 		fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
 
-		let old_env = env::var_os("WSL_DISTRO_NAME");
-		env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+		let bridge = Bridge::from_path_with_timeouts_for_platform(
+			&path,
+			None,
+			Duration::from_millis(100),
+			Duration::from_millis(100),
+			true,
+		)
+		.unwrap();
 
-		let bridge =
-			Bridge::from_path_with_timeouts(&path, None, Duration::from_millis(100), Duration::from_millis(100))
-				.unwrap();
-
-		if let Some(old) = old_env {
-			env::set_var("WSL_DISTRO_NAME", old);
-		} else {
-			env::remove_var("WSL_DISTRO_NAME");
-		}
 		fs::remove_file(&path).unwrap();
 
 		match bridge.transport {
 			Transport::Helper { port, .. } => assert_eq!(port, 1234),
-			Transport::Reqwest { .. } => panic!("expected Helper transport under WSL when wslEndpoint is present"),
-		}
-	}
-
-	#[test]
-	fn backend_selection_uses_helper_when_wsl_endpoint_absent() {
-		let (discovery, _) = discovery_and_capabilities(true, 1);
-		let path = env::temp_dir().join(format!(
-			"carbon-backend-selection-reqwest-{}-{}.json",
-			std::process::id(),
-			uuid::Uuid::new_v4().simple()
-		));
-		fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
-
-		let old_env = env::var_os("WSL_DISTRO_NAME");
-		env::set_var("WSL_DISTRO_NAME", "Ubuntu");
-
-		let bridge =
-			Bridge::from_path_with_timeouts(&path, None, Duration::from_millis(100), Duration::from_millis(100))
-				.unwrap();
-
-		if let Some(old) = old_env {
-			env::set_var("WSL_DISTRO_NAME", old);
-		} else {
-			env::remove_var("WSL_DISTRO_NAME");
-		}
-		fs::remove_file(&path).unwrap();
-
-		match bridge.transport {
-			Transport::Helper { port, .. } => assert_eq!(port, 1234),
-			Transport::Reqwest { .. } => panic!("expected Helper transport under WSL when wslEndpoint is absent"),
+			Transport::Reqwest { .. } => panic!("expected Helper transport under WSL"),
 		}
 	}
 

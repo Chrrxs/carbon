@@ -188,7 +188,25 @@ function Core:run(): Promise.Promise
 			self.project = project
 		elseif trustedBuiltPlace then
 			if privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then
-				local identityBootstrap = self.client:bootstrapManifestIdentities():expect()
+				local bootstrapManifestIdentities = function()
+					return self.client:bootstrapManifestIdentities():expect()
+				end
+				local bootstrapSuccess, bootstrapResult
+				if self.expectedWorktree then
+					bootstrapSuccess, bootstrapResult = BoundedRetry.runUntil(
+						bootstrapManifestIdentities,
+						waitForRetry,
+						function()
+							return self.status == Core.Status.Connecting
+						end
+					)
+				else
+					bootstrapSuccess, bootstrapResult = BoundedRetry.run(bootstrapManifestIdentities, waitForRetry)
+				end
+				if not bootstrapSuccess then
+					return reject(bootstrapResult)
+				end
+				local identityBootstrap = bootstrapResult
 				if identityBootstrap.authoritative ~= true then
 					return reject(Error.new(Error.ManifestIdentityRejected))
 				end
