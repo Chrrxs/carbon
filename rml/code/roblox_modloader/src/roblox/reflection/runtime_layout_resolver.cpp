@@ -3432,13 +3432,9 @@ namespace rml::roblox::internals
 		std::size_t search_from = 1;
 		while (search_from < executable_code.size())
 		{
-			const auto remaining = executable_code.size() - search_from;
-			const auto* lea_opcode = static_cast<const std::uint8_t*>(
-				std::memchr(code_bytes + search_from, 0x8D, remaining));
-			const auto* mov_opcode = static_cast<const std::uint8_t*>(
-				std::memchr(code_bytes + search_from, 0x8B, remaining));
-			const auto* opcode = lea_opcode == nullptr ? mov_opcode :
-				(mov_opcode == nullptr || lea_opcode < mov_opcode ? lea_opcode : mov_opcode);
+			const auto* opcode = static_cast<const std::uint8_t*>(
+				std::memchr(code_bytes + search_from, 0x8D,
+					executable_code.size() - search_from));
 			if (opcode == nullptr)
 				break;
 			const auto opcode_offset = static_cast<std::size_t>(opcode - code_bytes);
@@ -3470,7 +3466,7 @@ namespace rml::roblox::internals
 			ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
 			if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
 					&decoder, code_bytes + cursor, executable_code.size() - cursor, &inst, operands)) ||
-				inst.length != 7 ||
+				inst.length != 7 || inst.mnemonic != ZYDIS_MNEMONIC_LEA ||
 				!win_ops_has_vft_xref(inst, operands, instruction_address, waiting_vft_addr))
 			{
 				continue;
@@ -3503,7 +3499,8 @@ namespace rml::roblox::internals
 							continue;
 						}
 
-						if (win_ops_has_vft_xref(sinst, soperands, code_address + scan_pos, waiting_vft_addr))
+						if (sinst.mnemonic == ZYDIS_MNEMONIC_LEA &&
+							win_ops_has_vft_xref(sinst, soperands, code_address + scan_pos, waiting_vft_addr))
 						{
 							tracker.set_role(soperands[0].reg.value, RegRole::VftAddr);
 						}
