@@ -301,19 +301,27 @@ namespace rml::roblox::internals
 		}
 
 		std::vector<std::size_t> vft_xrefs;
-		std::size_t cursor = 0;
-		while (cursor < executable_code.size())
+		const auto* code_bytes =
+			reinterpret_cast<const std::uint8_t*>(executable_code.data());
+		std::size_t search_from = 1;
+		while (search_from < executable_code.size())
 		{
-			const auto* bytes =
-				reinterpret_cast<const std::uint8_t*>(executable_code.data() + cursor);
-			if (cursor + 7 > executable_code.size() ||
-				(bytes[0] & 0xF8) != 0x48 ||
-				(bytes[1] != 0x8D && bytes[1] != 0x8B) ||
-				(bytes[2] & 0xC7) != 0x05)
-			{
-				++cursor;
+			const auto* opcode = static_cast<const std::uint8_t*>(
+				std::memchr(
+					code_bytes + search_from,
+					0x8D,
+					executable_code.size() - search_from));
+			if (!opcode)
+				break;
+			const auto opcode_offset = static_cast<std::size_t>(opcode - code_bytes);
+			search_from = opcode_offset + 1;
+			if (executable_code.size() - opcode_offset < 6)
+				break;
+			const auto cursor = opcode_offset - 1;
+			const auto* bytes = code_bytes + cursor;
+			if ((bytes[0] & 0xF8) != 0x48 || (bytes[2] & 0xC7) != 0x05)
 				continue;
-			}
+
 			std::int32_t displacement = 0;
 			std::memcpy(&displacement, bytes + 3, sizeof(displacement));
 			std::uintptr_t target = 0;
@@ -321,7 +329,6 @@ namespace rml::roblox::internals
 				std::find(datamodel_vft_addresses.begin(), datamodel_vft_addresses.end(), target) ==
 					datamodel_vft_addresses.end())
 			{
-				++cursor;
 				continue;
 			}
 			ZydisDecodedInstruction instruction{};
@@ -334,12 +341,10 @@ namespace rml::roblox::internals
 					instruction,
 					operands))
 			{
-				++cursor;
 				continue;
 			}
 
-			if ((instruction.mnemonic == ZYDIS_MNEMONIC_LEA ||
-				 instruction.mnemonic == ZYDIS_MNEMONIC_MOV) &&
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
 				operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 				operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
 				operands[1].mem.base == ZYDIS_REGISTER_RIP &&
@@ -359,8 +364,6 @@ namespace rml::roblox::internals
 					vft_xrefs.push_back(cursor);
 				}
 			}
-
-			cursor += instruction.length;
 		}
 
 		if (vft_xrefs.empty())
