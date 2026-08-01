@@ -53,15 +53,26 @@ public sealed class PolicyAndEngineWorkTests
     }
 
     [Theory]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    public void NativeSelectedUnauthenticatedDataModelReplacesDifferentCandidate(
+    [InlineData((int)DataModelType.Edit, (int)DataModelType.Edit, true, false)]
+    [InlineData((int)DataModelType.Edit, (int)DataModelType.Edit, false, true)]
+    [InlineData((int)DataModelType.Edit, (int)DataModelType.Standalone, false, false)]
+    [InlineData((int)DataModelType.Edit, 1_097_167_477, false, false)]
+    [InlineData((int)DataModelType.Standalone, (int)DataModelType.Edit, false, true)]
+    [InlineData((int)DataModelType.Standalone, (int)DataModelType.Standalone, false, true)]
+    [InlineData((int)DataModelType.Standalone, 1_097_167_477, false, false)]
+    [InlineData(1_097_167_477, (int)DataModelType.Standalone, false, true)]
+    public void NativeSelectedUnauthenticatedDataModelPreservesCandidatePriority(
+        int rawCurrentDataModelType,
+        int rawCandidateDataModelType,
         bool sameDataModel,
         bool expected)
     {
         Assert.Equal(
             expected,
-            CarbonBridgeMod.ShouldReplaceUnauthenticatedEditDataModel(sameDataModel));
+            CarbonBridgeMod.ShouldReplaceUnauthenticatedEditDataModel(
+                (DataModelType)rawCurrentDataModelType,
+                (DataModelType)rawCandidateDataModelType,
+                sameDataModel));
     }
 
     [Theory]
@@ -121,6 +132,33 @@ public sealed class PolicyAndEngineWorkTests
     }
 
     [Fact]
+    public void TransientStudioRouteReadFailurePreservesTheVerifiedCandidate()
+    {
+        var candidates = new Dictionary<
+            nuint,
+            (string StudioSessionId, string InstanceId)>
+        {
+            [42] = ("studio-session", "studio-instance"),
+        };
+
+        CarbonBridgeMod.UpdateStudioRouteCandidate(
+            candidates,
+            42,
+            readSucceeded: false,
+            route: null);
+
+        Assert.Equal(("studio-session", "studio-instance"), candidates[42]);
+
+        CarbonBridgeMod.UpdateStudioRouteCandidate(
+            candidates,
+            42,
+            readSucceeded: true,
+            route: null);
+
+        Assert.Empty(candidates);
+    }
+
+    [Fact]
     public void ManifestLedgerResumeRequiresTheSameActiveStudioRoute()
     {
         var detached = ("studio-session", "studio-instance");
@@ -175,6 +213,28 @@ public sealed class PolicyAndEngineWorkTests
         Assert.Equal(
             TimeSpan.FromSeconds(30),
             CarbonBridgeMod.ManagedSnapshotReadinessTimeout);
+    }
+
+    [Fact]
+    public void IdenticalManagedRestagePreservesTheInFlightContractReference()
+    {
+        var source = new ManagedSourceNode[]
+        {
+            new("game", "", "DataModel", "Place"),
+            new("workspace", "game", "Workspace", "Workspace", ParentIndex: 0),
+        };
+        var inFlight = new ManagedStageFixture("0123456789abcdef0123456789abcdef", source);
+        var duplicate = new ManagedStageFixture(
+            inFlight.ContractId,
+            source.Select(node => node with { }).ToArray());
+
+        var retained = CarbonBridgeMod.RetainIdempotentManagedStage(
+            inFlight,
+            duplicate,
+            static stage => stage.ContractId,
+            static stage => stage.Source);
+
+        Assert.Same(inFlight, retained);
     }
 
     [Fact]
@@ -544,4 +604,8 @@ public sealed class PolicyAndEngineWorkTests
         var descriptor = new SerializedPropertyDescriptor("Fixture", typeName, attributes);
         Assert.Equal(expected, CarbonBridgeMod.CanCopyFromModel(descriptor));
     }
+
+    private sealed record ManagedStageFixture(
+        string ContractId,
+        IReadOnlyList<ManagedSourceNode> Source);
 }

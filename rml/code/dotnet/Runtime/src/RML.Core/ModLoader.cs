@@ -161,22 +161,27 @@ internal static class ModLoader
             if (interested is { Length: > 0 } && !interested.Contains(dataModelType))
                 continue;
 
+            var isProcessLifetimeMod = interested is null || interested.Length == 0;
+
             if (newModel != null)
             {
-                var wasInitialized = _registry.GetInitialized(modInfo);
-
-                if (!wasInitialized)
+                if (!isProcessLifetimeMod)
                 {
-                    try
-                    {
-                        modInfo.Instance.OnLoad();
-                    }
-                    catch (Exception e)
-                    {
-                        RuntimeLog.Error($"Error while calling OnLoad for mod: {e}");
-                    }
+                    var wasInitialized = _registry.GetInitialized(modInfo);
 
-                    _registry.SetInitialized(modInfo, true);
+                    if (!wasInitialized)
+                    {
+                        try
+                        {
+                            modInfo.Instance.OnLoad();
+                        }
+                        catch (Exception e)
+                        {
+                            RuntimeLog.Error($"Error while calling OnLoad for mod: {e}");
+                        }
+
+                        _registry.SetInitialized(modInfo, true);
+                    }
                 }
 
                 if (modInfo.Instance is IDataModelAware aware)
@@ -205,20 +210,23 @@ internal static class ModLoader
                     }
                 }
 
-                var wasInitialized = _registry.GetInitialized(modInfo);
-
-                if (wasInitialized)
+                if (!isProcessLifetimeMod)
                 {
-                    try
-                    {
-                        modInfo.Instance.OnUnload();
-                    }
-                    catch (Exception e)
-                    {
-                        RuntimeLog.Error($"Error while calling OnUnload for mod: {e}");
-                    }
+                    var wasInitialized = _registry.GetInitialized(modInfo);
 
-                    _registry.SetInitialized(modInfo, false);
+                    if (wasInitialized)
+                    {
+                        try
+                        {
+                            modInfo.Instance.OnUnload();
+                        }
+                        catch (Exception e)
+                        {
+                            RuntimeLog.Error($"Error while calling OnUnload for mod: {e}");
+                        }
+
+                        _registry.SetInitialized(modInfo, false);
+                    }
                 }
             }
         }

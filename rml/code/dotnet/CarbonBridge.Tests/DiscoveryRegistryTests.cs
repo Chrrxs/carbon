@@ -54,6 +54,30 @@ public sealed class DiscoveryRegistryTests : IDisposable
     }
 
     [Fact]
+    public void StaleBridgeUnloadCannotDeleteANewerDiscoveryOwner()
+    {
+        var bridgeId = "0123456789abcdef0123456789abcdef";
+        var path = Path.Combine(_root, "v1", $"{bridgeId}.json");
+        WriteDiscovery(path, bridgeId, 42, "http://127.0.0.1:2002/", "new-token");
+
+        Assert.False(CarbonBridgeMod.DeleteOwnedDiscoveryFile(
+            path,
+            bridgeId,
+            "http://127.0.0.1:1001/",
+            "old-token",
+            42));
+        Assert.True(File.Exists(path));
+
+        Assert.True(CarbonBridgeMod.DeleteOwnedDiscoveryFile(
+            path,
+            bridgeId,
+            "http://127.0.0.1:2002/",
+            "new-token",
+            42));
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
     public void RejectsALiveProcessThatIsNotRobloxStudio()
     {
         Assert.False(CarbonBridgeMod.IsStudioProcessRunning(Environment.ProcessId));
@@ -67,7 +91,12 @@ public sealed class DiscoveryRegistryTests : IDisposable
         }
     }
 
-    private static void WriteDiscovery(string path, string bridgeId, int processId)
+    private static void WriteDiscovery(
+        string path,
+        string bridgeId,
+        int processId,
+        string endpoint = "http://127.0.0.1:1/",
+        string token = "secret")
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(
@@ -77,8 +106,8 @@ public sealed class DiscoveryRegistryTests : IDisposable
                 protocolVersion = 2,
                 rmlBuildVersion = "test",
                 bridgeId,
-                endpoint = "http://127.0.0.1:1/",
-                token = "secret",
+                endpoint,
+                token,
                 processId,
             }));
     }

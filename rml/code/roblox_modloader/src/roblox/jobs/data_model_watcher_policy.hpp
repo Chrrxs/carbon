@@ -1,12 +1,20 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <utility>
 
 namespace rml::jobs::detail
 {
+	[[nodiscard]] constexpr std::uint8_t studio_marker_priority(const std::size_t route_markers, const bool baseline_ready) noexcept
+	{
+		if (route_markers != 1)
+			return 0;
+		return baseline_ready ? 2 : 1;
+	}
+
 	[[nodiscard]] constexpr bool should_cleanup_stale_data_model(const void* const current_data_model, const void* const tracked_data_model) noexcept
 	{
 		return tracked_data_model && (!current_data_model || current_data_model == tracked_data_model);

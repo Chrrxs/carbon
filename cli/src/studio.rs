@@ -75,6 +75,11 @@ impl ManagedStudio {
 			ManagedStudioLifecycle::Mcp { .. } => "robloxstudio-mcp",
 		}
 	}
+
+	pub fn bridge_id(&self) -> Option<&str> {
+		self.bridge_id.as_deref()
+	}
+
 	pub fn focus_metadata(&self) -> Option<FocusMetadata> {
 		#[cfg(any(target_os = "linux", target_os = "windows"))]
 		{

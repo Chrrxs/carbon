@@ -25,6 +25,9 @@ use std::{
 	time::{Duration, Instant, SystemTime},
 };
 
+pub(crate) const CAPTURE_BRIDGE_NOT_READY_MESSAGE: &str =
+	"Capture Manifest requires the connected Studio RML bridge; wait for Carbon to finish connecting";
+
 use self::{
 	processor::artifact::{ArtifactProcessor, CapturePrecommitAttestation},
 	queue::Queue,
@@ -282,6 +285,15 @@ where
 	}
 }
 
+fn ensure_capture_startup_ready(has_managed_worktree: bool, route: &queue::StudioRoute) -> Result<()> {
+	ensure!(
+		route.bridge_id.as_ref().is_some_and(|bridge_id| !bridge_id.is_empty())
+			&& (!has_managed_worktree || route.manifest_identities_authoritative),
+		CAPTURE_BRIDGE_NOT_READY_MESSAGE
+	);
+	Ok(())
+}
+
 fn run_manifest_capture_attempts<T, Attempt, Retry, Wait>(
 	phase: &AtomicU8,
 	mut attempt: Attempt,
@@ -330,6 +342,23 @@ pub(crate) fn is_transient_manifest_capture_error(error: &anyhow::Error) -> bool
 #[cfg(test)]
 mod manifest_capture_retry_tests {
 	use super::*;
+
+	#[test]
+	fn managed_capture_waits_for_launch_identity_bootstrap() {
+		let mut route = queue::StudioRoute {
+			studio_session_id: "studio".to_owned(),
+			instance_id: "instance".to_owned(),
+			bridge_id: Some("bridge".to_owned()),
+			manifest_identities_authoritative: false,
+		};
+
+		let error = ensure_capture_startup_ready(true, &route).unwrap_err();
+		assert!(error.to_string().contains(CAPTURE_BRIDGE_NOT_READY_MESSAGE));
+		assert!(ensure_capture_startup_ready(false, &route).is_ok());
+
+		route.manifest_identities_authoritative = true;
+		assert!(ensure_capture_startup_ready(true, &route).is_ok());
+	}
 
 	#[test]
 	fn transient_studio_invalidations_retry_the_same_manifest_capture() {
@@ -1075,13 +1104,12 @@ impl Core {
 			.queue
 			.studio_route(client_id)
 			.context("Capture Manifest requires an exact connected Studio route")?;
+		ensure_capture_startup_ready(self.has_managed_worktree(), &route)?;
 		let bridge_id = route
 			.bridge_id
 			.clone()
 			.filter(|bridge_id| !bridge_id.is_empty())
-			.context(
-				"Capture Manifest requires the connected Studio RML bridge; wait for Carbon to finish connecting",
-			)?;
+			.context(CAPTURE_BRIDGE_NOT_READY_MESSAGE)?;
 		let source_generation = self.source_generation();
 		let request_id = uuid::Uuid::new_v4().simple().to_string();
 		let phase = Arc::new(AtomicU8::new(CAPTURE_COLLECTING));
@@ -1721,7 +1749,7 @@ impl Core {
 				.reduce(|left, right| format!("{left}; {right}"));
 				if finalization_error.is_none() {
 					let capture_fingerprint = artifact.capture_fingerprint().unwrap_or_else(|| artifact.generation());
-					self.remember_capture_epoch_if_current(
+					if let Err(error) = self.remember_capture_epoch_if_current(
 						&precommit_bridge,
 						&capabilities,
 						&request.studio_session_id,
@@ -1731,7 +1759,9 @@ impl Core {
 						&generation,
 						&artifact,
 						capture_fingerprint,
-					);
+					) {
+						crate::carbon_info!("Capture epoch no-op cache was not retained: {error:#}");
+					}
 				}
 				let transition_completed = finalization_error.is_none() && managed_reload_transition_id.is_some();
 				{
@@ -1931,7 +1961,7 @@ impl Core {
 		&self,
 		bridge: &impl ManagedHierarchyRefreshBridge,
 		capabilities: &Capabilities,
-	) {
+	) -> Result<()> {
 		let source_generation = self.source_generation();
 		let result = (|| -> Result<()> {
 			let contract = self.managed_hierarchy_contract()?;
@@ -1960,12 +1990,13 @@ impl Core {
 				&source_generation,
 				&artifact,
 				&launch_fingerprint,
-			);
+			)?;
 			Ok(())
 		})();
-		if let Err(error) = result {
+		if let Err(error) = &result {
 			crate::carbon_info!("Managed launch capture epoch was not retained: {error:#}");
 		}
+		result
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -1980,7 +2011,7 @@ impl Core {
 		source_generation: &str,
 		artifact: &artifact_store::ValidatedArtifactReceipt,
 		artifact_fingerprint: &str,
-	) {
+	) -> Result<()> {
 		let receipt = (|| -> Result<CaptureEpochReceipt> {
 			let current = bridge.capabilities()?;
 			ensure!(
@@ -2025,11 +2056,9 @@ impl Core {
 				artifact_len: artifact_metadata.len(),
 				artifact_modified: artifact_metadata.modified()?,
 			})
-		})();
-		match receipt {
-			Ok(receipt) => *self.last_capture_epoch.lock().unwrap() = Some(receipt),
-			Err(error) => crate::carbon_info!("Capture epoch no-op cache was not retained: {error:#}"),
-		}
+		})()?;
+		*self.last_capture_epoch.lock().unwrap() = Some(receipt);
+		Ok(())
 	}
 
 	fn exact_project_realization_generation(&self) -> Result<String> {
@@ -3536,7 +3565,8 @@ mod source_watcher_tests {
 		let bridge = FakeRefreshBridge::authoritative();
 		let capabilities = bridge.capabilities().unwrap();
 		let source_generation = core.source_generation();
-		core.remember_trusted_managed_launch_epoch_if_current(&bridge, &capabilities);
+		core.remember_trusted_managed_launch_epoch_if_current(&bridge, &capabilities)
+			.unwrap();
 
 		let epoch = core
 			.last_capture_epoch
@@ -3558,6 +3588,42 @@ mod source_watcher_tests {
 			epoch.managed_contract_id,
 			core.managed_hierarchy_contract().unwrap().contract_id
 		);
+
+		drop(core);
+		std::fs::remove_dir_all(materialized.directory).unwrap();
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn trusted_managed_launch_propagates_epoch_seed_failure() {
+		let directory = std::env::temp_dir().join(format!(
+			"carbon-trusted-launch-capture-epoch-failure-{}",
+			uuid::Uuid::new_v4()
+		));
+		std::fs::create_dir_all(&directory).unwrap();
+		let project_path = directory.join("game.carbon.json");
+		project::initialize(&project_path, "Game".to_owned()).unwrap();
+
+		let materialized = project::materialize(&project_path).unwrap();
+		let core = Core::new_project_with_worktree(
+			&project_path,
+			&materialized,
+			("Game".to_owned(), "worktree".to_owned(), "session".to_owned()),
+		)
+		.unwrap();
+		let bridge = FakeRefreshBridge::new();
+		let capabilities = bridge.capabilities().unwrap();
+
+		let error = core
+			.remember_trusted_managed_launch_epoch_if_current(&bridge, &capabilities)
+			.unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("Studio changed before the capture epoch could be retained"),
+			"{error:#}"
+		);
+		assert!(core.last_capture_epoch.lock().unwrap().is_none());
 
 		drop(core);
 		std::fs::remove_dir_all(materialized.directory).unwrap();

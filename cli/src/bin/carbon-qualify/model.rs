@@ -686,6 +686,12 @@ mod tests {
 			.unwrap()
 			.iter()
 			.any(|output| output == "exact no-op"));
+		assert!(
+			step("unchanged-managed-launch-capture")["timeout_seconds"]
+				.as_u64()
+				.unwrap() >= 60,
+			"the fresh-install capture gate must outlast bridge readiness retries"
+		);
 		assert_eq!(step("unchanged-managed-launch-preserves-baseline")["check_mtime"], true);
 		let step_index = |name: &str| {
 			steps

@@ -35,6 +35,51 @@ internal static class ManifestIdentityAttributeCodec
         }
     }
 
+    public static string? DecodeWithReflectedFallback(
+        ReadOnlySpan<byte> serialized,
+        Func<object?> readReflectedAttribute,
+        string className,
+        string instanceName)
+    {
+        var serializedIdentity = Decode(serialized, className, instanceName);
+        if (serializedIdentity is not null)
+        {
+            return serializedIdentity;
+        }
+
+        object? reflected;
+        try
+        {
+            reflected = readReflectedAttribute();
+        }
+        catch (Exception error)
+        {
+            throw new InvalidDataException(
+                $"{AttributeName} is unavailable on {className} {instanceName}",
+                error);
+        }
+        if (reflected is null)
+        {
+            return null;
+        }
+        if (reflected is not string value)
+        {
+            throw new InvalidDataException(
+                $"{AttributeName} must be a string attribute on {className} {instanceName}");
+        }
+        try
+        {
+            return ManifestIdentity.Parse(value).ToString();
+        }
+        catch (InvalidDataException error)
+        {
+            throw new InvalidDataException(
+                $"{AttributeName} must be a nonzero 128-bit hexadecimal value on " +
+                $"{className} {instanceName}",
+                error);
+        }
+    }
+
 
     internal static bool MatchesIgnoringTransportMcpPlaceId(
         ReadOnlySpan<byte> baseline,

@@ -14,11 +14,44 @@ public sealed class ConcurrencyFakeMod : IMod
 
     public void OnUnload()
     {
+        var probe = Environment.GetEnvironmentVariable("RML_TEST_GLOBAL_MOD_UNLOAD_PROBE");
+        if (!string.IsNullOrEmpty(probe))
+        {
+            System.IO.File.AppendAllText(probe, "unloaded\n");
+        }
     }
 }
 
 public class ModLoaderConcurrencyTests
 {
+    [Fact]
+    public void ProcessLifetimeModIsNotUnloadedWhenADataModelStops()
+    {
+        var sourcePath = typeof(ConcurrencyFakeMod).Assembly.Location;
+        var tempDir = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            "rml_modloader_process_lifetime_" + Guid.NewGuid());
+        var modPath = System.IO.Path.Combine(tempDir, "process_lifetime_mod.dll");
+        var probePath = System.IO.Path.Combine(tempDir, "unloaded.txt");
+        System.IO.Directory.CreateDirectory(tempDir);
+        System.IO.File.Copy(sourcePath, modPath);
+        Environment.SetEnvironmentVariable("RML_TEST_GLOBAL_MOD_UNLOAD_PROBE", probePath);
+
+        try
+        {
+            ModLoader.LoadMod(modPath);
+            ModLoader.OnDataModelChanged(1, 0, DataModelType.Client);
+
+            Assert.False(System.IO.File.Exists(probePath));
+        }
+        finally
+        {
+            ModLoader.UnloadMod(modPath);
+            Environment.SetEnvironmentVariable("RML_TEST_GLOBAL_MOD_UNLOAD_PROBE", null);
+            DeleteDirectoryWithRetries(tempDir);
+        }
+    }
+
     [Fact]
     public async Task LoadUnload_Interleaved_With_OnDataModelChanged_Does_Not_Throw()
     {

@@ -13,12 +13,14 @@ use std::{
 	process::{Command, Stdio},
 	sync::{mpsc, Arc},
 	thread,
-	time::{Duration, SystemTime},
+	time::{Duration, Instant, SystemTime},
 };
 
 const DISCOVERY_ENV: &str = "CARBON_RML_BRIDGE_DISCOVERY";
 const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
+const EXACT_DISCOVERY_ATTEMPTS: usize = 5;
+const EXACT_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -305,7 +307,7 @@ impl HelperExecutor for ProcessHelperExecutor {
 		let helper_path = crate::rml::helper_path()
 			.with_context(|| format!("failed to find RML helper for bridge process {process_id}"))?;
 
-		let mut child = Command::new(&helper_path)
+		let child = Command::new(&helper_path)
 			.args([
 				"bridge-request",
 				&port.to_string(),
@@ -326,52 +328,158 @@ impl HelperExecutor for ProcessHelperExecutor {
 				)
 			})?;
 
-		if let Some(mut stdin) = child.stdin.take() {
-			stdin.write_all(stdin_payload).with_context(|| {
-				format!("failed to write request framing to RML helper process for bridge process {process_id}")
-			})?;
-		}
+		execute_helper_child(
+			child,
+			stdin_payload,
+			writer,
+			process_id,
+			Duration::from_millis(timeout_ms),
+		)
+	}
+}
 
-		let stderr_pipe = child.stderr.take();
-		let stderr_handle = thread::spawn(move || {
+fn execute_helper_child(
+	mut child: std::process::Child,
+	stdin_payload: &[u8],
+	writer: &mut dyn Write,
+	process_id: u32,
+	timeout: Duration,
+) -> Result<HelperExecutionResult> {
+	let mut stdin_pipe = child.stdin.take();
+	let mut stdout_pipe = child
+		.stdout
+		.take()
+		.with_context(|| format!("RML helper process stdout is unavailable for bridge process {process_id}"))?;
+	let stderr_pipe = child.stderr.take();
+	let deadline = Instant::now()
+		.checked_add(timeout)
+		.context("RML helper request timeout is too large")?;
+
+	thread::scope(|scope| -> Result<HelperExecutionResult> {
+		let stderr_handle = scope.spawn(move || {
 			let mut buf = Vec::new();
-			if let Some(mut r) = stderr_pipe {
-				let _ = io::copy(&mut r, &mut buf);
+			if let Some(mut stderr) = stderr_pipe {
+				let _ = io::copy(&mut stderr, &mut buf);
 			}
 			buf
 		});
 
-		let mut stdout = child
-			.stdout
-			.take()
-			.with_context(|| format!("RML helper process stdout is unavailable for bridge process {process_id}"))?;
+		let (output_sender, output_receiver) = mpsc::sync_channel(1);
+		let io_handle = scope.spawn(move || {
+			let body_sender = output_sender.clone();
+			let result = (|| {
+				if let Some(mut stdin) = stdin_pipe.take() {
+					stdin.write_all(stdin_payload).with_context(|| {
+						format!("failed to write request framing to RML helper process for bridge process {process_id}")
+					})?;
+				}
+				let mut channel_writer = HelperChannelWriter { sender: body_sender };
+				parse_helper_stdout(&mut stdout_pipe, &mut channel_writer, process_id)
+			})();
+			let _ = output_sender.send(HelperOutputMessage::Finished(result));
+		});
 
-		let result = parse_helper_stdout(&mut stdout, writer, process_id);
+		let parsed = loop {
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				break Err(anyhow::anyhow!(
+					"RML helper process for bridge process {process_id} timed out after {} ms",
+					timeout.as_millis()
+				));
+			}
+			match output_receiver.recv_timeout(remaining) {
+				Ok(HelperOutputMessage::Body(chunk)) => {
+					if let Err(error) = writer.write_all(&chunk) {
+						break Err(error).context(format!(
+							"failed to stream RML helper response for bridge process {process_id}"
+						));
+					}
+				}
+				Ok(HelperOutputMessage::Finished(result)) => break result,
+				Err(mpsc::RecvTimeoutError::Timeout) => {
+					break Err(anyhow::anyhow!(
+						"RML helper process for bridge process {process_id} timed out after {} ms",
+						timeout.as_millis()
+					));
+				}
+				Err(mpsc::RecvTimeoutError::Disconnected) => {
+					break Err(anyhow::anyhow!(
+						"RML helper process I/O worker stopped unexpectedly for bridge process {process_id}"
+					));
+				}
+			}
+		};
 
-		if result.is_err() {
+		let mut outcome = parsed.and_then(|result| {
+			let exit_status = loop {
+				if let Some(status) = child
+					.try_wait()
+					.with_context(|| format!("failed to wait for RML helper process for bridge process {process_id}"))?
+				{
+					break status;
+				}
+				let remaining = deadline.saturating_duration_since(Instant::now());
+				if remaining.is_zero() {
+					anyhow::bail!(
+						"RML helper process for bridge process {process_id} timed out after {} ms",
+						timeout.as_millis()
+					);
+				}
+				thread::sleep(remaining.min(Duration::from_millis(5)));
+			};
+
+			anyhow::ensure!(
+				exit_status.success(),
+				"RML helper process for bridge process {process_id} failed with exit status {:?}",
+				exit_status.code()
+			);
+			Ok(result)
+		});
+
+		drop(output_receiver);
+		if outcome.is_err() {
 			let _ = child.kill();
 			let _ = child.wait();
-			let stderr_bytes = stderr_handle.join().unwrap_or_default();
-			if !stderr_bytes.is_empty() {
-				let stderr_msg = String::from_utf8_lossy(&stderr_bytes);
-				return result.with_context(|| format!("RML helper process stderr: {stderr_msg}"));
-			}
-			return result;
 		}
+		if io_handle.join().is_err() && outcome.is_ok() {
+			outcome = Err(anyhow::anyhow!(
+				"RML helper process I/O worker panicked for bridge process {process_id}"
+			));
+		}
+		let stderr_bytes = stderr_handle.join().unwrap_or_default();
 
-		let exit_status = child
-			.wait()
-			.with_context(|| format!("failed to wait for RML helper process for bridge process {process_id}"))?;
+		match outcome {
+			Err(error) if !stderr_bytes.is_empty() => {
+				let stderr_msg = String::from_utf8_lossy(&stderr_bytes);
+				Err(error).with_context(|| format!("RML helper process stderr: {stderr_msg}"))
+			}
+			other => other,
+		}
+	})
+}
 
-		let _stderr = stderr_handle.join().unwrap_or_default();
+enum HelperOutputMessage {
+	Body(Vec<u8>),
+	Finished(Result<HelperExecutionResult>),
+}
 
-		anyhow::ensure!(
-			exit_status.success(),
-			"RML helper process for bridge process {process_id} failed with exit status {:?}",
-			exit_status.code()
-		);
+struct HelperChannelWriter {
+	sender: mpsc::SyncSender<HelperOutputMessage>,
+}
 
-		result
+impl Write for HelperChannelWriter {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		if buf.is_empty() {
+			return Ok(0);
+		}
+		self.sender
+			.send(HelperOutputMessage::Body(buf.to_vec()))
+			.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "RML helper response consumer stopped"))?;
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
 	}
 }
 
@@ -499,8 +607,13 @@ pub struct Bridge {
 impl Bridge {
 	pub fn discover(bridge_id: &str) -> Result<Self> {
 		validate_bridge_id(bridge_id)?;
-		let path = discovery_path(bridge_id)?;
-		Self::from_path(&path, Some(bridge_id))
+		retry_exact_bridge_discovery(
+			|| {
+				let path = discovery_path(bridge_id)?;
+				Self::from_path(&path, Some(bridge_id))
+			},
+			thread::sleep,
+		)
 	}
 
 	pub fn discover_studio(studio_session_id: &str, instance_id: &str) -> Result<Self> {
@@ -1122,6 +1235,31 @@ fn validate_bridge_id(bridge_id: &str) -> Result<()> {
 	Ok(())
 }
 
+fn retry_exact_bridge_discovery<T, Discover, Wait>(mut discover: Discover, mut wait: Wait) -> Result<T>
+where
+	Discover: FnMut() -> Result<T>,
+	Wait: FnMut(Duration),
+{
+	for attempt in 1..=EXACT_DISCOVERY_ATTEMPTS {
+		match discover() {
+			Ok(value) => return Ok(value),
+			Err(error) if attempt < EXACT_DISCOVERY_ATTEMPTS && discovery_record_is_missing(&error) => {
+				wait(EXACT_DISCOVERY_RETRY_DELAY);
+			}
+			Err(error) => return Err(error),
+		}
+	}
+	unreachable!("exact bridge discovery attempts are nonzero")
+}
+
+fn discovery_record_is_missing(error: &anyhow::Error) -> bool {
+	error.chain().any(|cause| {
+		cause
+			.downcast_ref::<io::Error>()
+			.is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+	})
+}
+
 fn discovery_claims_studio(discovery: &Discovery, studio_session_id: &str, instance_id: &str) -> bool {
 	discovery.studio_session_id.as_deref() == Some(studio_session_id)
 		&& discovery.instance_id.as_deref() == Some(instance_id)
@@ -1363,6 +1501,44 @@ mod tests {
 		let (_, capabilities) = discovery_and_capabilities(true, 3);
 		let value = serde_json::to_value(capabilities).unwrap();
 		assert_eq!(value["serializedReferences"], true);
+	}
+
+	#[test]
+	fn exact_discovery_retries_a_transient_record_replacement() {
+		let mut attempts = 0;
+		let mut waits = 0;
+		let result = retry_exact_bridge_discovery(
+			|| {
+				attempts += 1;
+				if attempts < 3 {
+					return Err(anyhow::Error::new(io::Error::from(io::ErrorKind::NotFound)));
+				}
+				Ok("bridge")
+			},
+			|_| waits += 1,
+		)
+		.unwrap();
+
+		assert_eq!(result, "bridge");
+		assert_eq!(attempts, 3);
+		assert_eq!(waits, 2);
+	}
+
+	#[test]
+	fn exact_discovery_does_not_retry_an_invalid_record() {
+		let mut attempts = 0;
+		let mut waits = 0;
+		let result = retry_exact_bridge_discovery::<(), _, _>(
+			|| {
+				attempts += 1;
+				anyhow::bail!("invalid discovery record")
+			},
+			|_| waits += 1,
+		);
+
+		assert_eq!(result.unwrap_err().to_string(), "invalid discovery record");
+		assert_eq!(attempts, 1);
+		assert_eq!(waits, 0);
 	}
 
 	#[test]
@@ -1638,6 +1814,49 @@ mod tests {
 		}
 		buf.extend_from_slice(body);
 		buf
+	}
+
+	fn stalling_helper_child() -> std::process::Child {
+		#[cfg(unix)]
+		let mut command = {
+			let mut command = Command::new("sleep");
+			command.arg("0.30");
+			command
+		};
+		#[cfg(windows)]
+		let mut command = {
+			let mut command = Command::new("powershell.exe");
+			command.args([
+				"-NoProfile",
+				"-NonInteractive",
+				"-Command",
+				"Start-Sleep -Milliseconds 300",
+			]);
+			command
+		};
+
+		command
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.unwrap()
+	}
+
+	#[test]
+	fn helper_process_timeout_bounds_the_parent_side_io_and_wait() {
+		let started = std::time::Instant::now();
+		let error = execute_helper_child(
+			stalling_helper_child(),
+			b"",
+			&mut Vec::new(),
+			42,
+			Duration::from_millis(40),
+		)
+		.unwrap_err();
+
+		assert!(error.to_string().contains("timed out"), "{error:#}");
+		assert!(started.elapsed() < Duration::from_millis(250));
 	}
 
 	#[test]

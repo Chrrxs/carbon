@@ -58,6 +58,32 @@ public sealed class ManifestIdentityLedgerTests
             "Part"));
     }
 
+    [Fact]
+    public void ReflectedManifestIdentityRecoversAnEmptySerializedMarkerRead()
+    {
+        Assert.Equal(
+            Right,
+            ManifestIdentityAttributeCodec.DecodeWithReflectedFallback(
+                [],
+                () => Right,
+                "ReplicatedStorage",
+                "ReplicatedStorage"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData("not-hex")]
+    [InlineData("00000000000000000000000000000000")]
+    public void ReflectedManifestIdentityFallbackRejectsInvalidValues(object invalid)
+    {
+        Assert.Throws<InvalidDataException>(() =>
+            ManifestIdentityAttributeCodec.DecodeWithReflectedFallback(
+                [],
+                () => invalid,
+                "ReplicatedStorage",
+                "ReplicatedStorage"));
+    }
+
     [Theory]
     [InlineData("not-hex")]
     [InlineData("00000000000000000000000000000000")]

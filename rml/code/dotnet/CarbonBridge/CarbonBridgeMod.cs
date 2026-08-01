@@ -237,7 +237,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
 
     private readonly ConcurrentDictionary<string, Instance> _instances = new(StringComparer.Ordinal);
     private readonly ConcurrentQueue<EngineWork> _engineWork = new();
-    private readonly object _discoveryWriteLock = new();
+    private static readonly ConcurrentDictionary<string, object> DiscoveryWriteLocks =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly object _engineStateLock = new();
     private readonly object _changesLock = new();
     private readonly List<PropertyChange> _changes = [];
@@ -270,6 +271,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private Timer? _launchHydratedDefaultsTimer;
     private CaptureLeaseManager? _captureLeases;
     private DataModel? _dataModel;
+    private DataModelType _dataModelType = DataModelType.Null;
     private nuint _detachedEditDataModelHandle;
 
     private SerializedPropertyAccess.EngineThreadPump? _engineThreadPump;
@@ -367,6 +369,8 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             if (_dataModel is { } currentDataModel)
             {
                 if (!ShouldReplaceUnauthenticatedEditDataModel(
+                        _dataModelType,
+                        dataModelType,
                         currentDataModel.Equals(dataModel)))
                 {
                     return;
@@ -397,6 +401,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         lock (_engineStateLock)
         {
             _dataModel = dataModel;
+            _dataModelType = dataModelType;
         }
         // Exact-property requests identify every snapshot node by Studio's
         // debug identity. DataModel itself is not a descendant, so it never
@@ -561,10 +566,20 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         {
             try
             {
-                IOFile.Delete(_discoveryPath);
+                DeleteOwnedDiscoveryFile(
+                    _discoveryPath,
+                    _bridgeId,
+                    _endpoint,
+                    _token,
+                    Environment.ProcessId);
                 if (_routeDiscoveryPath.Length != 0)
                 {
-                    IOFile.Delete(_routeDiscoveryPath);
+                    DeleteOwnedDiscoveryFile(
+                        _routeDiscoveryPath,
+                        _bridgeId,
+                        _endpoint,
+                        _token,
+                        Environment.ProcessId);
                 }
             }
             catch
@@ -619,6 +634,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             _studioIdentity = null;
             _detachedEditDataModelHandle = InstanceHierarchy.RuntimeHandle(dataModel);
             _dataModel = null;
+            _dataModelType = DataModelType.Null;
             Interlocked.Exchange(ref _excludedEditCameraHandle, 0);
         }
 
@@ -1073,10 +1089,11 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         {
             var instance = Instance.FromHandle(node.Handle)
                 ?? throw new InvalidDataException("manifest identity bootstrap handle is unavailable");
-            var sourceId = ManifestIdentityAttributeCodec.Decode(
+            var sourceId = ManifestIdentityAttributeCodec.DecodeWithReflectedFallback(
                 SerializedPropertyAccess.Read(
                     instance,
                     ManifestIdentityAttributeCodec.SerializedPropertyName),
+                () => instance.GetAttribute(ManifestIdentityAttributeCodec.AttributeName),
                 node.ClassName,
                 node.Name);
             if (sourceId is null)
@@ -1568,8 +1585,21 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         && !hasAuthenticatedEditDataModel;
 
     internal static bool ShouldReplaceUnauthenticatedEditDataModel(
+        DataModelType currentDataModelType,
+        DataModelType candidateDataModelType,
         bool sameDataModel) =>
-        !sameDataModel;
+        !sameDataModel
+        && EditDataModelCandidatePriority(candidateDataModelType)
+            >= EditDataModelCandidatePriority(currentDataModelType);
+
+    private static int EditDataModelCandidatePriority(DataModelType dataModelType) =>
+        dataModelType switch
+        {
+            DataModelType.Edit => 3,
+            DataModelType.Standalone => 2,
+            _ when !System.Enum.IsDefined(typeof(DataModelType), dataModelType) => 1,
+            _ => 0,
+        };
 
 
     internal static bool IsManagedBaselineReadyMarker(
@@ -1588,6 +1618,26 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         startupBoundaryAttested
             ? AttestedManagedSnapshotQuietPeriod
             : ManagedSnapshotQuietPeriod;
+
+    internal static T RetainIdempotentManagedStage<T>(
+        T? current,
+        T incoming,
+        Func<T, string> contractId,
+        Func<T, IReadOnlyList<ManagedSourceNode>> source)
+        where T : class
+    {
+        if (current is null
+            || !string.Equals(contractId(current), contractId(incoming), StringComparison.Ordinal))
+        {
+            return incoming;
+        }
+        if (!source(current).SequenceEqual(source(incoming)))
+        {
+            throw new InvalidDataException(
+                "managed hierarchy contract identity was reused with different source");
+        }
+        return current;
+    }
 
     private void RecordChange(
         Instance instance,
@@ -2636,8 +2686,17 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 var staged = ManagedSourceContract.Create(contractId, source);
                 lock (_managedHierarchyLock)
                 {
+                    var previous = _stagedManagedSource;
+                    staged = RetainIdempotentManagedStage(
+                        previous,
+                        staged,
+                        static contract => contract.ContractId,
+                        static contract => contract.Source);
                     _stagedManagedSource = staged;
-                    RebuildManagedObservationOwnership(staged);
+                    if (!ReferenceEquals(previous, staged))
+                    {
+                        RebuildManagedObservationOwnership(staged);
+                    }
                 }
                 Interlocked.Exchange(ref _managedSnapshotPending, 1);
                 ArmManagedSnapshotTimer(ManagedSnapshotQuietPeriodFor(
@@ -6639,8 +6698,11 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         && detachedRoute == activeRoute;
 
 
-    private static (string StudioSessionId, string InstanceId)? TryReadStudioRoute(Instance instance)
+    private static bool TryReadStudioRoute(
+        Instance instance,
+        out (string StudioSessionId, string InstanceId)? route)
     {
+        route = null;
         try
         {
             if (instance.Name == StudioRouteMarker
@@ -6649,20 +6711,41 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 && instance.Parent is { } parent
                 && parent.ClassName == "CoreGui")
             {
-                return ParseStudioRoute(
+                route = ParseStudioRoute(
                     Reflection.GetProperty<string>(instance, "Value") ?? string.Empty);
             }
+            return true;
         }
         catch
         {
+            return false;
         }
-        return null;
+    }
+
+    internal static void UpdateStudioRouteCandidate(
+        Dictionary<nuint, (string StudioSessionId, string InstanceId)> candidates,
+        nuint handle,
+        bool readSucceeded,
+        (string StudioSessionId, string InstanceId)? route)
+    {
+        if (!readSucceeded)
+        {
+            return;
+        }
+        if (route is { } validRoute)
+        {
+            candidates[handle] = validRoute;
+        }
+        else
+        {
+            candidates.Remove(handle);
+        }
     }
 
     private void TryCacheStudioIdentity(Instance instance)
     {
         var handle = InstanceHierarchy.RuntimeHandle(instance);
-        var route = TryReadStudioRoute(instance);
+        var readSucceeded = TryReadStudioRoute(instance, out var route);
 
         StudioIdentity? publishedIdentity;
         var changed = false;
@@ -6673,14 +6756,11 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
                 return;
             }
 
-            if (route is { } validRoute)
-            {
-                _studioIdentityCandidates[handle] = validRoute;
-            }
-            else
-            {
-                _studioIdentityCandidates.Remove(handle);
-            }
+            UpdateStudioRouteCandidate(
+                _studioIdentityCandidates,
+                handle,
+                readSucceeded,
+                route);
             _preservedStudioRoute = UniqueStudioRoute(_studioIdentityCandidates.Values);
             var previous = _studioIdentity;
             RefreshStudioIdentityLocked();
@@ -6872,7 +6952,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             studioSessionId = identity?.StudioSessionId,
             instanceId = identity?.InstanceId,
         }, JsonOptions);
-        lock (_discoveryWriteLock)
+        lock (DiscoveryWriteLock(_discoveryPath))
         {
             WriteDiscoveryFile(_discoveryPath, json);
             var routeDiscoveryPath = identity is null
@@ -6907,6 +6987,48 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         if (!OperatingSystem.IsWindows())
         {
             IOFile.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+    }
+
+    private static object DiscoveryWriteLock(string path) =>
+        DiscoveryWriteLocks.GetOrAdd(IOPath.GetFullPath(path), static _ => new object());
+
+    internal static bool DeleteOwnedDiscoveryFile(
+        string path,
+        string bridgeId,
+        string endpoint,
+        string token,
+        int processId)
+    {
+        lock (DiscoveryWriteLock(path))
+        {
+            if (!IOFile.Exists(path))
+            {
+                return false;
+            }
+            try
+            {
+                using var document = JsonDocument.Parse(IOFile.ReadAllBytes(path));
+                var root = document.RootElement;
+                if (!root.TryGetProperty("bridgeId", out var recordBridgeId)
+                    || !root.TryGetProperty("endpoint", out var recordEndpoint)
+                    || !root.TryGetProperty("token", out var recordToken)
+                    || !root.TryGetProperty("processId", out var recordProcessId)
+                    || !string.Equals(recordBridgeId.GetString(), bridgeId, StringComparison.Ordinal)
+                    || !string.Equals(recordEndpoint.GetString(), endpoint, StringComparison.Ordinal)
+                    || !string.Equals(recordToken.GetString(), token, StringComparison.Ordinal)
+                    || !recordProcessId.TryGetInt32(out var recordProcess)
+                    || recordProcess != processId)
+                {
+                    return false;
+                }
+                IOFile.Delete(path);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 

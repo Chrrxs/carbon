@@ -1,4 +1,4 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use parking_lot::Mutex;
@@ -316,6 +316,14 @@ impl Serve {
 		if let Some(token) = std::env::var_os("CARBON_QUALIFICATION_EXPORT_TOKEN") {
 			core.enable_qualification_export(build_path.clone(), token.to_string_lossy().into_owned())?;
 		}
+		let managed_bridge_id = match managed_studio.bridge_id() {
+			Some(bridge_id) => bridge_id.to_owned(),
+			None => {
+				clean(&cleanup_paths, None, Some(&managed_studio));
+				bail!("managed Roblox Studio launch did not retain its attested RML bridge identity");
+			}
+		};
+		core.queue().set_trusted_managed_bridge(&managed_bridge_id);
 		let (studio_executable, creation_filetime) = match managed_studio.focus_metadata() {
 			Some(meta) => (Some(meta.studio_executable), Some(meta.creation_filetime)),
 			None => (None, None),
@@ -410,6 +418,7 @@ impl Serve {
 			let reload_session = session_token.clone();
 			let reload_control = control_sender.clone();
 			let reload_cleanup_paths = cleanup_paths.clone();
+			let reload_managed_bridge_id = managed_bridge_id.clone();
 			let callback_build = build_path.clone();
 			let active_server = Server::new(Arc::clone(&core), SERVE_HOST, port);
 			let reload_stop_requested = active_server.external_stop_signal();
@@ -474,6 +483,7 @@ impl Serve {
 									return false;
 								}
 							};
+						next_core.queue().set_trusted_managed_bridge(&reload_managed_bridge_id);
 						if let Some(token) = std::env::var_os("CARBON_QUALIFICATION_EXPORT_TOKEN") {
 							if let Err(error) = next_core.enable_qualification_export(
 								callback_build.clone(),

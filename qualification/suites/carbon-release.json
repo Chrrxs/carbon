@@ -213,7 +213,7 @@
           "program": "${carbon}",
           "args": ["capture", "--port", "${port}", "--color", "never"],
           "cwd": "${repo}",
-          "timeout_seconds": 30,
+          "timeout_seconds": 60,
           "stderr_contains": ["exact no-op"]
         },
         {

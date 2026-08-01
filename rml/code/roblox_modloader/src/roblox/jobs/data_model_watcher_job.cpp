@@ -162,6 +162,7 @@ namespace rml::jobs
 				return 0;
 
 			std::size_t route_markers = 0;
+			bool baseline_ready = false;
 			for (const auto& child_owner : *children)
 			{
 				const auto* child = child_owner.get();
@@ -169,10 +170,10 @@ namespace rml::jobs
 					continue;
 				const auto name = child->get_name();
 				if (name == managed_baseline_ready_marker)
-					return 2;
+					baseline_ready = true;
 				route_markers += name == studio_route_marker ? 1u : 0u;
 			}
-			return route_markers == 1 ? 1 : 0;
+			return detail::studio_marker_priority(route_markers, baseline_ready);
 		}
 		return 0;
 	}

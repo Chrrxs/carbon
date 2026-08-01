@@ -1465,7 +1465,7 @@ pub(crate) async fn bootstrap_manifest_identities(
 			current_capabilities.manifest_identities_authoritative,
 			"RML did not retain the bootstrapped manifest identity authority"
 		);
-		epoch_core.remember_trusted_managed_launch_epoch_if_current(&bridge, &current_capabilities);
+		epoch_core.remember_trusted_managed_launch_epoch_if_current(&bridge, &current_capabilities)?;
 		Ok(response)
 	})
 	.await;

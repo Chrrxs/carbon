@@ -51,6 +51,7 @@ pub struct Queue {
 	listeners: RwLock<Vec<Listener>>,
 	unsynced_changes: RwLock<usize>,
 	first_subscribe: Mutex<Option<FirstSubscribe>>,
+	trusted_managed_bridge: Mutex<Option<String>>,
 }
 
 type FirstSubscribe = Box<dyn FnOnce(&str, Option<&StudioRoute>) + Send + 'static>;
@@ -64,7 +65,12 @@ impl Queue {
 			listeners: RwLock::new(Vec::new()),
 			unsynced_changes: RwLock::new(0),
 			first_subscribe: Mutex::new(None),
+			trusted_managed_bridge: Mutex::new(None),
 		}
+	}
+
+	pub fn set_trusted_managed_bridge(&self, bridge_id: &str) {
+		*self.trusted_managed_bridge.lock().unwrap() = Some(bridge_id.to_owned());
 	}
 
 	pub fn on_first_subscribe<F>(&self, callback: F)
@@ -146,6 +152,12 @@ impl Queue {
 			bail!("another Studio client is already connected")
 		}
 
+		let studio_route = studio_route.map(|mut route| {
+			if let Some(bridge_id) = self.trusted_managed_bridge.lock().unwrap().clone() {
+				route.bridge_id = Some(bridge_id);
+			}
+			route
+		});
 		let (sender, receiver) = crossbeam_channel::bounded(Self::CHANNEL_CAPACITY);
 		let channel = Channel { sender, receiver };
 
@@ -303,6 +315,30 @@ mod tests {
 		assert!(queue.studio_route(101).unwrap().manifest_identities_authoritative);
 		queue.set_manifest_identities_authoritative(101, false).unwrap();
 		assert!(!queue.studio_route(101).unwrap().manifest_identities_authoritative);
+	}
+
+	#[test]
+	fn trusted_managed_launch_binds_the_first_subscribed_studio_route() {
+		let queue = Queue::new();
+		let bridge_id = "0123456789abcdef0123456789abcdef";
+		queue.set_trusted_managed_bridge(bridge_id);
+		queue
+			.subscribe(
+				101,
+				"managed-place",
+				Some(StudioRoute {
+					studio_session_id: "plugin-session".to_owned(),
+					instance_id: "anon:managed-place".to_owned(),
+					bridge_id: None,
+					manifest_identities_authoritative: false,
+				}),
+			)
+			.unwrap();
+
+		assert_eq!(
+			queue.studio_route(101).and_then(|route| route.bridge_id),
+			Some(bridge_id.to_owned())
+		);
 	}
 
 	#[test]
