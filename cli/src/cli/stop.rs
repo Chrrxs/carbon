@@ -2,8 +2,11 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use colored::Colorize;
 use reqwest::blocking::Client;
+use std::time::Duration;
 
 use crate::{carbon_info, carbon_warn, logger::Table, sessions, util};
+
+const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 + 30);
 
 /// Stop Carbon serve instances by address, instance ID, or all running instances.
 #[derive(Parser)]
@@ -111,7 +114,12 @@ impl Stop {
 	fn make_request(address: &str, pid: u32) -> Result<()> {
 		let url = format!("{address}/stop");
 
-		match Client::new().post(url).send() {
+		match Client::builder()
+			.timeout(STOP_REQUEST_TIMEOUT)
+			.build()?
+			.post(url)
+			.send()
+		{
 			Ok(response) => {
 				let status = response.status();
 				let message = response
@@ -144,5 +152,10 @@ mod tests {
 	fn stop_accepts_reported_instance_ids() {
 		let parsed = Stop::try_parse_from(["stop", "7", "12"]).unwrap();
 		assert_eq!(parsed.instances, ["7", "12"]);
+	}
+
+	#[test]
+	fn stop_request_outlives_the_full_auto_recovery_wait() {
+		assert!(STOP_REQUEST_TIMEOUT > crate::recovery::CAPTURE_TIMEOUT);
 	}
 }

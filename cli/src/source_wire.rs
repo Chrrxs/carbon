@@ -3,16 +3,16 @@
 use anyhow::{ensure, Context, Result};
 use rbx_dom_weak::{
 	types::{
-		Attributes, CFrame, Color3, ColorSequence, ColorSequenceKeypoint, ContentType, CustomPhysicalProperties, Enum,
-		Matrix3, NumberRange, NumberSequence, NumberSequenceKeypoint, PhysicalProperties, Ray, Rect, Ref, Region3,
-		UDim, UDim2, Variant, VariantType, Vector2, Vector3, Vector3int16,
+		Attributes, CFrame, Color3, ColorSequence, ColorSequenceKeypoint, CustomPhysicalProperties, Enum, Matrix3,
+		NumberRange, NumberSequence, NumberSequenceKeypoint, PhysicalProperties, Ray, Rect, Region3, UDim, UDim2,
+		Variant, VariantType, Vector2, Vector3, Vector3int16,
 	},
 	Ustr, UstrMap,
 };
-use rbx_reflection::{DataType, PropertyKind, PropertySerialization};
+use rbx_reflection::{DataType, PropertyKind};
 use serde::ser::SerializeMap;
 
-use crate::{resolution::UnresolvedValue, util};
+use crate::util;
 
 pub(crate) fn cframe_semantically_equal(left: &CFrame, right: &CFrame) -> bool {
 	if left.position != right.position {
@@ -487,88 +487,6 @@ pub(crate) fn canonical_variant_type(class: &str, property: &str) -> Option<Vari
 		}
 		current = descriptor.superclass?;
 	}
-}
-
-pub(crate) fn canonical_property_serializes(class: &str, property: &str) -> Option<bool> {
-	let database = util::get_reflection_database();
-	let mut current = class;
-	loop {
-		let descriptor = database.classes.get(current)?;
-		if let Some(property) = descriptor.properties.get(property) {
-			return match property.kind {
-				PropertyKind::Canonical { ref serialization } => Some(matches!(
-					serialization,
-					PropertySerialization::Serializes | PropertySerialization::SerializesAs(_)
-				)),
-				PropertyKind::Alias { alias_for } => canonical_property_serializes(current, alias_for),
-				_ => None,
-			};
-		}
-		current = descriptor.superclass?;
-	}
-}
-
-pub(crate) fn is_omittable_default(class: &str, property: &str, value: &Variant) -> bool {
-	let Some(class_descriptor) = util::get_reflection_database().classes.get(class) else {
-		return false;
-	};
-	let is_default = util::get_reflection_database().find_default_property(class_descriptor, property) == Some(value);
-	let absence_changes_engine_load =
-		(class == "Lighting" && property == "LightingStyle") || (class == "Model" && property == "NeedsPivotMigration");
-	is_default && !absence_changes_engine_load
-}
-
-pub(crate) fn validate_capture_property(
-	class: &str,
-	property: &str,
-	value: &Variant,
-	contains_ref: impl Fn(Ref) -> bool,
-) -> Result<()> {
-	if property == "__CarbonRawName" {
-		ensure!(
-			matches!(value, Variant::BinaryString(_)),
-			"internal raw name is not a BinaryString"
-		);
-	}
-	if property == "Source" && matches!(class, "Script" | "LocalScript" | "ModuleScript") {
-		ensure!(
-			matches!(value, Variant::String(_) | Variant::BinaryString(_)),
-			"{class}.Source is neither String nor BinaryString"
-		);
-	}
-	let target = match value {
-		Variant::Ref(target) if target.is_some() => Some(*target),
-		Variant::Content(content) => match content.value() {
-			ContentType::Object(target) if target.is_some() => Some(*target),
-			_ => None,
-		},
-		_ => None,
-	};
-	if let Some(target) = target {
-		ensure!(contains_ref(target), "reference target {target:?} is outside the place");
-	}
-	let unresolved = UnresolvedValue::from_variant(value.clone(), class, property);
-	serde_json::to_vec(&unresolved).context("property has no canonical representation")?;
-	Ok(())
-}
-
-fn is_synthesizable_default_property(property: &str) -> bool {
-	!matches!(property, "HistoryId" | "UniqueId")
-}
-
-pub(crate) fn capture_synthesized_defaults(class_name: &str) -> UstrMap<Variant> {
-	let database = util::get_reflection_database();
-	let mut result = UstrMap::default();
-	let mut class = database.classes.get(class_name);
-	while let Some(descriptor) = class {
-		for (property, value) in &descriptor.default_properties {
-			if is_synthesizable_default_property(property) {
-				result.entry(Ustr::from(property)).or_insert_with(|| value.clone());
-			}
-		}
-		class = descriptor.superclass.and_then(|name| database.classes.get(name));
-	}
-	result
 }
 
 pub(crate) struct WireProperties<'a>(pub(crate) &'a UstrMap<Variant>);

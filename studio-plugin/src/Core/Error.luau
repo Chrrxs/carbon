@@ -21,9 +21,6 @@ local Error = {
 	Disconnected = "Disconnected from the server: $1",
 	RestartRequired = "Carbon serve requires a hard restart: $1",
 	ManagedReload = "Managed carbon reload requested: $1",
-	PrivilegedUnavailable = "The exact RML bridge required for Capture Manifest is unavailable: $1",
-	ManifestIdentityUnsupported = "RML does not support Carbon manifest identity GUIDs",
-	ManifestIdentityRejected = "RML rejected the managed-place manifest identity contract",
 	-- Process errors
 	DecodeFailed = "Failed to decode snapshot property: $1 with value: $2",
 	EncodeFailed = "Failed to encode snapshot property: $1 with value: $2",

@@ -79,9 +79,6 @@ verify_change_receipt() {
 		.components.studio_plugin.source_path == "studio-plugin" and
 		(.components.studio_plugin.artifact_path | type == "string") and
 		(.components.studio_plugin.artifact_sha256 | type == "string") and
-		(.components.rml.artifact_path | type == "string") and
-		(.components.rml.artifact_sha256 | type == "string") and
-		(.components.rml.artifact_file_count | type == "number" and . > 0) and
 		(.report.path | type == "string") and
 		(.report.sha256 | type == "string") and
 		.workflow.plan_sha256 == $plan_sha256 and
@@ -105,16 +102,6 @@ verify_change_receipt() {
 		[.report.path, .report.sha256]
 	] | .[] | @tsv' "$receipt")
 	[[ "$(jq -er '.outcome' "$(jq -er '.report.path' "$receipt")")" == "pass" ]] || return 1
-
-	local rml_path
-	local rml_sha256
-	local rml_file_count
-	rml_path="$(jq -er '.components.rml.artifact_path' "$receipt")" || return 1
-	rml_sha256="$(jq -er '.components.rml.artifact_sha256' "$receipt")" || return 1
-	rml_file_count="$(jq -er '.components.rml.artifact_file_count' "$receipt")" || return 1
-	[[ -d "$rml_path" ]] || return 1
-	[[ "$(fingerprint_tree "$rml_path" .)" == "$rml_sha256" ]] || return 1
-	[[ "$(find "$rml_path" -type f -printf '.' | wc -c)" == "$rml_file_count" ]] || return 1
 
 	while IFS=$'\t' read -r log_path log_sha256; do
 		verify_hashed_file "$log_path" "$log_sha256" || return 1

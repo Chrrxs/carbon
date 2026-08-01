@@ -37,7 +37,6 @@ function Core.new(host: string?, port: number?, expectedWorktree: Types.Project?
 	self.executor = Executor.new()
 	self.reconciler = reconciler or MappingReconciler.new()
 	self.tree = self.reconciler.tree
-	self.privilegedCapabilities = nil
 
 	local managedWorkspace = expectedWorktree ~= nil and expectedWorktree.worktreeId ~= nil
 	local serverStorage = game:FindFirstChildOfClass("ServerStorage")
@@ -127,101 +126,32 @@ function Core:run(): Promise.Promise
 		local serverStorage = game:FindFirstChildOfClass("ServerStorage")
 		TransientMetadata.claimMcpPlaceIdTransport(serverStorage, self.client.instanceId)
 
-		-- Negotiation binds this Studio session to its RML bridge for explicit
-		-- native capture. Managed launches wait until the matching bridge arrives;
-		-- removing the managed session marker cancels the wait through Core:stop.
-		local fetchCapabilities = function()
-			return self.client:getPrivilegedCapabilities():expect()
-		end
-		local waitForRetry = function(delay)
-			task.wait(delay)
-		end
-		local privilegedSuccess, privilegedResult
-		if self.expectedWorktree then
-			privilegedSuccess, privilegedResult = BoundedRetry.runUntil(fetchCapabilities, waitForRetry, function()
-				return self.status == Core.Status.Connecting
-			end)
-		else
-			privilegedSuccess, privilegedResult = BoundedRetry.run(fetchCapabilities, waitForRetry)
-		end
-		if not privilegedSuccess then
-			Dom.configurePrivileged(nil, nil)
-			if self.status ~= Core.Status.Connecting then
-				return reject(Error.new(Error.Terminated))
-			end
-			return reject(Error.new(Error.PrivilegedUnavailable, privilegedResult))
-		end
-		if
-			privilegedResult.studioSessionId ~= self.client.studioSessionId
-			or privilegedResult.instanceId ~= self.client.instanceId
-		then
-			Dom.configurePrivileged(nil, nil)
-			return reject(Error.new(Error.PrivilegedUnavailable, "RML bridge routing identity mismatch"))
-		end
-		local privilegedCapabilities = privilegedResult
-		Dom.configurePrivileged(self.client, privilegedCapabilities)
-		self.privilegedCapabilities = privilegedCapabilities
-		if privilegedCapabilities.manifestIdentityLedger ~= true then
-			return reject(Error.new(Error.ManifestIdentityUnsupported))
-		end
-
+		-- Carbon operates entirely through Studio's ordinary plugin surface. Capture
+		-- waits for Studio's next auto-recovery file on the server side.
 		if managedReloadTransitionId ~= nil then
-			-- The replacement Core describes a new mapping contract. Reconcile that
-			-- contract before refreshing the retained native identity ledger. The
-			-- transition identity authorizes that one replacement, including identities
-			-- introduced by the new mapping contract, and the following full capture is
-			-- the server's acknowledgement boundary.
+			-- Reconcile the replacement mapping contract before waiting for the
+			-- auto-recovery snapshot that acknowledges the managed reload.
 			Log.trace("Reconciling replacement filesystem mappings before managed reload acknowledgement..")
 			local report = self:__reconcileMappings()
 			self.tree = self.reconciler.tree
 			Log.debug("Managed reload mapping reconciliation:", report.instances, "instances")
-			local identityBootstrap = self.client:bootstrapManifestIdentities(managedReloadTransitionId):expect()
-			if identityBootstrap.authoritative ~= true then
-				return reject(Error.new(Error.ManifestIdentityRejected))
-			end
 
-			local captureStatus = self.client:requestManifestCapture(nil, true, managedReloadTransitionId):expect()
+			local captureStatus = self.client:requestManifestCapture(nil, managedReloadTransitionId):expect()
 			self:__advanceSourceGeneration(captureStatus.sourceGeneration)
 			self.expectedWorktree.managedReloadTransitionId = nil
 			project = self.client:fetchDetails():expect()
 			self:__verifyProject(project):expect()
 			self.project = project
 		elseif trustedBuiltPlace then
-			if privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then
-				local bootstrapManifestIdentities = function()
-					return self.client:bootstrapManifestIdentities():expect()
-				end
-				local bootstrapSuccess, bootstrapResult
-				if self.expectedWorktree then
-					bootstrapSuccess, bootstrapResult = BoundedRetry.runUntil(
-						bootstrapManifestIdentities,
-						waitForRetry,
-						function()
-							return self.status == Core.Status.Connecting
-						end
-					)
-				else
-					bootstrapSuccess, bootstrapResult = BoundedRetry.run(bootstrapManifestIdentities, waitForRetry)
-				end
-				if not bootstrapSuccess then
-					return reject(bootstrapResult)
-				end
-				local identityBootstrap = bootstrapResult
-				if identityBootstrap.authoritative ~= true then
-					return reject(Error.new(Error.ManifestIdentityRejected))
-				end
-			end
-			Log.trace("Binding generation-matched mapped source identities without hierarchy verification..")
+			Log.trace("Binding generation-matched mapped source identities from the built hierarchy..")
 			local report = self.reconciler:prime(self.client, self.project)
 			self.tree = self.reconciler.tree
 			Log.debug("Attached built mapping identities:", report.instances, "of", report.expected, "instances")
 		else
-			-- Preserve authored Studio state before the source-authoritative mapped
-			-- projection can overwrite properties or remove invalid mapped nodes.
-			-- A full native capture is also the continuity boundary when a retained
-			-- RML ledger reconnects after an edit DataModel replacement.
+			-- Preserve authored Studio state through auto-recovery before the
+			-- source-authoritative mapped projection can overwrite mapped nodes.
 			Log.trace("Capturing the open Studio place before initial mapping reconciliation..")
-			local captureStatus = self.client:requestManifestCapture(nil, true):expect()
+			local captureStatus = self.client:requestManifestCapture(nil):expect()
 			self:__advanceSourceGeneration(captureStatus.sourceGeneration)
 			project = self.client:fetchDetails():expect()
 			self:__verifyProject(project):expect()
@@ -238,6 +168,7 @@ function Core:run(): Promise.Promise
 		end
 		self:__commitManagedProjectName(project.name)
 		self.status = Core.Status.Connected
+		self.client:startAutomaticManifestCapture():expect()
 		self.__ready(project)
 		Log.trace("Starting filesystem sync loop..")
 		return self:__startSyncLoop():expect()
@@ -250,7 +181,6 @@ function Core:stop()
 	end
 	Log.trace("Stopping Carbon core..")
 	self.status = Core.Status.Disconnecting
-	Dom.configurePrivileged(nil, nil)
 	if self.client.isSubscribed then
 		task.spawn(function()
 			self.client:unsubscribe():catch(function(err)
@@ -303,14 +233,9 @@ function Core:captureManifest(
 end
 
 function Core:__reconcileMappings()
-	-- Filesystem mappings use only the ordinary Studio property surface.
-	-- Reflection-protected serialized fields are excluded while the adapter is
-	-- disabled, so engine-owned defaults cannot block script synchronization.
-	Dom.configurePrivileged(nil, nil)
 	local success, result = pcall(function()
 		return self.reconciler:reconcile(self.client, self.project)
 	end)
-	Dom.configurePrivileged(self.client, self.privilegedCapabilities)
 	if not success then
 		error(result, 0)
 	end
@@ -413,6 +338,9 @@ function Core:__startSyncLoop()
 				self:__advanceSourceGeneration(data.sourceGeneration)
 				self.__sync(kind, report)
 			elseif kind == "SyncDetails" then
+				if type(data.sourceGeneration) == "string" and data.sourceGeneration ~= "" then
+					self:__advanceSourceGeneration(data.sourceGeneration)
+				end
 				self:__verifyProject(data):expect()
 				self.project = data
 				self.__sync(kind, data)

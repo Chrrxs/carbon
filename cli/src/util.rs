@@ -15,7 +15,7 @@ use std::{
 	sync::{Mutex, OnceLock},
 };
 
-use crate::rml;
+use crate::studio;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -1161,7 +1161,7 @@ fn windows_path(path: &std::path::Path) -> Result<std::ffi::OsString> {
 }
 
 #[cfg(target_os = "linux")]
-fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Path) -> Result<()> {
+fn generate_api_dump(studio_info: &studio::StudioInfo, output_path: &std::path::Path) -> Result<()> {
 	let (studio, output) = (windows_path(&studio_info.executable)?, windows_path(output_path)?);
 	let mut command = crate::studio::powershell_command()?;
 	command
@@ -1188,7 +1188,7 @@ fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Pat
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Path) -> Result<()> {
+fn generate_api_dump(studio_info: &studio::StudioInfo, output_path: &std::path::Path) -> Result<()> {
 	use std::time::{Duration, Instant};
 
 	let mut child = Command::new(&studio_info.executable)
@@ -1234,7 +1234,7 @@ fn generate_api_dump(studio_info: &rml::StudioInfo, output_path: &std::path::Pat
 	Ok(())
 }
 
-fn get_or_fetch_api_dump(studio_info: &rml::StudioInfo) -> Result<(String, ApiDump)> {
+fn get_or_fetch_api_dump(studio_info: &studio::StudioInfo) -> Result<(String, ApiDump)> {
 	let cache_dir = get_carbon_dir()?
 		.join("reflection")
 		.join(format!("{}-{}", studio_info.build_id, studio_info.version_text));
@@ -1327,7 +1327,7 @@ pub fn init_reflection() -> Result<&'static ReflectionSnapshot> {
 		return Ok(snapshot);
 	}
 
-	let studio_info = rml::get_studio_info()?;
+	let studio_info = studio::get_studio_info()?;
 	let (api_dump, parsed_dump) = get_or_fetch_api_dump(&studio_info)?;
 	let database = build_database_from_api(parsed_dump, studio_info.version_components);
 

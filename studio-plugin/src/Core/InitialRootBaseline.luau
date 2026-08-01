@@ -2,8 +2,8 @@
 
 local InitialRootBaseline = {}
 
--- The bridge's DataModel callback can run before Studio finishes parenting the
--- serialized place roots. The roots endpoint is the authoritative current
+-- Plugin startup can run before Studio finishes parenting the serialized place
+-- roots. The roots endpoint is the authoritative current
 -- enumeration; the plugin's separately frozen hierarchy prevents roots created
 -- later by reconciliation from being adopted.
 function InitialRootBaseline.indexCurrent(roots): { [string]: boolean }

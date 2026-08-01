@@ -15,7 +15,6 @@ required_files=(
 	CONTRIBUTING.md
 	SECURITY.md
 	LICENSE.md
-	rml/THIRD_PARTY_NOTICES.md
 	.github/ISSUE_TEMPLATE/bug_report.yml
 	.github/ISSUE_TEMPLATE/feature_request.yml
 	.github/ISSUE_TEMPLATE/config.yml
@@ -28,7 +27,6 @@ done
 
 ignored_local_paths=(
 	docs/example.md
-	rml/docs/example.md
 	CONTEXT.md
 	AGENTS.md
 	.local/example.txt
@@ -40,7 +38,7 @@ for path in "${ignored_local_paths[@]}"; do
 done
 
 if git -C "$REPO" ls-files --error-unmatch AGENTS.md CONTEXT.md >/dev/null 2>&1 ||
-	git -C "$REPO" ls-files docs rml/docs | grep -q .; then
+	git -C "$REPO" ls-files docs | grep -q .; then
 	fail "local-only documentation is still tracked"
 fi
 
@@ -55,7 +53,7 @@ done
 	fail ".github/FUNDING.yml must not be published"
 
 if grep -Eq '\]\((docs/|CONTEXT\.md|AGENTS\.md|GOAL\.md|CODE_OF_CONDUCT\.md)([)#]|$)' \
-	"${REPO}/README.md" "${REPO}/rml/README.md"; then
+	"${REPO}/README.md"; then
 	fail "public entrypoints link to local-only documentation"
 fi
 
@@ -105,25 +103,10 @@ for license in LICENSE.md cli/crates/config-derive/LICENSE studio-plugin/LICENSE
 		fail "${license} must match the repository MIT license"
 done
 
-third_party_notices="${REPO}/rml/THIRD_PARTY_NOTICES.md"
-for dependency in 'Bullet Physics' 'G3D Innovation Engine' 'Luau' 'Roblox ModLoader'; do
-	grep -Fq "$dependency" "$third_party_notices" ||
-		fail "rml/THIRD_PARTY_NOTICES.md is missing ${dependency}"
-done
-grep -Fq 'Redistribution and use in source and binary forms' "$third_party_notices" ||
-	fail "rml/THIRD_PARTY_NOTICES.md is missing the G3D BSD terms"
-grep -Fq 'Permission is hereby granted' "$third_party_notices" ||
-	fail "rml/THIRD_PARTY_NOTICES.md is missing the MIT terms"
-grep -Fq '$thirdPartyNotices = Join-Path $SourceDir "THIRD_PARTY_NOTICES.md"' \
-	"${REPO}/scripts/build-rml.ps1" ||
-	fail "RML packaging must source the third-party notices"
-grep -Fq 'Copy-Item -LiteralPath $thirdPartyNotices -Destination (Join-Path $stageRml "THIRD_PARTY_NOTICES.md") -Force' \
-	"${REPO}/scripts/build-rml.ps1" ||
-	fail "RML packaging must include the third-party notices"
-grep -Fq 'carbon-studio-helper.cpp' "${REPO}/scripts/build-rml.ps1" ||
-	fail "RML packaging must compile carbon-studio-helper.cpp"
-grep -Fq '(Join-Path $stage "carbon-studio-helper.exe")' "${REPO}/scripts/build-rml.ps1" ||
-	fail "RML packaging must require carbon-studio-helper.exe"
+[[ ! -e "${REPO}/rml" ]] || fail "legacy native modification sources must not be published"
+[[ ! -e "${REPO}/scripts/build-rml.ps1" ]] || fail "legacy native modification build tooling must not be published"
+grep -Fq 'CAPTURE_TIMEOUT: Duration = Duration::from_secs(6 * 60)' "${REPO}/cli/src/recovery.rs" ||
+	fail "recovery capture must retain its six-minute timeout"
 
 grep -Fq '## System requirements' "${REPO}/README.md" ||
 	fail "README.md must state system requirements"
@@ -197,7 +180,6 @@ required_ci_checks=(
 	'cargo test --locked --all-targets --verbose'
 	'carbon-qualify -- validate qualification/suites/carbon-release.json'
 	'./scripts/test-build-optimization'
-	'./scripts/test-rml-build-optimization'
 	'./scripts/test-release-installer'
 	'./scripts/test-release-workflow'
 	'./scripts/test-public-readiness'
@@ -207,9 +189,6 @@ required_ci_checks=(
 	'selene src'
 	'stylua src scripts --check'
 	'./scripts/build-studio-plugin target/Carbon.rbxm'
-	'dotnet test rml/code/dotnet/Runtime/Runtime.slnx -c Release --nologo'
-	'dotnet test rml/code/dotnet/Roblox/Roblox.slnx -c Release --nologo'
-	'dotnet test rml/code/dotnet/CarbonBridge.Tests/CarbonBridge.Tests.csproj -c Release --nologo'
 )
 for check in "${required_ci_checks[@]}"; do
 	grep -Fq -- "$check" "$ci_workflow" ||

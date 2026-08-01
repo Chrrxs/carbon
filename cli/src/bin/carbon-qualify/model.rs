@@ -239,18 +239,6 @@ impl Step {
 				ensure!(!snapshot.trim().is_empty(), "snapshot name must not be empty");
 				ensure!(!path.trim().is_empty(), "snapshot path must not be empty");
 			}
-			Action::StartCrashWatch {
-				watcher,
-				crash_dir,
-				rml_log_dir,
-			} => {
-				ensure!(!watcher.trim().is_empty(), "crash watcher name must not be empty");
-				ensure!(!crash_dir.trim().is_empty(), "crash directory must not be empty");
-				ensure!(!rml_log_dir.trim().is_empty(), "RML log directory must not be empty");
-			}
-			Action::AssertNoCrash { watcher } => {
-				ensure!(!watcher.trim().is_empty(), "crash watcher name must not be empty");
-			}
 			Action::AssertNumericDelta {
 				before,
 				after,
@@ -263,15 +251,31 @@ impl Step {
 					"maximum numeric increase must be finite and non-negative"
 				);
 			}
-			Action::ExportStudioPlace {
-				endpoint,
-				token,
-				output,
-				..
+			Action::AssertPlaceInstance {
+				path,
+				instance_path,
+				class_name,
+				properties,
+				attributes,
 			} => {
-				ensure!(!endpoint.trim().is_empty(), "Studio export endpoint must not be empty");
-				ensure!(!token.trim().is_empty(), "Studio export token must not be empty");
-				ensure!(!output.trim().is_empty(), "Studio export output must not be empty");
+				ensure!(!path.trim().is_empty(), "place path must not be empty");
+				ensure!(!instance_path.is_empty(), "instance path must not be empty");
+				ensure!(
+					instance_path.iter().all(|segment| !segment.trim().is_empty()),
+					"instance path segments must not be empty"
+				);
+				ensure!(!class_name.trim().is_empty(), "instance class must not be empty");
+				ensure!(
+					!properties.is_empty() || !attributes.is_empty(),
+					"place assertion must include at least one property or attribute"
+				);
+				for (name, expected) in properties.iter().chain(attributes) {
+					ensure!(
+						!name.trim().is_empty(),
+						"expected property or attribute name must not be empty"
+					);
+					validate_place_value(expected)?;
+				}
 			}
 		}
 		Ok(())
@@ -355,26 +359,33 @@ pub enum Action {
 		#[serde(default = "default_true")]
 		check_mtime: bool,
 	},
-	StartCrashWatch {
-		watcher: String,
-		crash_dir: String,
-		rml_log_dir: String,
-	},
-	AssertNoCrash {
-		watcher: String,
-	},
 	AssertNumericDelta {
 		before: String,
 		after: String,
 		max_increase: f64,
 	},
-	ExportStudioPlace {
-		endpoint: String,
-		token: String,
-		output: String,
-		#[serde(default = "default_mcp_timeout")]
-		timeout_seconds: u64,
+	AssertPlaceInstance {
+		path: String,
+		instance_path: Vec<String>,
+		#[serde(rename = "class")]
+		class_name: String,
+		#[serde(default)]
+		properties: BTreeMap<String, Value>,
+		#[serde(default)]
+		attributes: BTreeMap<String, Value>,
 	},
+}
+
+fn validate_place_value(value: &Value) -> Result<()> {
+	let supported = matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_))
+		|| value
+			.as_array()
+			.is_some_and(|components| components.len() == 3 && components.iter().all(Value::is_number));
+	ensure!(
+		supported,
+		"place values must be booleans, numbers, strings, or three-number vectors"
+	);
+	Ok(())
 }
 
 fn default_command_timeout() -> u64 {
@@ -596,210 +607,102 @@ mod tests {
 		suite.validate().unwrap();
 	}
 
-	#[test]
-	fn release_suite_contains_mapped_identity_live_regression() {
+	fn release_suite() -> Value {
 		let suite_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
 			.parent()
 			.unwrap()
 			.join("qualification/suites/carbon-release.json");
-		let suite: Value = serde_json::from_slice(&std::fs::read(suite_path).unwrap()).unwrap();
+		serde_json::from_slice(&std::fs::read(suite_path).unwrap()).unwrap()
+	}
+
+	#[test]
+	fn release_suite_exercises_auto_recovery_capture() {
+		let suite = release_suite();
+		let deterministic = suite["scenarios"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|scenario| scenario["name"] == "deterministic-installed-build")
+			.expect("release suite is missing deterministic build coverage");
+		let offline = deterministic["steps"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|step| step["name"] == "capture-offline-binary-place")
+			.expect("release suite is missing offline binary-place capture");
+		assert_eq!(
+			offline["args"],
+			serde_json::json!(["capture", "${project}", "${studio_launch_path}", "--color", "never"])
+		);
 		let scenario = suite["scenarios"]
 			.as_array()
 			.unwrap()
 			.iter()
-			.find(|scenario| scenario["name"] == "managed-studio-runtime")
-			.expect("release suite is missing the managed Studio scenario");
-		assert!(
-			scenario["tags"]
-				.as_array()
-				.unwrap()
-				.iter()
-				.any(|tag| tag == "mapped_identity"),
-			"managed Studio scenario is missing the mapped_identity tag"
-		);
-		let step_names = scenario["steps"]
+			.find(|scenario| scenario["name"] == "managed-studio-auto-recovery-capture")
+			.expect("release suite is missing the auto-recovery scenario");
+		let steps = scenario["steps"].as_array().unwrap();
+		let capture = steps
+			.iter()
+			.find(|step| step["name"] == "stop-after-next-auto-recovery")
+			.expect("release suite is missing recovery-backed stop");
+		assert!(capture["timeout_seconds"].as_u64().unwrap() >= 390);
+		assert!(capture["stderr_contains"]
 			.as_array()
 			.unwrap()
 			.iter()
-			.filter_map(|step| step["name"].as_str())
-			.collect::<std::collections::HashSet<_>>();
-		for required in [
-			"create-live-mapped-reference",
-			"verify-live-mapped-identity-metadata",
-			"rebuild-live-mapped-reference",
-			"remove-live-mapped-identity",
-			"missing-live-mapped-identity-blocks-build",
-			"restore-live-mapped-identity",
-			"capture-corrected-live-manifest",
-			"build-after-live-manifest-correction",
-			"corrected-live-manifest-rebuild-parity",
-		] {
-			assert!(step_names.contains(required), "release suite is missing {required}");
-		}
+			.any(|value| value == "auto-recovery"));
+		assert!(!capture["args"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.any(|value| value == "--force-full"));
+		assert!(capture["args"].as_array().unwrap().iter().any(|value| value == "stop"));
+		assert!(steps
+			.iter()
+			.any(|step| step["name"] == "verify-rebuilt-place-contains-live-edit"));
 	}
 
 	#[test]
-	fn release_suite_gates_optimized_capture_against_a_forced_full_oracle() {
-		let suite_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-			.parent()
-			.unwrap()
-			.join("qualification/suites/carbon-release.json");
-		let suite: Value = serde_json::from_slice(&std::fs::read(suite_path).unwrap()).unwrap();
+	fn release_suite_verifies_the_rebuilt_capture_state() {
+		let suite = release_suite();
 		let steps = suite["scenarios"]
 			.as_array()
 			.unwrap()
 			.iter()
-			.find(|scenario| scenario["name"] == "managed-studio-runtime")
-			.expect("release suite is missing the managed Studio scenario")["steps"]
+			.find(|scenario| scenario["name"] == "managed-studio-auto-recovery-capture")
+			.unwrap()["steps"]
 			.as_array()
 			.unwrap();
-		let step = |name: &str| {
-			steps
-				.iter()
-				.find(|step| step["name"] == name)
-				.unwrap_or_else(|| panic!("release suite is missing {name}"))
-		};
+		let assertion = steps
+			.iter()
+			.find(|step| step["name"] == "verify-rebuilt-capture-state")
+			.expect("release suite does not inspect the rebuilt RBXL state");
 
-		let mutation = step("mutate-captured-datamodel")["arguments"]["code"].as_str().unwrap();
-		for evidence in [
-			".Source",
-			"SetAttribute",
-			"ObjectValue",
-			".CFrame",
-			".Parent",
-			"Destroy",
-			"AddTag",
-			"Lighting",
-		] {
-			assert!(
-				mutation.contains(evidence),
-				"live capture mutation is missing {evidence}"
-			);
-		}
-		assert!(step("forced-full-capture-oracle")["args"]
-			.as_array()
-			.unwrap()
-			.iter()
-			.any(|argument| argument == "--force-full"));
-		assert!(step("unchanged-managed-launch-capture")["stderr_contains"]
-			.as_array()
-			.unwrap()
-			.iter()
-			.any(|output| output == "exact no-op"));
-		assert!(
-			step("unchanged-managed-launch-capture")["timeout_seconds"]
-				.as_u64()
-				.unwrap() >= 60,
-			"the fresh-install capture gate must outlast bridge readiness retries"
-		);
-		assert_eq!(step("unchanged-managed-launch-preserves-baseline")["check_mtime"], true);
-		let step_index = |name: &str| {
-			steps
-				.iter()
-				.position(|candidate| candidate["name"] == name)
-				.unwrap_or_else(|| panic!("release suite is missing {name}"))
-		};
-		assert!(
-			step_index("unchanged-managed-launch-capture") < step_index("edit-datamodel-probe"),
-			"the launch no-op gate must run before any edit-target execution"
-		);
+		assert_eq!(assertion["kind"], "assert_place_instance");
+		assert_eq!(assertion["path"], "${capture_rebuild_output}");
 		assert_eq!(
-			step("end-test-does-not-focus-managed-studio")["args"],
-			serde_json::json!(["assert-not", "${studio_pid}"]),
-			"the final focus check must only reject the managed test Studio"
+			assertion["instance_path"],
+			serde_json::json!(["Workspace", "CarbonAutoRecoveryProbe"])
 		);
-		assert_eq!(
-			step("optimized-capture-matches-forced-full-oracle")["check_mtime"],
-			false
-		);
-		assert_eq!(
-			step("warm-capture-preserves-forced-full-fixed-point")["check_mtime"],
-			true
-		);
+		assert_eq!(assertion["class"], "Part");
+		assert_eq!(assertion["properties"]["Anchored"], true);
+		assert_eq!(assertion["properties"]["Size"], serde_json::json!([7, 3, 5]));
+		assert_eq!(assertion["attributes"]["CapturedThroughAutoRecovery"], true);
 	}
 
 	#[test]
-	fn release_suite_requires_carbon_stop_to_report_automatic_capture() {
-		let suite_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-			.parent()
-			.unwrap()
-			.join("qualification/suites/carbon-release.json");
-		let suite: Value = serde_json::from_slice(&std::fs::read(suite_path).unwrap()).unwrap();
-		let cleanup = suite["scenarios"]
-			.as_array()
-			.unwrap()
-			.iter()
-			.find(|scenario| scenario["name"] == "managed-studio-runtime")
-			.expect("release suite is missing the managed Studio scenario")["cleanup"]
-			.as_array()
-			.unwrap();
-		let stop = cleanup
-			.iter()
-			.find(|step| step["name"] == "stop-managed-serve-and-studio")
-			.expect("release suite is missing managed Carbon stop");
-		let output = stop["stderr_contains"]
-			.as_array()
-			.expect("managed Carbon stop must assert its capture result");
-		assert!(output.iter().any(|value| value == "Capture Manifest completed"));
-		assert!(output.iter().any(|value| value == "Carbon stopped successfully"));
-	}
-
-	#[test]
-	fn release_suite_contains_procedural_mapped_generator_live_regression() {
-		let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-		let suite: Value =
-			serde_json::from_slice(&std::fs::read(root.join("qualification/suites/carbon-release.json")).unwrap())
-				.unwrap();
+	fn release_suite_requires_deterministic_builds() {
+		let suite = release_suite();
 		let scenario = suite["scenarios"]
 			.as_array()
 			.unwrap()
 			.iter()
-			.find(|scenario| scenario["name"] == "managed-studio-runtime")
-			.expect("release suite is missing the managed Studio scenario");
+			.find(|scenario| scenario["name"] == "deterministic-installed-build")
+			.expect("release suite is missing deterministic build coverage");
 		let steps = scenario["steps"].as_array().unwrap();
-		let step_names = steps
+		assert!(steps.iter().any(|step| step["name"] == "stable-build-bytes"));
+		assert!(steps
 			.iter()
-			.filter_map(|step| step["name"].as_str())
-			.collect::<std::collections::HashSet<_>>();
-		for required in [
-			"create-live-procedural-models-with-mapped-generator",
-			"capture-live-procedural-generator-reference",
-			"verify-live-procedural-generator-metadata",
-			"verify-live-procedural-regeneration-after-capture",
-			"missing-procedural-generator-id-blocks-build",
-			"clear-one-of-two-procedural-generators",
-			"remaining-procedural-generator-reference-still-blocks-build",
-			"clear-final-procedural-generator",
-			"corrected-procedural-manifest-builds-without-generator-id",
-			"corrected-procedural-manifest-rebuild-parity",
-		] {
-			assert!(step_names.contains(required), "release suite is missing {required}");
-		}
-		let creation_code = steps
-			.iter()
-			.find(|step| step["name"] == "create-live-procedural-models-with-mapped-generator")
-			.and_then(|step| step["arguments"]["code"].as_str())
-			.expect("procedural model creation step has no Luau body");
-		assert!(
-			creation_code.contains(
-				"assert(model:ForceGeneration(), name .. ' parameter generation did not start'); assert(model:WaitForGenerationAsync(), name .. ' parameter generation failed: ' .. model.GenerationError)"
-			),
-			"every procedural model must explicitly start and await parameter generation"
-		);
-		assert!(
-			creation_code.contains(
-				"assert(model:ForceGeneration(), name .. ' attribute generation did not start'); assert(model:WaitForGenerationAsync(), name .. ' attribute generation failed: ' .. model.GenerationError)"
-			),
-			"every procedural model must explicitly start and await attribute generation"
-		);
-		assert!(
-			!creation_code.contains("task.wait"),
-			"procedural model quiescence must use the engine await instead of a fixed delay"
-		);
-
-		let generator = std::fs::read_to_string(root.join("qualification/fixtures/ProceduralGenerator/init.luau"))
-			.expect("release qualification is missing its mapped procedural generator");
-		assert!(generator.contains("Attributes"));
-		assert!(generator.contains("OnGenerate"));
+			.any(|step| step["name"] == "stable-manifest-bytes-and-mtimes"));
 	}
 }

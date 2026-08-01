@@ -130,9 +130,9 @@ return function(props: Props): { Instance }
 					Text = Computed(function(use)
 						local compact = use(compactActions)
 						if use(captureState) == "running" then
-							return if compact then "Saving..." else "Capturing..."
+							return if compact then "Waiting..." else "Waiting for Auto-Capture..."
 						end
-						return if compact then "Capture" else "Capture Manifest"
+						return if compact then "Wait" else "Wait for Auto-Capture"
 					end),
 					TextSize = Theme.TextSize.Small,
 					Active = Computed(function(use)
@@ -147,7 +147,7 @@ return function(props: Props): { Instance }
 							return
 						end
 						captureState:set("running")
-						captureMessage:set("Requesting a native Studio snapshot...")
+						captureMessage:set("Waiting for the current Studio auto-recovery capture...")
 						props.App.core
 							:captureManifest(function(status)
 								captureState:set(status.state)

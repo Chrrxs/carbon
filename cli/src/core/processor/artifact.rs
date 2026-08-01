@@ -21,7 +21,6 @@ use crate::{
 	artifact_store::{self, ArtifactStore},
 	core::{changes::Changes, snapshot::Snapshot, tree::Tree},
 	lock,
-	privileged_bridge::{Bridge, Capabilities},
 	project::{self, PreparedCapturePromotion},
 };
 
@@ -33,14 +32,6 @@ const COMPLETED_TRANSACTION_TTL: Duration = Duration::from_secs(60 * 60);
 const TRANSACTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) struct CapturePrecommitAttestation {
-	pub bridge: Bridge,
-	pub bridge_id: String,
-	pub process_id: u32,
-	pub studio_session_id: String,
-	pub instance_id: String,
-	pub engine_generation: u64,
-	pub hierarchy_sequence: u64,
-	pub change_sequence: u64,
 	pub project_path: PathBuf,
 	pub project_document: Vec<u8>,
 	pub previous_projected: Snapshot,
@@ -50,22 +41,6 @@ pub(crate) struct CapturePrecommitAttestation {
 
 impl CapturePrecommitAttestation {
 	fn validate(&self) -> Result<()> {
-		let current: Capabilities = self.bridge.get("v1/capabilities")?;
-		ensure!(
-			current.bridge_id == self.bridge_id
-				&& current.process_id == self.process_id
-				&& current.studio_session_id == self.studio_session_id
-				&& current.instance_id == self.instance_id,
-			"Studio capture route changed during staging"
-		);
-		ensure!(
-			current.engine_ready && current.engine_generation == self.engine_generation,
-			"Studio native observation engine changed during staging"
-		);
-		ensure!(
-			current.hierarchy_sequence == self.hierarchy_sequence && current.change_sequence == self.change_sequence,
-			"Studio changed during Capture Manifest staging; retry the capture"
-		);
 		ensure!(
 			project::exact_projected_realization_generation(
 				&self.project_path,
@@ -117,12 +92,6 @@ enum WritePayload {
 	PreparedCapture {
 		projected_tree: Tree,
 		promotion: PreparedCapturePromotion,
-		phase: Arc<AtomicU8>,
-		expected_generation: String,
-		attestation: CapturePrecommitAttestation,
-	},
-	PreparedCaptureNoop {
-		receipt: artifact_store::ValidatedArtifactReceipt,
 		phase: Arc<AtomicU8>,
 		expected_generation: String,
 		attestation: CapturePrecommitAttestation,
@@ -213,33 +182,6 @@ impl ArtifactProcessor {
 								store.install_projected_receipt(&receipt);
 								drop(cleanup);
 								Ok(Some(receipt.generation().to_owned()))
-							})(),
-							WritePayload::PreparedCaptureNoop {
-								receipt,
-								phase,
-								expected_generation,
-								attestation,
-							} => (|| -> Result<Option<String>> {
-								ensure!(
-									receipt.generation() == expected_generation,
-									"validated capture receipt does not match the served source generation"
-								);
-								// Revalidate the artifact and every referenced blob under the
-								// commit lock. The canonical artifact generation transitively
-								// binds blob hashes, but a blob can be externally replaced
-								// without changing the artifact bytes themselves.
-								let current_receipt =
-									artifact_store::validated_artifact_receipt(store.artifact_path())?;
-								let current_generation = current_receipt.generation();
-								ensure!(
-									current_generation == receipt.generation(),
-									"validated capture artifact changed before the exact no-op claim"
-								);
-								validate_and_claim_capture(&phase, &expected_generation, current_generation, || {
-									attestation.validate()
-								})?;
-								phase.store(crate::core::CAPTURE_COMMITTED, Ordering::Release);
-								Ok(Some(current_generation.to_owned()))
 							})(),
 						}
 					};
@@ -449,21 +391,6 @@ impl ArtifactProcessor {
 		self.submit(WritePayload::PreparedCapture {
 			projected_tree,
 			promotion,
-			phase,
-			expected_generation,
-			attestation,
-		})
-	}
-
-	pub(crate) fn commit_capture_noop(
-		&self,
-		receipt: artifact_store::ValidatedArtifactReceipt,
-		phase: Arc<AtomicU8>,
-		expected_generation: String,
-		attestation: CapturePrecommitAttestation,
-	) -> Result<String> {
-		self.submit(WritePayload::PreparedCaptureNoop {
-			receipt,
 			phase,
 			expected_generation,
 			attestation,

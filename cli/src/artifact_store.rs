@@ -5,7 +5,7 @@
 //! content-addressed blobs; callers never depend on the physical encoding.
 
 use anyhow::{bail, ensure, Context, Result};
-use rbx_binary::{DecodeSink, Deserializer, InstanceSource, InstanceView, Serializer};
+use rbx_binary::{Deserializer, InstanceSource, InstanceView, Serializer};
 use rbx_dom_weak::{
 	types::{Attributes, BinaryString, Content, ContentType, Ref, SharedString, Variant},
 	InstanceBuilder, Ustr, UstrMap, WeakDom,
@@ -14,8 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 #[cfg(test)]
 use std::cell::Cell;
-#[cfg(test)]
-use std::time::SystemTime;
 use std::{
 	collections::{BTreeMap, HashMap, HashSet},
 	fs::{self, File, OpenOptions},
@@ -37,11 +35,7 @@ use crate::{
 };
 
 use crate::source_wire::{adapt_lighting_output_properties, normalize_wire_attributes};
-pub(crate) use crate::source_wire::{
-	canonical_property_name, canonical_property_serializes, canonical_variant_type, capture_synthesized_defaults,
-	cframe_semantically_equal, decode_exact_raw, exact_raw_bytes, is_omittable_default, validate_capture_property,
-	WireProperties,
-};
+pub(crate) use crate::source_wire::{canonical_property_name, WireProperties};
 
 pub const MANIFEST_IDENTITY_ATTRIBUTE: &str = "__StudioWorktree_CarbonManifestId";
 pub(crate) const CAPTURE_FINGERPRINT_METADATA_KEY: &str = "CarbonCaptureFingerprintV2";
@@ -53,8 +47,6 @@ const VERSION: u32 = 1;
 const FLAGS: u32 = 0;
 const FIXED_HEADER_BYTES: u64 = 96;
 const BLOB_THRESHOLD: usize = 16 * 1024;
-const CAPTURE_PARTITION_BITS: usize = 12;
-const CAPTURE_PARTITION_COUNT: usize = 1 << CAPTURE_PARTITION_BITS;
 
 #[cfg(test)]
 thread_local! {
@@ -194,10 +186,12 @@ impl ValidatedArtifactReceipt {
 		&self.name
 	}
 
+	#[cfg(test)]
 	pub(crate) fn capture_fingerprint(&self) -> Option<&str> {
 		self.metadata.get(CAPTURE_FINGERPRINT_METADATA_KEY).map(String::as_str)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn project_generation(&self) -> Option<&str> {
 		self.metadata
 			.get(CAPTURE_PROJECT_GENERATION_METADATA_KEY)
@@ -3170,276 +3164,13 @@ impl SourceReader {
 	}
 
 	pub(crate) fn install_projected_state(&self, selected: HashSet<Ref>, generation: String) -> Result<()> {
-		// Capture's projected tree is the processor's bounded topology state, not
-		// an authoritative property snapshot. In particular, native capture may
-		// retain default script Sources there while the committed artifact holds
-		// the complete filesystem-backed source bytes.
+		// The projected tree is the processor's bounded topology state. The
+		// committed artifact retains the complete filesystem-backed source bytes.
 		self.set_projected_source_ids(selected, generation)
 	}
 
 	pub(crate) fn set_generation(&self, generation: String) {
 		*self.generation_override.write().unwrap() = Some(generation);
-	}
-}
-
-fn capture_partition(referent: Ref) -> Result<usize> {
-	let bytes = ref_bytes(referent)?;
-	Ok(((usize::from(bytes[0]) << 8) | usize::from(bytes[1])) >> (16 - CAPTURE_PARTITION_BITS))
-}
-
-pub(crate) fn partition_for_ref(referent: Ref) -> Result<usize> {
-	capture_partition(referent)
-}
-
-#[derive(Deserialize, Serialize)]
-struct SpooledProperty {
-	referent: Ref,
-	name: Ustr,
-	value: Variant,
-}
-
-struct PropertySpoolWriter {
-	writer: BufWriter<File>,
-	buffer: Vec<u8>,
-}
-
-impl PropertySpoolWriter {
-	fn append(&mut self, property: &SpooledProperty) -> Result<()> {
-		self.buffer.clear();
-		rmp_serde::encode::write(&mut self.buffer, property)?;
-		let len = u32::try_from(self.buffer.len()).context("serialized property exceeds 4 GiB")?;
-		self.writer.write_all(&len.to_le_bytes())?;
-		self.writer.write_all(&self.buffer)?;
-		Ok(())
-	}
-
-	fn finish(mut self) -> Result<()> {
-		self.writer.flush()?;
-		Ok(())
-	}
-}
-
-fn spool_path(directory: &Path, partition: usize) -> PathBuf {
-	directory.join(format!("{partition:04x}.properties"))
-}
-
-pub(crate) struct CapturePropertySpools {
-	directory: PathBuf,
-	writers: Option<HashMap<usize, PropertySpoolWriter>>,
-}
-
-impl std::fmt::Debug for CapturePropertySpools {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		formatter
-			.debug_struct("CapturePropertySpools")
-			.field("directory", &self.directory)
-			.finish_non_exhaustive()
-	}
-}
-
-impl CapturePropertySpools {
-	pub(crate) fn new(directory: PathBuf) -> Result<Self> {
-		fs::create_dir_all(&directory)?;
-		Ok(Self {
-			directory,
-			writers: Some(HashMap::new()),
-		})
-	}
-
-	pub(crate) fn append(&mut self, referent: Ref, name: Ustr, value: Variant) -> Result<()> {
-		let partition = capture_partition(referent)?;
-		let writers = self.writers.as_mut().context("property spool is already finished")?;
-		if let std::collections::hash_map::Entry::Vacant(entry) = writers.entry(partition) {
-			let file = OpenOptions::new()
-				.create(true)
-				.append(true)
-				.open(spool_path(&self.directory, partition))?;
-			entry.insert(PropertySpoolWriter {
-				writer: BufWriter::with_capacity(1024, file),
-				buffer: Vec::new(),
-			});
-		}
-		writers
-			.get_mut(&partition)
-			.unwrap()
-			.append(&SpooledProperty { referent, name, value })
-	}
-
-	pub(crate) fn finish(&mut self) -> Result<()> {
-		if let Some(writers) = self.writers.take() {
-			for writer in writers.into_values() {
-				writer.finish()?;
-			}
-		}
-		Ok(())
-	}
-
-	pub(crate) fn read_partition(&self, partition: usize) -> Result<HashMap<Ref, UstrMap<Variant>>> {
-		let path = spool_path(&self.directory, partition);
-		if !path.exists() {
-			return Ok(HashMap::new());
-		}
-		let mut reader = BufReader::new(File::open(path)?);
-		let mut result = HashMap::<Ref, UstrMap<Variant>>::new();
-		loop {
-			let mut width = [0; 4];
-			match reader.read_exact(&mut width) {
-				Ok(()) => {}
-				Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-				Err(error) => return Err(error.into()),
-			}
-			let mut bytes = vec![0; u32::from_le_bytes(width) as usize];
-			reader.read_exact(&mut bytes)?;
-			let property: SpooledProperty = rmp_serde::from_slice(&bytes)?;
-			result
-				.entry(property.referent)
-				.or_default()
-				.insert(property.name, property.value);
-		}
-		Ok(result)
-	}
-
-	pub(crate) fn cleanup(&self) -> Result<()> {
-		if self.directory.exists() {
-			fs::remove_dir_all(&self.directory)?;
-		}
-		Ok(())
-	}
-}
-
-impl Drop for CapturePropertySpools {
-	fn drop(&mut self) {
-		let _ = self.cleanup();
-	}
-}
-
-struct CanonicalCFrameSink<'a> {
-	ids: &'a [[u8; 16]],
-	spools: &'a mut CapturePropertySpools,
-	cancelled: &'a dyn Fn() -> bool,
-}
-
-impl DecodeSink for CanonicalCFrameSink<'_> {
-	fn property(&mut self, referent: Ref, name: Ustr, value: Variant) -> std::result::Result<(), String> {
-		if (self.cancelled)() {
-			return Err("Capture Manifest was cancelled during canonical CFrame staging".to_owned());
-		}
-		if !matches!(value, Variant::CFrame(_)) {
-			return Ok(());
-		}
-		let stable = stable_binary_ref(referent, self.ids).map_err(|error| error.to_string())?;
-		self.spools
-			.append(stable, name, value)
-			.map_err(|error| error.to_string())
-	}
-}
-
-pub(crate) fn canonical_cframe_spools(
-	artifact_path: &Path,
-	directory: PathBuf,
-	cancelled: &dyn Fn() -> bool,
-) -> Result<CapturePropertySpools> {
-	ensure!(
-		!cancelled(),
-		"Capture Manifest was cancelled before canonical CFrame staging"
-	);
-	let artifact = Artifact::open(artifact_path)?;
-	let mut spools = CapturePropertySpools::new(directory)?;
-	let decoder = Deserializer::new(util::get_reflection_database()).strict(true);
-	{
-		let mut sink = CanonicalCFrameSink {
-			ids: &artifact.sideband.ids,
-			spools: &mut spools,
-			cancelled,
-		};
-		decoder.deserialize_properties_with_sink(BufReader::new(artifact.payload()?), &mut sink)?;
-	}
-	spools.finish()?;
-	Ok(spools)
-}
-
-pub(crate) struct ArtifactReferents {
-	name: String,
-	ids: Vec<Ref>,
-}
-
-impl ArtifactReferents {
-	pub(crate) fn name(&self) -> &str {
-		&self.name
-	}
-
-	#[cfg(test)]
-	pub(crate) fn all(&self) -> HashSet<Ref> {
-		self.ids.iter().copied().collect()
-	}
-
-	pub(crate) fn residual(&self, claimed: &HashSet<Ref>) -> HashSet<Ref> {
-		self.ids.iter().copied().filter(|id| !claimed.contains(id)).collect()
-	}
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PriorIdentityHeader {
-	pub id: Ref,
-	pub parent: Option<Ref>,
-	pub class: Ustr,
-	pub semantic_name: [u8; 32],
-}
-
-#[derive(Clone)]
-pub(crate) struct PriorIdentityNode {
-	pub id: Ref,
-	pub parent: Option<Ref>,
-	pub class: Ustr,
-	pub name: String,
-	pub raw_name: Option<serde_bytes::ByteBuf>,
-	pub properties: UstrMap<Variant>,
-	pub children: Vec<Ref>,
-}
-
-#[derive(Debug)]
-pub(crate) struct CaptureStagePlan {
-	dirty_buckets: HashSet<usize>,
-	fresh: bool,
-}
-
-impl CaptureStagePlan {
-	pub(crate) fn semantic_noop(path: &Path) -> Result<Self> {
-		Artifact::open(path)?;
-		Ok(Self {
-			dirty_buckets: HashSet::new(),
-			fresh: false,
-		})
-	}
-
-	pub(crate) fn fresh() -> Self {
-		Self {
-			dirty_buckets: (0..CAPTURE_PARTITION_COUNT).collect(),
-			fresh: true,
-		}
-	}
-
-	pub(crate) fn from_artifact_cancellable(
-		path: &Path,
-		dirty_buckets: HashSet<usize>,
-		cancelled: &dyn Fn() -> bool,
-	) -> Result<Self> {
-		ensure!(!cancelled(), "Capture Manifest was cancelled during artifact staging");
-		Artifact::open(path)?;
-		ensure!(
-			dirty_buckets
-				.iter()
-				.all(|partition| *partition < CAPTURE_PARTITION_COUNT),
-			"capture stage plan contains an invalid partition"
-		);
-		Ok(Self {
-			dirty_buckets,
-			fresh: false,
-		})
-	}
-
-	pub(crate) fn dirty_buckets(&self) -> &HashSet<usize> {
-		&self.dirty_buckets
 	}
 }
 
@@ -3526,143 +3257,6 @@ fn artifact_build_generation(artifact: &Artifact, bytes: &[u8]) -> Result<String
 		hasher.update(field);
 	}
 	Ok(hasher.finalize().to_hex().to_string())
-}
-
-#[cfg(test)]
-pub(crate) fn artifact_referents(path: &Path) -> Result<ArtifactReferents> {
-	artifact_referents_cancellable(path, &|| false)
-}
-
-pub(crate) fn artifact_referents_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<ArtifactReferents> {
-	let artifact = Artifact::open(path)?;
-	let mut ids = Vec::with_capacity(artifact.sideband.ids.len());
-	for id in source_ids(&artifact) {
-		ensure!(!cancelled(), "Capture Manifest was cancelled during identity staging");
-		ids.push(id);
-	}
-	ids.sort_unstable_by_key(ToString::to_string);
-	Ok(ArtifactReferents {
-		name: artifact.sideband.name,
-		ids,
-	})
-}
-
-pub(crate) fn visit_prior_identity_headers_cancellable(
-	path: &Path,
-	cancelled: &dyn Fn() -> bool,
-	mut visit: impl FnMut(PriorIdentityHeader) -> Result<()>,
-) -> Result<()> {
-	let artifact = Artifact::open(path)?;
-	let structure = Deserializer::new(util::get_reflection_database())
-		.strict(true)
-		.deserialize_structure(BufReader::new(artifact.payload()?))?;
-	let synthetic_root = structure
-		.get_by_ref(structure.root_ref())
-		.context("artifact RBXL synthetic root is missing")?;
-	ensure!(
-		synthetic_root.children.len() == 1,
-		"Carbon artifact RBXL payload must have one root"
-	);
-	let binary_root = synthetic_root.children[0];
-	let root_instance = structure
-		.get_by_ref(binary_root)
-		.context("artifact RBXL root is missing")?;
-	let root = stable_binary_ref(binary_root, &artifact.sideband.ids)?;
-	ensure!(
-		root == ref_from_bytes(artifact.sideband.root),
-		"root identity sideband mismatch"
-	);
-	visit(PriorIdentityHeader {
-		id: root,
-		parent: None,
-		class: root_instance.class,
-		semantic_name: *blake3::hash(root_instance.name.as_bytes()).as_bytes(),
-	})?;
-	let mut stack = root_instance
-		.children
-		.iter()
-		.rev()
-		.map(|id| (*id, root))
-		.collect::<Vec<_>>();
-	while let Some((binary, parent)) = stack.pop() {
-		ensure!(
-			!cancelled(),
-			"Capture Manifest was cancelled during prior identity staging"
-		);
-		let instance = structure
-			.get_by_ref(binary)
-			.context("artifact structure instance is missing")?;
-		let id = stable_binary_ref(binary, &artifact.sideband.ids)?;
-		visit(PriorIdentityHeader {
-			id,
-			parent: Some(parent),
-			class: instance.class,
-			semantic_name: *blake3::hash(instance.name.as_bytes()).as_bytes(),
-		})?;
-		stack.extend(instance.children.iter().rev().map(|child| (*child, id)));
-	}
-	Ok(())
-}
-
-pub(crate) fn visit_prior_identity_nodes_cancellable(
-	path: &Path,
-	cancelled: &dyn Fn() -> bool,
-	mut visit: impl FnMut(PriorIdentityNode) -> Result<()>,
-) -> Result<()> {
-	let loaded = load_tree(path)?;
-	for id in loaded.tree.subtree_refs(loaded.tree.root_ref())? {
-		ensure!(
-			!cancelled(),
-			"Capture Manifest was cancelled during prior evidence staging"
-		);
-		let node = loaded.tree.get_instance(id).context("prior artifact node is missing")?;
-		let raw_name = node
-			.properties
-			.get(&Ustr::from("__CarbonRawName"))
-			.and_then(|value| match value {
-				Variant::BinaryString(value) => Some(serde_bytes::ByteBuf::from(value.clone().into_vec())),
-				_ => None,
-			});
-		visit(PriorIdentityNode {
-			id,
-			parent: node.parent().is_some().then_some(node.parent()),
-			class: node.class,
-			name: node.name.clone(),
-			raw_name,
-			properties: node.properties.clone(),
-			children: node.children().to_vec(),
-		})?;
-	}
-	Ok(())
-}
-
-pub(crate) fn load_prior_identity_nodes(
-	path: &Path,
-	selected: &HashSet<Ref>,
-) -> Result<HashMap<Ref, PriorIdentityNode>> {
-	load_prior_identity_nodes_cancellable(path, selected, &|| false)
-}
-
-pub(crate) fn load_prior_identity_nodes_cancellable(
-	path: &Path,
-	selected: &HashSet<Ref>,
-	cancelled: &dyn Fn() -> bool,
-) -> Result<HashMap<Ref, PriorIdentityNode>> {
-	let mut nodes = HashMap::with_capacity(selected.len());
-	visit_prior_identity_nodes_cancellable(path, cancelled, |node| {
-		if selected.contains(&node.id) {
-			nodes.insert(node.id, node);
-		}
-		Ok(())
-	})?;
-	ensure!(
-		nodes.len() == selected.len(),
-		"prior artifact identity set is incomplete"
-	);
-	for node in nodes.values_mut() {
-		node.children.retain(|child| selected.contains(child));
-	}
-	Ok(nodes)
 }
 
 #[derive(Debug)]
@@ -3752,21 +3346,6 @@ impl Drop for StagedCompiledCapture {
 	}
 }
 
-pub(crate) fn stage_compiled_noop(active_artifact: &Path) -> Result<StagedCompiledCapture> {
-	let receipt = validated_artifact_receipt(active_artifact)?;
-	let parent = active_artifact.parent().unwrap_or_else(|| Path::new("."));
-	Ok(StagedCompiledCapture {
-		root: parent.join(format!(".carbon-capture-noop-{}", Uuid::new_v4().simple())),
-		artifact: active_artifact.to_owned(),
-		active_artifact: active_artifact.to_owned(),
-		receipt,
-		studio_artifact: None,
-		studio_receipt: None,
-		studio_excluded: HashSet::new(),
-		cleanup_on_drop: AtomicBool::new(true),
-	})
-}
-
 fn source_tree(source: &dyn InstanceSource, root: Ref, cancelled: &dyn Fn() -> bool) -> Result<Tree> {
 	let root_view = source.get_by_ref(root).context("compiled capture root is missing")?;
 	let root_snapshot = Snapshot::new()
@@ -3802,90 +3381,18 @@ fn source_tree(source: &dyn InstanceSource, root: Ref, cancelled: &dyn Fn() -> b
 	Ok(tree)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_compiled_capture(
 	source: &dyn InstanceSource,
 	root_ref: Ref,
 	name: String,
 	mut metadata: BTreeMap<String, String>,
-	capture_fingerprint: Option<&str>,
-	properties: Option<&CapturePropertySpools>,
-	canonical_cframes: Option<&CapturePropertySpools>,
-	stage_plan: &CaptureStagePlan,
 	preserve_records: &HashSet<Ref>,
 	output: &Path,
 	cancelled: &dyn Fn() -> bool,
 ) -> Result<StagedCompiledCapture> {
 	let started = std::time::Instant::now();
-	let mut tree = source_tree(source, root_ref, cancelled)?;
-	let active = (!stage_plan.fresh && output.exists())
-		.then(|| Artifact::open(output))
-		.transpose()?;
-	let prior = if stage_plan.fresh {
-		None
-	} else {
-		active.as_ref().map(load_artifact_tree).transpose()?
-	};
+	let tree = source_tree(source, root_ref, cancelled)?;
 	let ids = tree.subtree_refs(tree.root_ref())?;
-	if let Some(prior) = &prior {
-		for id in &ids {
-			ensure!(
-				!cancelled(),
-				"Capture Manifest was cancelled during artifact property staging"
-			);
-			let partition = capture_partition(*id)?;
-			if !stage_plan.dirty_buckets.contains(&partition) || preserve_records.contains(id) {
-				let previous = prior
-					.get_instance(*id)
-					.with_context(|| format!("unchanged capture identity {id} is missing from active artifact"))?;
-				let current = tree.get_instance(*id).context("compiled capture identity is missing")?;
-				ensure!(
-					current.parent() == previous.parent()
-						&& current.class == previous.class
-						&& current.name == previous.name,
-					"preserved capture identity {id} changed structurally"
-				);
-				tree.get_instance_mut(*id).unwrap().properties = previous.properties.clone();
-			}
-		}
-	}
-	if let Some(properties) = properties {
-		for partition in &stage_plan.dirty_buckets {
-			ensure!(
-				!cancelled(),
-				"Capture Manifest was cancelled during property spool staging"
-			);
-			for (id, values) in properties.read_partition(*partition)? {
-				let node = tree
-					.get_instance_mut(id)
-					.with_context(|| format!("captured property owner {id} is missing"))?;
-				node.properties.extend(values);
-			}
-		}
-	}
-	if let Some(canonical_cframes) = canonical_cframes {
-		for partition in &stage_plan.dirty_buckets {
-			ensure!(
-				!cancelled(),
-				"Capture Manifest was cancelled during canonical CFrame reconciliation"
-			);
-			for (id, values) in canonical_cframes.read_partition(*partition)? {
-				let Some(node) = tree.get_instance_mut(id) else {
-					continue;
-				};
-				for (name, canonical) in values {
-					let (Some(Variant::CFrame(observed)), Variant::CFrame(canonical_frame)) =
-						(node.properties.get(&name), &canonical)
-					else {
-						continue;
-					};
-					if cframe_semantically_equal(observed, canonical_frame) {
-						node.properties.insert(name, canonical);
-					}
-				}
-			}
-		}
-	}
 	let active_data = output.parent().unwrap_or_else(|| Path::new("."));
 	let parent = active_data.parent().unwrap_or_else(|| Path::new("."));
 	let root = parent.join(format!(
@@ -3901,14 +3408,7 @@ pub(crate) fn stage_compiled_capture(
 	);
 	fs::create_dir_all(&staged_data)?;
 	let staged = staged_data.join(output.file_name().context("capture artifact has no file name")?);
-	match capture_fingerprint {
-		Some(fingerprint) => {
-			metadata.insert(CAPTURE_FINGERPRINT_METADATA_KEY.to_owned(), fingerprint.to_owned());
-		}
-		None => {
-			metadata.remove(CAPTURE_FINGERPRINT_METADATA_KEY);
-		}
-	}
+	metadata.remove(CAPTURE_FINGERPRINT_METADATA_KEY);
 	metadata.remove(LEGACY_CAPTURE_FINGERPRINT_METADATA_KEY);
 	let staged_studio = if preserve_records.is_empty() {
 		None
@@ -3939,9 +3439,8 @@ pub(crate) fn stage_compiled_capture(
 		return Err(error);
 	}
 	crate::carbon_info!(
-		"Capture Manifest artifact stage: instances={}, dirty-partitions={}, total={:.1}ms",
+		"Capture Manifest artifact stage: instances={}, total={:.1}ms",
 		ids.len(),
-		stage_plan.dirty_buckets.len(),
 		started.elapsed().as_secs_f64() * 1_000.0,
 	);
 	let (receipt, studio_receipt) = match &staged_studio {
@@ -3976,21 +3475,11 @@ pub(crate) fn stage_snapshot_capture(
 	cancelled: &dyn Fn() -> bool,
 ) -> Result<StagedCompiledCapture> {
 	let tree = Tree::new(snapshot.clone());
-	let spool_root = output
-		.parent()
-		.unwrap_or_else(|| Path::new("."))
-		.join(format!(".snapshot-capture-spool-{}", Uuid::new_v4()));
-	let mut properties = CapturePropertySpools::new(spool_root)?;
-	properties.finish()?;
 	stage_compiled_capture(
 		&tree,
 		tree.root_ref(),
 		name,
 		BTreeMap::new(),
-		None,
-		Some(&properties),
-		None,
-		&CaptureStagePlan::fresh(),
 		preserve_records,
 		output,
 		cancelled,
@@ -4211,48 +3700,6 @@ pub fn write_sourcemap(path: &Path, output: &Path) -> Result<u64> {
 	writer.write_all(b"\n")?;
 	writer.flush()?;
 	Ok(included.len() as u64)
-}
-
-#[cfg(test)]
-pub(crate) fn capture_probe_projection(path: &Path, mapped_roots: &HashSet<Ref>) -> Result<Snapshot> {
-	let loaded = load_tree(path)?;
-	let mut snapshot = tree_snapshot(&loaded.tree, loaded.tree.root_ref())?;
-	fn prune(snapshot: &mut Snapshot, excluded: &HashSet<Ref>) {
-		snapshot.children.retain(|child| !excluded.contains(&child.id));
-		for child in &mut snapshot.children {
-			prune(child, excluded);
-		}
-	}
-	prune(&mut snapshot, mapped_roots);
-	Ok(snapshot)
-}
-
-#[cfg(test)]
-pub(crate) fn capture_probe_file_fingerprints(path: &Path) -> Result<Vec<(PathBuf, u64, SystemTime, String)>> {
-	let artifact = Artifact::open(path)?;
-	let mut paths = vec![path.to_owned()];
-	paths.extend(
-		artifact
-			.sideband
-			.external
-			.iter()
-			.map(|value| blob_path(path, value.hash)),
-	);
-	paths.sort();
-	paths.dedup();
-	paths
-		.into_iter()
-		.map(|path| {
-			let metadata = fs::metadata(&path)?;
-			let bytes = fs::read(&path)?;
-			Ok((
-				path,
-				metadata.len(),
-				metadata.modified()?,
-				blake3::hash(&bytes).to_hex().to_string(),
-			))
-		})
-		.collect()
 }
 
 #[cfg(test)]

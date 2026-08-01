@@ -105,7 +105,7 @@ impl Tree {
 		let mut stack = vec![(root, true)];
 		while let Some((id, parent_available)) = stack.pop() {
 			let index = *self.by_ref.get(&id).context("tree traversal instance is missing")?;
-			// Root availability depends on the active Studio build and RML engine
+			// Root availability depends on the active Studio build and plugin
 			// creation capability. The Studio client now probes each root instead of
 			// baking a class-name deny-list into source loading.
 			let unavailable_root = false;

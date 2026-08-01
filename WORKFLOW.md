@@ -52,10 +52,10 @@ phase to pass:
 2. Rust linting with warnings denied
 3. RustSec advisory scanning with the pinned `cargo-audit` release
 4. All locked Rust targets and tests
-5. Workflow, installer, isolation, and RML-build tests
+5. Workflow, installer, and isolation tests
 6. Studio-plugin reflection validation, linting, and formatting
-7. Release CLI, Studio plugin, native RML, and all managed .NET tests
-8. The installed-stack Studio qualification suite, including native-save parity
+7. Release CLI and Studio plugin builds
+8. The installed-stack Studio qualification suite, including auto-recovery capture
 
 The repository is hashed before and after qualification. Any changed byte
 invalidates the run. A passing receipt is stored by the complete Git-tree

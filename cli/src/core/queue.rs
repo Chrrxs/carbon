@@ -36,8 +36,6 @@ struct Listener {
 pub struct StudioRoute {
 	pub studio_session_id: String,
 	pub instance_id: String,
-	pub bridge_id: Option<String>,
-	pub manifest_identities_authoritative: bool,
 }
 
 #[derive(Debug)]
@@ -51,7 +49,6 @@ pub struct Queue {
 	listeners: RwLock<Vec<Listener>>,
 	unsynced_changes: RwLock<usize>,
 	first_subscribe: Mutex<Option<FirstSubscribe>>,
-	trusted_managed_bridge: Mutex<Option<String>>,
 }
 
 type FirstSubscribe = Box<dyn FnOnce(&str, Option<&StudioRoute>) + Send + 'static>;
@@ -65,12 +62,7 @@ impl Queue {
 			listeners: RwLock::new(Vec::new()),
 			unsynced_changes: RwLock::new(0),
 			first_subscribe: Mutex::new(None),
-			trusted_managed_bridge: Mutex::new(None),
 		}
-	}
-
-	pub fn set_trusted_managed_bridge(&self, bridge_id: &str) {
-		*self.trusted_managed_bridge.lock().unwrap() = Some(bridge_id.to_owned());
 	}
 
 	pub fn on_first_subscribe<F>(&self, callback: F)
@@ -152,12 +144,6 @@ impl Queue {
 			bail!("another Studio client is already connected")
 		}
 
-		let studio_route = studio_route.map(|mut route| {
-			if let Some(bridge_id) = self.trusted_managed_bridge.lock().unwrap().clone() {
-				route.bridge_id = Some(bridge_id);
-			}
-			route
-		});
 		let (sender, receiver) = crossbeam_channel::bounded(Self::CHANNEL_CAPACITY);
 		let channel = Channel { sender, receiver };
 
@@ -228,31 +214,6 @@ impl Queue {
 			.and_then(|listener| listener.studio_route.clone())
 	}
 
-	pub fn bind_studio_bridge(&self, id: u32, bridge_id: &str) -> Result<()> {
-		let mut listeners = write!(self.listeners);
-		let listener = listeners.iter_mut().find(|listener| listener.id == id);
-		let Some(route) = listener.and_then(|listener| listener.studio_route.as_mut()) else {
-			bail!("Studio route is unavailable")
-		};
-		route.bridge_id = Some(bridge_id.to_owned());
-		Ok(())
-	}
-
-	pub fn mark_manifest_identities_authoritative(&self, id: u32) -> Result<()> {
-		self.set_manifest_identities_authoritative(id, true)
-	}
-
-	pub fn set_manifest_identities_authoritative(&self, id: u32, authoritative: bool) -> Result<()> {
-		let mut listeners = write!(self.listeners);
-		let route = listeners
-			.iter_mut()
-			.find(|listener| listener.id == id)
-			.and_then(|listener| listener.studio_route.as_mut())
-			.ok_or_else(|| anyhow::anyhow!("Studio route is unavailable"))?;
-		route.manifest_identities_authoritative = authoritative;
-		Ok(())
-	}
-
 	pub fn get_first_non_internal_listener_name(&self) -> Option<String> {
 		read!(self.listeners)
 			.iter()
@@ -266,20 +227,18 @@ mod tests {
 	use super::*;
 	use std::sync::{Arc, Mutex};
 
-	fn route(session: &str, instance: &str, bridge: &str) -> StudioRoute {
+	fn route(session: &str, instance: &str) -> StudioRoute {
 		StudioRoute {
 			studio_session_id: session.to_owned(),
 			instance_id: instance.to_owned(),
-			bridge_id: Some(bridge.to_owned()),
-			manifest_identities_authoritative: false,
 		}
 	}
 
 	#[test]
 	fn studio_route_is_replaced_only_after_the_client_disconnects() {
 		let queue = Queue::new();
-		let first = route("plugin-session-a", "place:123", "0123456789abcdef0123456789abcdef");
-		let second = route("plugin-session-b", "place:123", "fedcba9876543210fedcba9876543210");
+		let first = route("plugin-session-a", "place:123");
+		let second = route("plugin-session-b", "place:123");
 
 		queue.subscribe(101, "same-place", Some(first.clone())).unwrap();
 		assert_eq!(queue.studio_route(101), Some(first));
@@ -289,56 +248,6 @@ mod tests {
 		queue.subscribe(202, "same-place", Some(second.clone())).unwrap();
 		assert_eq!(queue.studio_route(101), None);
 		assert_eq!(queue.studio_route(202), Some(second));
-	}
-
-	#[test]
-	fn capability_negotiation_binds_only_the_calling_studio_route() {
-		let queue = Queue::new();
-		let unbound = StudioRoute {
-			studio_session_id: "plugin-session-a".to_owned(),
-			instance_id: "anon:place-a".to_owned(),
-			bridge_id: None,
-			manifest_identities_authoritative: false,
-		};
-		queue.subscribe(101, "place-a", Some(unbound)).unwrap();
-
-		queue
-			.bind_studio_bridge(101, "0123456789abcdef0123456789abcdef")
-			.unwrap();
-
-		assert_eq!(
-			queue.studio_route(101).and_then(|route| route.bridge_id),
-			Some("0123456789abcdef0123456789abcdef".to_owned())
-		);
-		assert!(!queue.studio_route(101).unwrap().manifest_identities_authoritative);
-		queue.mark_manifest_identities_authoritative(101).unwrap();
-		assert!(queue.studio_route(101).unwrap().manifest_identities_authoritative);
-		queue.set_manifest_identities_authoritative(101, false).unwrap();
-		assert!(!queue.studio_route(101).unwrap().manifest_identities_authoritative);
-	}
-
-	#[test]
-	fn trusted_managed_launch_binds_the_first_subscribed_studio_route() {
-		let queue = Queue::new();
-		let bridge_id = "0123456789abcdef0123456789abcdef";
-		queue.set_trusted_managed_bridge(bridge_id);
-		queue
-			.subscribe(
-				101,
-				"managed-place",
-				Some(StudioRoute {
-					studio_session_id: "plugin-session".to_owned(),
-					instance_id: "anon:managed-place".to_owned(),
-					bridge_id: None,
-					manifest_identities_authoritative: false,
-				}),
-			)
-			.unwrap();
-
-		assert_eq!(
-			queue.studio_route(101).and_then(|route| route.bridge_id),
-			Some(bridge_id.to_owned())
-		);
 	}
 
 	#[test]
@@ -365,7 +274,7 @@ mod tests {
 		});
 
 		queue
-			.subscribe(101, "first", Some(route("studio-session", "anon:first", "bridge")))
+			.subscribe(101, "first", Some(route("studio-session", "anon:first")))
 			.unwrap();
 		queue.unsubscribe(101).unwrap();
 		queue.subscribe(202, "second", None).unwrap();

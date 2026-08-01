@@ -44,7 +44,7 @@ body:
     id: logs
     attributes:
       label: Relevant output
-      description: Paste sanitized CLI, Studio, or RML output. Do not include secrets or private place content.
+      description: Paste sanitized CLI or Studio output. Do not include secrets or private place content.
       render: shell
   - type: checkboxes
     id: checks

@@ -30,8 +30,6 @@ async fn main(request: MsgPack<Request>, core: Data<Arc<Core>>) -> impl Responde
 		(Some(studio_session_id), Some(instance_id)) => Some(StudioRoute {
 			studio_session_id,
 			instance_id,
-			bridge_id: None,
-			manifest_identities_authoritative: false,
 		}),
 		_ => None,
 	};

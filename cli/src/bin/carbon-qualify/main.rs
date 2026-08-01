@@ -1,5 +1,6 @@
 mod engine;
 mod model;
+mod place_assertion;
 mod report;
 mod runtime;
 mod snapshot;

@@ -4,7 +4,7 @@ local InitialRootBaseline = require("../src/Core/InitialRootBaseline")
 
 local roots = {
 	{ debugId = "workspace", initiallyPresent = true },
-	-- These model authored roots parented after RML's OnDataModelLoaded callback.
+	-- These model authored roots parented after the initial hierarchy snapshot.
 	{ debugId = "late-lighting", initiallyPresent = false },
 	{ debugId = "late-folder", initiallyPresent = false },
 	{ debugId = "hidden-authored", initiallyPresent = false },
@@ -22,7 +22,7 @@ local hidden = InitialRootBaseline.hiddenCurrent(roots, {
 assert(#hidden == 1 and hidden[1].debugId == "hidden-authored")
 
 -- A root created after the plugin freezes the hierarchy can appear in a later
--- bridge enumeration, but it is absent from the frozen visible set.
+-- hierarchy enumeration, but it is absent from the frozen visible set.
 local managedVisible = InitialRootBaseline.managedFrozenVisible(
 	{ "workspace", "late-lighting", "late-folder" },
 	current,

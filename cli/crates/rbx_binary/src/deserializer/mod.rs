@@ -286,7 +286,7 @@ impl<'db> Deserializer<'db> {
 	/// Allows strict capture decoding to omit properties that the current
 	/// reflection schema knows Studio cannot load back from a saved place.
 	///
-	/// Studio may still emit save-only properties in native capture chunks.
+	/// Studio may still emit save-only properties in recovered place files.
 	/// This exception remains narrow: unknown properties and malformed chunks
 	/// retain strict failure behavior.
 	#[inline]

@@ -87,7 +87,6 @@ pub struct MaterializedProject {
 	pub manifest_path: PathBuf,
 	pub mapped_refs: HashSet<Ref>,
 	pub identity_exclusions: HashSet<Ref>,
-	pub(crate) identity_rebindings: Vec<ManagedIdentityRebinding>,
 	pub mapped_roots: Vec<Ref>,
 	pub mapped_watch_roots: Vec<PathBuf>,
 	pub routing_refs: HashSet<Ref>,
@@ -118,19 +117,6 @@ pub(crate) enum ManagedIdentityRebindingKind {
 	AccessoryWeld,
 	HeadWeld,
 	Descendant,
-}
-
-impl ManagedIdentityRebindingKind {
-	pub(crate) fn wire_name(self) -> &'static str {
-		match self {
-			Self::HumanoidStatus => "humanoidStatus",
-			Self::ConfigureServerService => "configureServerService",
-			Self::FilteredSelection => "filteredSelection",
-			Self::AccessoryWeld => "accessoryWeld",
-			Self::HeadWeld => "headWeld",
-			Self::Descendant => "descendant",
-		}
-	}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -627,7 +613,7 @@ fn materialize_for_build(project_path: &Path, exact_generation: bool) -> Result<
 	} = evaluation;
 	let (mapped_refs, mapped_roots, routing_refs) = snapshot_refs_for_routes(&snapshot, &barrier_routes)?;
 	validate_no_cross_domain_references(&snapshot, &mapped_refs)?;
-	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs);
+	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs, &mapped_roots);
 	let tree = Tree::new(snapshot);
 	let composite = if exact_generation {
 		let directory = project_path
@@ -1094,7 +1080,7 @@ fn managed_build_identity_anchors(snapshot: &Snapshot) -> (HashSet<Ref>, HashSet
 }
 
 /// Canonical identities whose disposable build instances are replaced by
-/// Studio. The descriptors are in parent-before-child order so RML can bind
+/// Studio. The descriptors are in parent-before-child order so the plugin can bind
 /// each replacement beneath an already authoritative parent.
 pub(crate) fn managed_build_identity_rebindings(
 	snapshot: &Snapshot,
@@ -1202,27 +1188,48 @@ pub(crate) fn managed_build_identity_rebindings(
 /// DataModel. Filesystem-owned and omitted edit-camera subtrees stay outside
 /// the manifest ledger; other Studio-rehydrated identities are restored by
 /// the bootstrap contract.
-fn managed_build_identity_exclusions(snapshot: &Snapshot, mapped_refs: &HashSet<Ref>) -> HashSet<Ref> {
+fn managed_build_identity_exclusions(
+	snapshot: &Snapshot,
+	mapped_refs: &HashSet<Ref>,
+	mapped_roots: &[Ref],
+) -> HashSet<Ref> {
 	fn collect_unbound(
 		node: &Snapshot,
 		mapped_refs: &HashSet<Ref>,
+		mapped_roots: &HashSet<Ref>,
 		edit_cameras: &HashSet<Ref>,
 		ancestor_unbound: bool,
 		excluded: &mut HashSet<Ref>,
 	) {
-		let unbound_here = ancestor_unbound || mapped_refs.contains(&node.id) || edit_cameras.contains(&node.id);
+		let mapped = mapped_refs.contains(&node.id);
+		let unbound_here =
+			ancestor_unbound || (mapped && !mapped_roots.contains(&node.id)) || edit_cameras.contains(&node.id);
 		if unbound_here {
 			excluded.insert(node.id);
 		}
 		for child in &node.children {
-			collect_unbound(child, mapped_refs, edit_cameras, unbound_here, excluded);
+			collect_unbound(
+				child,
+				mapped_refs,
+				mapped_roots,
+				edit_cameras,
+				unbound_here || mapped,
+				excluded,
+			);
 		}
 	}
 
 	let (edit_cameras, _) = managed_build_identity_anchors(snapshot);
 	let rebindings = managed_build_identity_rebindings(snapshot, mapped_refs);
 	let mut excluded = rebindings.iter().map(|rebinding| rebinding.source_id).collect();
-	collect_unbound(snapshot, mapped_refs, &edit_cameras, false, &mut excluded);
+	collect_unbound(
+		snapshot,
+		mapped_refs,
+		&mapped_roots.iter().copied().collect(),
+		&edit_cameras,
+		false,
+		&mut excluded,
+	);
 	excluded
 }
 
@@ -1254,8 +1261,7 @@ fn materialize_mode(project_path: &Path, allow_transitions: bool) -> Result<Mate
 	let (mapped_refs, mapped_roots) = refs_for_routes(&route_tree, &barrier_routes)?;
 	let routing_refs = routing_refs(&route_tree, &mapped_roots)?;
 	validate_no_cross_domain_references(&snapshot, &mapped_refs)?;
-	let identity_rebindings = managed_build_identity_rebindings(&snapshot, &mapped_refs);
-	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs);
+	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs, &mapped_roots);
 	let mapped_watch_roots = mapped_traversal.watch_roots.into_iter().collect();
 	Ok(MaterializedProject {
 		name: project.name,
@@ -1263,7 +1269,6 @@ fn materialize_mode(project_path: &Path, allow_transitions: bool) -> Result<Mate
 		manifest_path,
 		mapped_refs,
 		identity_exclusions,
-		identity_rebindings,
 		mapped_roots,
 		mapped_watch_roots,
 		routing_refs,
@@ -1596,410 +1601,6 @@ pub fn live_policy(project_path: &Path, materialized: &MaterializedProject) -> L
 	}
 }
 
-#[derive(Clone, Debug)]
-enum IdentityLocation {
-	Persisted,
-	StableLinked,
-	Directory(PathBuf),
-	ScriptFile {
-		path: PathBuf,
-		project_route: Option<Vec<String>>,
-		project_relative: Option<PathBuf>,
-	},
-	Inline(Vec<String>),
-}
-
-fn find_identity_locations(
-	node: &Node,
-	project_root: &Path,
-	route: &mut Vec<String>,
-	target: Ref,
-	matches: &mut Vec<IdentityLocation>,
-) -> Result<()> {
-	if node.id.as_deref().is_some_and(|id| identity_ref(id) == target) {
-		matches.push(IdentityLocation::Persisted);
-	} else if node.path.is_none() && node.owns_subtree() && stable_ref(&format!("inline:{}", route.join("."))) == target
-	{
-		matches.push(IdentityLocation::Inline(route.clone()));
-	}
-	if let Some(relative) = &node.path {
-		let path = resolve_mapped_path(project_root, relative)?;
-		find_path_identity_locations(&path, target, Some(route.clone()), Some(relative.clone()), matches)?;
-	}
-	for (name, child) in &node.children {
-		route.push(name.clone());
-		find_identity_locations(child, project_root, route, target, matches)?;
-		route.pop();
-	}
-	Ok(())
-}
-
-fn find_path_identity_locations(
-	path: &Path,
-	target: Ref,
-	project_route: Option<Vec<String>>,
-	project_relative: Option<PathBuf>,
-	matches: &mut Vec<IdentityLocation>,
-) -> Result<()> {
-	find_path_identity_locations_inner(
-		path,
-		target,
-		project_route,
-		project_relative,
-		matches,
-		false,
-		&mut MappedTraversal::default(),
-		&mut Vec::new(),
-	)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_path_identity_locations_inner(
-	path: &Path,
-	target: Ref,
-	project_route: Option<Vec<String>>,
-	project_relative: Option<PathBuf>,
-	matches: &mut Vec<IdentityLocation>,
-	linked_ancestor: bool,
-	traversal: &mut MappedTraversal,
-	canonical_stack: &mut Vec<PathBuf>,
-) -> Result<()> {
-	let lexical = fs::symlink_metadata(path)
-		.with_context(|| format!("failed to inspect mapped identity path {}", path.display()))?;
-	let linked = linked_ancestor || lexical.file_type().is_symlink();
-	let file_type = traversal.file_type(path, lexical.file_type())?;
-	if file_type.is_file() {
-		if stable_ref(&format!("source:{}", path.display())) == target {
-			if linked {
-				matches.push(IdentityLocation::StableLinked);
-			} else {
-				matches.push(IdentityLocation::ScriptFile {
-					path: path.to_owned(),
-					project_route,
-					project_relative,
-				});
-			}
-		}
-		return Ok(());
-	}
-	if !file_type.is_dir() {
-		return Ok(());
-	}
-	with_mapped_directory(path, canonical_stack, |canonical_stack| {
-		if let Some(project_path) = default_project_path(path, traversal)? {
-			let tree = load_nested_project_tree(&project_path)?;
-			let identity_route = vec![format!("nested-project:{}", project_path.display())];
-			return find_nested_project_identity_locations(
-				&tree,
-				path,
-				&identity_route,
-				target,
-				matches,
-				linked,
-				traversal,
-				canonical_stack,
-			);
-		}
-		let persisted = path
-			.join("meta.json")
-			.is_file()
-			.then(|| read_meta(&path.join("meta.json")))
-			.transpose()?
-			.and_then(|meta| meta.id.map(|id| identity_ref(&id)));
-		if persisted == Some(target) {
-			matches.push(IdentityLocation::Persisted);
-		} else if persisted.is_none() && stable_ref(&format!("source:{}", path.display())) == target {
-			if linked {
-				matches.push(IdentityLocation::StableLinked);
-			} else {
-				matches.push(IdentityLocation::Directory(path.to_owned()));
-			}
-		}
-		let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
-		entries.sort_by_key(|entry| entry.file_name());
-		for entry in entries {
-			let child = entry.path();
-			let name = entry.file_name();
-			let name = name.to_str().context("mapped identity path is not UTF-8")?;
-			if name == "meta.json" || is_init_script_file(name) {
-				continue;
-			}
-			let child_type = traversal.file_type(&child, entry.file_type()?)?;
-			if child_type.is_dir() || child_type.is_file() && is_script_source_file(name) {
-				find_path_identity_locations_inner(
-					&child,
-					target,
-					None,
-					None,
-					matches,
-					linked,
-					traversal,
-					canonical_stack,
-				)?;
-			}
-		}
-		Ok(())
-	})
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_nested_project_identity_locations(
-	node: &Node,
-	project_root: &Path,
-	identity_route: &[String],
-	target: Ref,
-	matches: &mut Vec<IdentityLocation>,
-	linked_ancestor: bool,
-	traversal: &mut MappedTraversal,
-	canonical_stack: &mut Vec<PathBuf>,
-) -> Result<()> {
-	if node.id.as_deref().is_some_and(|id| identity_ref(id) == target) {
-		matches.push(IdentityLocation::Persisted);
-	}
-	if let Some(relative) = &node.path {
-		let path = resolve_mapped_path(project_root, relative)?;
-		let Some(_) = traversal.optional_path_type(&path, node.path_optional)? else {
-			return Ok(());
-		};
-		find_path_identity_locations_inner(
-			&path,
-			target,
-			None,
-			None,
-			matches,
-			linked_ancestor,
-			traversal,
-			canonical_stack,
-		)?;
-	} else if node.id.is_none() && stable_ref(&format!("inline:{}", identity_route.join("."))) == target {
-		matches.push(IdentityLocation::StableLinked);
-	}
-	for (name, child) in &node.children {
-		let mut child_route = identity_route.to_vec();
-		child_route.push(name.clone());
-		find_nested_project_identity_locations(
-			child,
-			project_root,
-			&child_route,
-			target,
-			matches,
-			linked_ancestor,
-			traversal,
-			canonical_stack,
-		)?;
-	}
-	Ok(())
-}
-
-fn project_json_node_mut<'a>(value: &'a mut Value, route: &[String]) -> Result<&'a mut Map<String, Value>> {
-	let mut node = value
-		.get_mut("tree")
-		.and_then(Value::as_object_mut)
-		.context("project is missing tree")?;
-	for component in route {
-		node = node
-			.get_mut(component)
-			.and_then(Value::as_object_mut)
-			.with_context(|| format!("project route {} is missing", route.join(".")))?;
-	}
-	Ok(node)
-}
-
-#[derive(Debug)]
-pub(crate) struct StagedMappedIdentities {
-	root: Option<PathBuf>,
-	domains: Vec<(PathBuf, PathBuf, PathBuf)>,
-	retirements: Vec<(PathBuf, PathBuf)>,
-	cleanup_on_drop: AtomicBool,
-}
-
-impl StagedMappedIdentities {
-	fn empty() -> Self {
-		Self {
-			root: None,
-			domains: Vec::new(),
-			retirements: Vec::new(),
-			cleanup_on_drop: AtomicBool::new(true),
-		}
-	}
-
-	fn preserve_for_recovery(&self) {
-		self.cleanup_on_drop.store(false, Ordering::Release);
-	}
-}
-
-impl Drop for StagedMappedIdentities {
-	fn drop(&mut self) {
-		if self.cleanup_on_drop.load(Ordering::Acquire) {
-			if let Some(root) = &self.root {
-				let _ = remove_any(root);
-			}
-		}
-	}
-}
-
-fn capture_backup(target: &Path) -> Result<PathBuf> {
-	let parent = target.parent().context("capture promotion target has no parent")?;
-	Ok(parent.join(format!(
-		".{}.capture-backup-{}",
-		target.get_name(),
-		Uuid::new_v4().simple()
-	)))
-}
-
-/// Stage every identity required by a manifest-owned capture reference. No
-/// active project source is changed until this stage joins the capture commit.
-pub(crate) fn stage_mapped_identities(
-	policy: &LivePolicy,
-	targets: &HashSet<Ref>,
-	cancelled: &dyn Fn() -> bool,
-) -> Result<StagedMappedIdentities> {
-	if targets.is_empty() {
-		return Ok(StagedMappedIdentities::empty());
-	}
-	ensure!(
-		targets.is_subset(&policy.mapped_refs),
-		"capture requested identity persistence for a non-mapped target"
-	);
-	recover(&policy.project_path)?;
-	let project = load_project(&policy.project_path)?;
-	let project_root = policy.project_path.parent().unwrap_or_else(|| Path::new("."));
-	let mut ordered = targets.iter().copied().collect::<Vec<_>>();
-	ordered.sort_by_key(ToString::to_string);
-	let mut planned = Vec::with_capacity(ordered.len());
-	for target in ordered {
-		ensure!(
-			!cancelled(),
-			"Capture Manifest was cancelled during mapped-identity staging"
-		);
-		let mut locations = Vec::new();
-		find_identity_locations(&project.tree, project_root, &mut Vec::new(), target, &mut locations)?;
-		ensure!(
-			locations.len() == 1,
-			"mapped reference target {target} has {} source identity locations; expected exactly one",
-			locations.len()
-		);
-		planned.push((target, locations.pop().unwrap()));
-	}
-	if planned
-		.iter()
-		.all(|(_, location)| matches!(location, IdentityLocation::Persisted | IdentityLocation::StableLinked))
-	{
-		return Ok(StagedMappedIdentities::empty());
-	}
-
-	let stage = transaction_stage(&policy.project_path)?;
-	fs::create_dir_all(&stage)?;
-	let result = (|| -> Result<StagedMappedIdentities> {
-		let mut domains = Vec::new();
-		let mut retirements = Vec::new();
-		let mut project_json: Value = serde_json::from_slice(&policy.project_document)?;
-		let mut project_changed = false;
-		for (index, (target, location)) in planned.into_iter().enumerate() {
-			ensure!(
-				!cancelled(),
-				"Capture Manifest was cancelled during mapped-identity staging"
-			);
-			match location {
-				IdentityLocation::Persisted | IdentityLocation::StableLinked => {}
-				IdentityLocation::Directory(directory) => {
-					let meta = directory.join("meta.json");
-					let mut value = if meta.is_file() {
-						serde_json::from_slice::<Value>(&fs::read(&meta)?)?
-					} else {
-						Value::Object(Map::new())
-					};
-					let object = value.as_object_mut().context("meta.json must be an object")?;
-					ensure!(
-						!object.contains_key("id"),
-						"mapped directory identity changed while staging {}",
-						directory.display()
-					);
-					object.insert("id".to_owned(), Value::String(target.to_string()));
-					let staged = stage.join(format!("identity-{index}.json"));
-					write_json(&staged, &value)?;
-					domains.push((staged, meta.clone(), capture_backup(&meta)?));
-				}
-				IdentityLocation::Inline(route) => {
-					let node = project_json_node_mut(&mut project_json, &route)?;
-					ensure!(
-						!node.contains_key("$id"),
-						"inline identity changed while staging {}",
-						route.join(".")
-					);
-					node.insert("$id".to_owned(), Value::String(target.to_string()));
-					project_changed = true;
-				}
-				IdentityLocation::ScriptFile {
-					path,
-					project_route,
-					project_relative,
-				} => {
-					let file_name = path
-						.file_name()
-						.and_then(|name| name.to_str())
-						.context("mapped script path is not UTF-8")?;
-					let class = script_class(file_name)?;
-					let instance_name = script_name(file_name)?;
-					let target_directory = path
-						.parent()
-						.context("mapped script path has no parent")?
-						.join(&instance_name);
-					ensure!(
-						!target_directory.exists(),
-						"cannot persist mapped script identity because {} already exists",
-						target_directory.display()
-					);
-					let staged = stage.join(format!("script-{index}"));
-					fs::create_dir_all(&staged)?;
-					write_text(
-						&staged.join(format!("init{}", script_suffix(class))),
-						&read_script_source(&path)?,
-					)?;
-					write_json(
-						&staged.join("meta.json"),
-						&serde_json::json!({"id": target.to_string()}),
-					)?;
-					domains.push((staged, target_directory.clone(), capture_backup(&target_directory)?));
-					retirements.push((path.clone(), capture_backup(&path)?));
-					match (project_route, project_relative) {
-						(Some(route), Some(relative)) => {
-							let node = project_json_node_mut(&mut project_json, &route)?;
-							let relative = relative.parent().unwrap_or_else(|| Path::new("")).join(&instance_name);
-							node.insert(
-								"$path".to_owned(),
-								Value::String(relative.to_string_lossy().replace('\\', "/")),
-							);
-							project_changed = true;
-						}
-						(None, None) => {}
-						_ => bail!("mapped script identity provenance is incomplete"),
-					}
-				}
-			}
-		}
-		if project_changed {
-			let staged = stage.join("project.json");
-			write_json(&staged, &project_json)?;
-			domains.push((
-				staged,
-				policy.project_path.clone(),
-				capture_backup(&policy.project_path)?,
-			));
-		}
-		Ok(StagedMappedIdentities {
-			root: Some(stage.clone()),
-			domains,
-			retirements,
-			cleanup_on_drop: AtomicBool::new(true),
-		})
-	})();
-	if result.is_err() {
-		let _ = remove_any(&stage);
-	}
-	result
-}
-
 fn remove_any(path: &Path) -> Result<()> {
 	if path.is_dir() {
 		fs::remove_dir_all(path)?;
@@ -2222,9 +1823,7 @@ pub(crate) struct CapturePromotionCleanup {
 pub(crate) struct PreparedCapturePromotion {
 	composite: artifact_store::StagedCompiledCapture,
 	studio: StagedStudioDomain,
-	identities: StagedMappedIdentities,
 	domains: Vec<(PathBuf, PathBuf, PathBuf)>,
-	retirements: Vec<(PathBuf, PathBuf)>,
 }
 
 impl PreparedCapturePromotion {
@@ -2243,18 +1842,9 @@ impl Drop for CapturePromotionCleanup {
 
 /// Resolve no-op state and every staged/target/backup path before the commit
 /// claim. The resulting promotion contains no artifact reads.
-#[cfg(test)]
-fn prepare_capture_promotion(
+pub(crate) fn prepare_capture_promotion(
 	composite: artifact_store::StagedCompiledCapture,
 	studio: StagedStudioDomain,
-) -> Result<PreparedCapturePromotion> {
-	prepare_capture_promotion_with_identities(composite, studio, StagedMappedIdentities::empty())
-}
-
-pub(crate) fn prepare_capture_promotion_with_identities(
-	composite: artifact_store::StagedCompiledCapture,
-	studio: StagedStudioDomain,
-	mut identities: StagedMappedIdentities,
 ) -> Result<PreparedCapturePromotion> {
 	let mut domains = Vec::<(PathBuf, PathBuf, PathBuf)>::new();
 	if !composite.is_noop()? {
@@ -2282,14 +1872,10 @@ pub(crate) fn prepare_capture_promotion_with_identities(
 			)),
 		));
 	}
-	domains.append(&mut identities.domains);
-	let retirements = std::mem::take(&mut identities.retirements);
 	Ok(PreparedCapturePromotion {
 		composite,
 		studio,
-		identities,
 		domains,
-		retirements,
 	})
 }
 
@@ -2322,7 +1908,7 @@ fn promote_capture_domains_impl(
 		);
 		Ok(())
 	}
-	if promotion.domains.is_empty() && promotion.retirements.is_empty() {
+	if promotion.domains.is_empty() {
 		return Ok(CapturePromotionCleanup { backups: Vec::new() });
 	}
 	let journal = transaction_journal(&promotion.studio.project_path)?;
@@ -2336,10 +1922,6 @@ fn promote_capture_domains_impl(
 				"target": target,
 				"backup": backup,
 			})).collect::<Vec<_>>(),
-			"retirements": promotion.retirements.iter().map(|(target, backup)| serde_json::json!({
-				"target": target,
-				"backup": backup,
-			})).collect::<Vec<_>>(),
 		}),
 	)?;
 	let promotion_result = (|| -> Result<()> {
@@ -2349,16 +1931,6 @@ fn promote_capture_domains_impl(
 				bail!("injected capture promotion failure after domain {index}");
 			}
 		}
-		for (target, backup) in &promotion.retirements {
-			if target.exists() && !backup.exists() {
-				fs::rename(target, backup)?;
-			}
-			ensure!(
-				!target.exists() && backup.exists(),
-				"capture retirement did not preserve {}",
-				target.display()
-			);
-		}
 		fs::remove_file(&journal)?;
 		Ok(())
 	})();
@@ -2366,7 +1938,6 @@ fn promote_capture_domains_impl(
 		if let Err(recovery) = recover(&promotion.studio.project_path) {
 			promotion.composite.preserve_for_recovery();
 			promotion.studio.preserve_for_recovery();
-			promotion.identities.preserve_for_recovery();
 			return Err(error).context(format!(
 				"capture promotion failed and synchronous roll-forward also failed: {recovery:#}"
 			));
@@ -2375,12 +1946,7 @@ fn promote_capture_domains_impl(
 			.context("capture promotion failed after the journal was written; synchronous roll-forward completed");
 	}
 	Ok(CapturePromotionCleanup {
-		backups: promotion
-			.domains
-			.iter()
-			.map(|(_, _, backup)| backup.clone())
-			.chain(promotion.retirements.iter().map(|(_, backup)| backup.clone()))
-			.collect(),
+		backups: promotion.domains.iter().map(|(_, _, backup)| backup.clone()).collect(),
 	})
 }
 
@@ -2567,6 +2133,7 @@ pub(crate) fn frozen_project_document(project_path: &Path) -> Result<Vec<u8>> {
 	fs::read(project_path).with_context(|| format!("failed to read Carbon project {}", project_path.display()))
 }
 
+#[cfg(test)]
 pub(crate) fn capture_service_anchor(canonical: &Snapshot, class: &str, name: &str) -> Result<Ref> {
 	let mut matches = canonical
 		.children
@@ -4454,6 +4021,604 @@ fn dom_snapshot(dom: &WeakDom, id: Ref) -> Result<Snapshot> {
 	Ok(snapshot)
 }
 
+const RECOVERY_TRANSIENT_ATTRIBUTES: &[&str] = &[
+	artifact_store::MANIFEST_IDENTITY_ATTRIBUTE,
+	"__StudioWorktree_CarbonEndpoint",
+	"__StudioWorktree_CarbonProject",
+	"__StudioWorktree_CarbonGeneration",
+	"__StudioWorktree_Identity",
+	"__StudioWorktree_Session",
+	"__MCPPlaceId",
+];
+
+#[derive(Default)]
+struct RecoveryRoute {
+	project: Option<String>,
+	worktree_id: Option<String>,
+	session_token: Option<String>,
+}
+
+fn recovery_attribute_string(attributes: &Attributes, name: &str) -> Option<String> {
+	match attributes.get(name) {
+		Some(Variant::String(value)) => Some(value.clone()),
+		Some(Variant::BinaryString(value)) => String::from_utf8(value.clone().into_vec()).ok(),
+		_ => None,
+	}
+}
+
+fn decode_recovery_attributes(value: Variant) -> Result<Attributes> {
+	match value {
+		Variant::Attributes(attributes) => Ok(attributes),
+		Variant::BinaryString(raw) => Attributes::from_reader(AsRef::<[u8]>::as_ref(&raw))
+			.context("recovery place contains invalid serialized Attributes"),
+		_ => anyhow::bail!("recovery place contains an unexpected Attributes representation"),
+	}
+}
+
+fn normalize_recovery_identities_for_scope(
+	snapshot: &mut Snapshot,
+	expected_project: &str,
+	expected_session: Option<(&str, &str)>,
+	expected_root: Ref,
+) -> Result<()> {
+	fn collect(
+		snapshot: &mut Snapshot,
+		is_root: bool,
+		route: &mut RecoveryRoute,
+		requested: &mut HashMap<Ref, Option<Ref>>,
+	) -> Result<()> {
+		let incoming = snapshot.id;
+		let attributes_name = Ustr::from("Attributes");
+		let mut manifest_id = None;
+		if let Some(value) = snapshot.properties.remove(&attributes_name) {
+			let mut attributes = decode_recovery_attributes(value)?;
+			if snapshot.class.as_str() == "Workspace" {
+				route.project = recovery_attribute_string(&attributes, "__StudioWorktree_CarbonProject");
+				route.worktree_id = recovery_attribute_string(&attributes, "__StudioWorktree_Identity");
+				route.session_token = recovery_attribute_string(&attributes, "__StudioWorktree_Session");
+			}
+			if let Some(value) = recovery_attribute_string(&attributes, artifact_store::MANIFEST_IDENTITY_ATTRIBUTE) {
+				manifest_id = Some(
+					value
+						.parse::<Ref>()
+						.context("recovery place contains an invalid Carbon manifest identity")?,
+				);
+			}
+			for name in RECOVERY_TRANSIENT_ATTRIBUTES {
+				attributes.remove(*name);
+			}
+			if !attributes.is_empty() {
+				snapshot
+					.properties
+					.insert(attributes_name, Variant::Attributes(attributes));
+			}
+		}
+		requested.insert(incoming, if is_root { None } else { manifest_id });
+		for child in &mut snapshot.children {
+			collect(child, false, route, requested)?;
+		}
+		Ok(())
+	}
+
+	fn assign(
+		snapshot: &mut Snapshot,
+		is_root: bool,
+		expected_root: Ref,
+		requested: &HashMap<Ref, Option<Ref>>,
+		allocator: &mut ManifestIdentityAllocator,
+		used: &mut HashSet<Ref>,
+		remap: &mut HashMap<Ref, Ref>,
+	) -> Result<()> {
+		let incoming = snapshot.id;
+		let requested_id = if is_root {
+			Some(expected_root)
+		} else {
+			requested.get(&incoming).copied().flatten()
+		};
+		let assigned = match requested_id {
+			Some(id) => {
+				ensure!(
+					id.is_some(),
+					"recovery place contains an empty Carbon manifest identity"
+				);
+				ensure!(
+					used.insert(id),
+					"recovery place duplicates Carbon manifest identity {id}"
+				);
+				id
+			}
+			None => loop {
+				let candidate = Ref::some(allocator.next());
+				if used.insert(candidate) {
+					break candidate;
+				}
+			},
+		};
+		ensure!(
+			remap.insert(incoming, assigned).is_none(),
+			"recovery place duplicates a binary referent"
+		);
+		snapshot.id = assigned;
+		for child in &mut snapshot.children {
+			assign(child, false, expected_root, requested, allocator, used, remap)?;
+		}
+		Ok(())
+	}
+
+	fn remap_values(snapshot: &mut Snapshot, remap: &HashMap<Ref, Ref>) -> Result<()> {
+		for value in snapshot.properties.values_mut() {
+			match value {
+				Variant::Ref(target) if target.is_some() => {
+					*target = *remap
+						.get(target)
+						.with_context(|| format!("recovery place reference target {target} is outside the place"))?;
+				}
+				Variant::Content(content) => {
+					if let ContentType::Object(target) = content.value() {
+						if target.is_some() {
+							*content = Content::from_referent(*remap.get(target).with_context(|| {
+								format!("recovery place content target {target} is outside the place")
+							})?);
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+		for child in &mut snapshot.children {
+			remap_values(child, remap)?;
+		}
+		Ok(())
+	}
+
+	let mut route = RecoveryRoute::default();
+	let mut requested = HashMap::new();
+	collect(snapshot, true, &mut route, &mut requested)?;
+	match expected_session {
+		Some((expected_worktree, expected_token)) => ensure!(
+			route.project.as_deref() == Some(expected_project)
+				&& route.worktree_id.as_deref() == Some(expected_worktree)
+				&& route.session_token.as_deref() == Some(expected_token),
+			"captured place belongs to a different Carbon Studio session"
+		),
+		None => ensure!(
+			route.project.as_deref() == Some(expected_project),
+			"captured place belongs to a different Carbon project"
+		),
+	}
+	let mut remap = HashMap::new();
+	assign(
+		snapshot,
+		true,
+		expected_root,
+		&requested,
+		&mut ManifestIdentityAllocator::new(),
+		&mut HashSet::new(),
+		&mut remap,
+	)?;
+	remap_values(snapshot, &remap)
+}
+
+fn normalize_recovery_identities(
+	snapshot: &mut Snapshot,
+	expected: &artifact_store::WorktreeContract,
+	expected_root: Ref,
+) -> Result<()> {
+	normalize_recovery_identities_for_scope(
+		snapshot,
+		&expected.project,
+		Some((&expected.worktree_id, &expected.session_token)),
+		expected_root,
+	)
+}
+
+fn restore_recovery_mapped_roots(recovery: &mut Snapshot, canonical: &Snapshot, mapped_roots: &[Ref]) -> Result<()> {
+	fn index<'a>(
+		snapshot: &'a Snapshot,
+		parent: Option<Ref>,
+		nodes: &mut HashMap<Ref, &'a Snapshot>,
+		parents: &mut HashMap<Ref, Ref>,
+	) {
+		nodes.insert(snapshot.id, snapshot);
+		if let Some(parent) = parent {
+			parents.insert(snapshot.id, parent);
+		}
+		for child in &snapshot.children {
+			index(child, Some(snapshot.id), nodes, parents);
+		}
+	}
+	fn remove(snapshot: &mut Snapshot, roots: &HashSet<Ref>, found: &mut HashSet<Ref>) {
+		snapshot.children.retain(|child| {
+			if roots.contains(&child.id) {
+				found.insert(child.id);
+				false
+			} else {
+				true
+			}
+		});
+		for child in &mut snapshot.children {
+			remove(child, roots, found);
+		}
+	}
+	fn find_mut(snapshot: &mut Snapshot, id: Ref) -> Option<&mut Snapshot> {
+		if snapshot.id == id {
+			return Some(snapshot);
+		}
+		for child in &mut snapshot.children {
+			if let Some(found) = find_mut(child, id) {
+				return Some(found);
+			}
+		}
+		None
+	}
+
+	let roots = mapped_roots.iter().copied().collect::<HashSet<_>>();
+	let mut canonical_nodes = HashMap::new();
+	let mut canonical_parents = HashMap::new();
+	index(canonical, None, &mut canonical_nodes, &mut canonical_parents);
+	let mut found = HashSet::new();
+	if roots.contains(&recovery.id) {
+		*recovery = canonical_nodes
+			.get(&recovery.id)
+			.context("canonical mapped root is missing")?
+			.to_owned()
+			.clone();
+		found.insert(recovery.id);
+	} else {
+		remove(recovery, &roots, &mut found);
+	}
+	for root in roots {
+		let parent = *canonical_parents
+			.get(&root)
+			.with_context(|| format!("canonical mapped root {root} has no parent"))?;
+		let parent = find_mut(recovery, parent)
+			.with_context(|| format!("auto-recovery place omitted the route for mapped root {root}"))?;
+		parent.children.push(
+			canonical_nodes
+				.get(&root)
+				.with_context(|| format!("canonical mapped root {root} is missing"))?
+				.to_owned()
+				.clone(),
+		);
+	}
+	Ok(())
+}
+
+pub(crate) fn decode_captured_place(
+	input: &Path,
+	expected: &artifact_store::WorktreeContract,
+	canonical: &Snapshot,
+	mapped_roots: &[Ref],
+) -> Result<Tree> {
+	ensure!(
+		input
+			.extension()
+			.is_some_and(|extension| extension.eq_ignore_ascii_case("rbxl")),
+		"Studio auto-recovery must be a binary .rbxl place"
+	);
+	let file = File::open(input).with_context(|| format!("failed to open Studio auto-recovery {}", input.display()))?;
+	let dom = rbx_binary::Deserializer::new(util::get_reflection_database())
+		.strict(true)
+		.deserialize(BufReader::new(file))
+		.with_context(|| format!("failed to decode Studio auto-recovery {}", input.display()))?;
+	let mut snapshot = dom_snapshot(&dom, dom.root_ref())?;
+	ensure!(
+		snapshot.class.as_str() == "DataModel",
+		"Studio auto-recovery is not a place"
+	);
+	normalize_recovery_identities(&mut snapshot, expected, canonical.id)?;
+	restore_recovery_mapped_roots(&mut snapshot, canonical, mapped_roots)?;
+	validate_unique_snapshot_ids(&snapshot)?;
+	validate_snapshot_references(&snapshot)?;
+	Ok(Tree::new(snapshot))
+}
+
+fn decode_project_captured_place(
+	input: &Path,
+	project_name: &str,
+	canonical: &Snapshot,
+	mapped_roots: &[Ref],
+) -> Result<Tree> {
+	ensure!(
+		input
+			.extension()
+			.is_some_and(|extension| extension.eq_ignore_ascii_case("rbxl")),
+		"manual capture requires a binary .rbxl place"
+	);
+	let file = File::open(input).with_context(|| format!("failed to open manually saved place {}", input.display()))?;
+	let dom = rbx_binary::Deserializer::new(util::get_reflection_database())
+		.strict(true)
+		.deserialize(BufReader::new(file))
+		.with_context(|| format!("failed to decode manually saved place {}", input.display()))?;
+	let mut snapshot = dom_snapshot(&dom, dom.root_ref())?;
+	ensure!(
+		snapshot.class.as_str() == "DataModel",
+		"manual capture input is not a place"
+	);
+	normalize_recovery_identities_for_scope(&mut snapshot, project_name, None, canonical.id)?;
+	restore_recovery_mapped_roots(&mut snapshot, canonical, mapped_roots)?;
+	validate_unique_snapshot_ids(&snapshot)?;
+	validate_snapshot_references(&snapshot)?;
+	Ok(Tree::new(snapshot))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureReport {
+	pub generation: String,
+}
+
+/// Import a manually saved managed place directly into a project. This path
+/// has no serve-session dependency: the explicit project selects the target,
+/// while the place's embedded Carbon project identity prevents cross-project
+/// imports.
+pub fn capture_saved_place(project_path: &Path, input: &Path, cancelled: &dyn Fn() -> bool) -> Result<CaptureReport> {
+	ensure!(
+		is_project_path(project_path),
+		"capture target must be a .carbon.json project"
+	);
+	ensure!(
+		project_path.is_file(),
+		"Carbon project does not exist: {}",
+		project_path.display()
+	);
+	ensure!(
+		input.is_file(),
+		"manual capture place does not exist: {}",
+		input.display()
+	);
+	ensure!(
+		crate::recovery::is_recovery_place(input),
+		"manual capture requires a binary .rbxl place"
+	);
+
+	let materialized = materialize_for_capture(project_path).context("failed to materialize capture target")?;
+	let temporary_composite = materialized.directory.clone();
+	let result = (|| -> Result<CaptureReport> {
+		let policy = live_policy(project_path, &materialized);
+		let canonical = materialized.snapshot.clone();
+		let project_generation = exact_projected_realization_generation(
+			project_path,
+			&policy.project_document,
+			&canonical,
+			&policy.mapped_refs,
+		)?;
+		let active_manifest = data_artifact(project_path)?;
+		let active_generation = artifact_store::validated_artifact_receipt(&active_manifest)?
+			.generation()
+			.to_owned();
+		ensure!(!cancelled(), "manual Capture Manifest was cancelled before validation");
+		let recovered = decode_project_captured_place(input, &materialized.name, &canonical, &policy.mapped_roots)?;
+		let metadata = artifact_store::validated_artifact_receipt(&policy.composite_manifest)?
+			.metadata()
+			.clone();
+		let staged_composite = artifact_store::stage_compiled_capture(
+			&recovered,
+			recovered.root_ref(),
+			materialized.name.clone(),
+			metadata,
+			&policy.mapped_refs,
+			&policy.composite_manifest,
+			cancelled,
+		)?;
+		let staged_studio = stage_captured_studio_domain(&policy, &staged_composite, cancelled)?;
+		let promotion = prepare_capture_promotion(staged_composite, staged_studio)?;
+		ensure!(!cancelled(), "manual Capture Manifest was cancelled before commit");
+		ensure!(
+			fs::read(project_path)? == policy.project_document,
+			"project document changed during manual Capture Manifest"
+		);
+		ensure!(
+			exact_projected_realization_generation(
+				project_path,
+				&policy.project_document,
+				&canonical,
+				&policy.mapped_refs,
+			)? == project_generation,
+			"filesystem mapping realization changed during manual Capture Manifest"
+		);
+		ensure!(
+			artifact_store::validated_artifact_receipt(&active_manifest)?.generation() == active_generation,
+			"Studio manifest changed during manual Capture Manifest"
+		);
+		let generation = promotion.artifact_receipt().generation().to_owned();
+		drop(promote_capture_domains(&promotion)?);
+		Ok(CaptureReport { generation })
+	})();
+	let _ = fs::remove_dir_all(temporary_composite);
+	result
+}
+
+#[cfg(test)]
+mod recovery_capture_tests {
+	use super::*;
+	use std::fs;
+
+	fn attributes(values: impl IntoIterator<Item = (&'static str, String)>) -> Variant {
+		Variant::Attributes(Attributes::from_iter(
+			values
+				.into_iter()
+				.map(|(name, value)| (name.to_owned(), Variant::String(value))),
+		))
+	}
+
+	#[test]
+	fn offline_capture_commits_the_expected_studio_state() {
+		let root = std::env::temp_dir().join(format!("carbon-offline-capture-{}", Uuid::new_v4()));
+		fs::create_dir_all(&root).unwrap();
+		let project_path = root.join("game.carbon.json");
+		let saved_place = root.join("saved.rbxl");
+		let rebuilt_place = root.join("rebuilt.rbxl");
+		initialize(&project_path, "OfflineCapture".to_owned()).unwrap();
+		let contract = artifact_store::WorktreeContract {
+			endpoint: "http://127.0.0.1:8000".to_owned(),
+			project: "OfflineCapture".to_owned(),
+			worktree_id: "offline-worktree".to_owned(),
+			session_token: "offline-session".to_owned(),
+			identity_exclusions: HashSet::new(),
+		};
+		compile(&project_path, &saved_place, Some(&contract)).unwrap();
+
+		let mut place = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&saved_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = place
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.name == "Workspace")
+			})
+			.unwrap();
+		place
+			.get_by_ref_mut(workspace)
+			.unwrap()
+			.properties
+			.insert(Ustr::from("Gravity"), Variant::Float32(123.0));
+		let roots = place.root().children().to_vec();
+		rbx_binary::to_writer_with_database(
+			File::create(&saved_place).unwrap(),
+			&place,
+			&roots,
+			util::get_reflection_database(),
+		)
+		.unwrap();
+
+		capture_saved_place(&project_path, &saved_place, &|| false).unwrap();
+		compile(&project_path, &rebuilt_place, None).unwrap();
+		let rebuilt = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&rebuilt_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = rebuilt
+			.root()
+			.children()
+			.iter()
+			.filter_map(|child| rebuilt.get_by_ref(*child))
+			.find(|instance| instance.name == "Workspace")
+			.unwrap();
+		assert_eq!(
+			workspace.properties.get(&Ustr::from("Gravity")),
+			Some(&Variant::Float32(123.0))
+		);
+		assert_eq!(
+			fs::read_to_string(root.join("src/ServerScriptService/Server.server.luau")).unwrap(),
+			"-- Server entry point.\n"
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn recovery_restores_mapped_roots_and_preserves_studio_edits() {
+		let root = Ref::new();
+		let workspace_id = Ref::new();
+		let mapped_id = Ref::new();
+		let mapped_child_id = Ref::new();
+		let canonical = Snapshot::new()
+			.with_id(root)
+			.with_name("DataModel")
+			.with_class("DataModel")
+			.with_children(vec![Snapshot::new()
+				.with_id(workspace_id)
+				.with_name("Workspace")
+				.with_class("Workspace")
+				.with_children(vec![Snapshot::new()
+					.with_id(mapped_id)
+					.with_name("Mapped")
+					.with_class("Folder")
+					.with_children(vec![Snapshot::new()
+						.with_id(mapped_child_id)
+						.with_name("Filesystem")
+						.with_class("ModuleScript")])])]);
+		let mut recovery = Snapshot::new()
+			.with_id(Ref::new())
+			.with_name("DataModel")
+			.with_class("DataModel")
+			.with_children(vec![Snapshot::new()
+				.with_id(Ref::new())
+				.with_name("Workspace")
+				.with_class("Workspace")
+				.with_properties(UstrMap::from_iter([(
+					Ustr::from("Attributes"),
+					attributes([
+						("__StudioWorktree_CarbonProject", "Game".to_owned()),
+						("__StudioWorktree_Identity", "worktree".to_owned()),
+						("__StudioWorktree_Session", "session".to_owned()),
+						(artifact_store::MANIFEST_IDENTITY_ATTRIBUTE, workspace_id.to_string()),
+					]),
+				)]))
+				.with_children(vec![
+					Snapshot::new()
+						.with_id(Ref::new())
+						.with_name("Mapped")
+						.with_class("Folder")
+						.with_properties(UstrMap::from_iter([(
+							Ustr::from("Attributes"),
+							attributes([(artifact_store::MANIFEST_IDENTITY_ATTRIBUTE, mapped_id.to_string())]),
+						)]))
+						.with_children(vec![Snapshot::new()
+							.with_id(Ref::new())
+							.with_name("Studio drift")
+							.with_class("Folder")]),
+					Snapshot::new()
+						.with_id(Ref::new())
+						.with_name("Authored in Studio")
+						.with_class("Folder"),
+				])]);
+		let expected = artifact_store::WorktreeContract {
+			endpoint: String::new(),
+			project: "Game".to_owned(),
+			worktree_id: "worktree".to_owned(),
+			session_token: "session".to_owned(),
+			identity_exclusions: HashSet::new(),
+		};
+
+		normalize_recovery_identities(&mut recovery, &expected, root).unwrap();
+		restore_recovery_mapped_roots(&mut recovery, &canonical, &[mapped_id]).unwrap();
+
+		assert_eq!(recovery.id, root);
+		let workspace = recovery.children.iter().find(|node| node.id == workspace_id).unwrap();
+		let mapped = workspace.children.iter().find(|node| node.id == mapped_id).unwrap();
+		assert_eq!(mapped.children[0].id, mapped_child_id);
+		assert!(workspace.children.iter().any(|node| node.name == "Authored in Studio"));
+		assert!(!workspace.children.iter().any(|node| node.name == "Studio drift"));
+	}
+
+	#[test]
+	fn recovery_rejects_another_worktree_session() {
+		let mut recovery = Snapshot::new()
+			.with_id(Ref::new())
+			.with_name("DataModel")
+			.with_class("DataModel")
+			.with_children(vec![Snapshot::new()
+				.with_id(Ref::new())
+				.with_name("Workspace")
+				.with_class("Workspace")
+				.with_properties(UstrMap::from_iter([(
+					Ustr::from("Attributes"),
+					attributes([
+						("__StudioWorktree_CarbonProject", "Other".to_owned()),
+						("__StudioWorktree_Identity", "worktree".to_owned()),
+						("__StudioWorktree_Session", "session".to_owned()),
+					]),
+				)]))]);
+		let expected = artifact_store::WorktreeContract {
+			endpoint: String::new(),
+			project: "Game".to_owned(),
+			worktree_id: "worktree".to_owned(),
+			session_token: "session".to_owned(),
+			identity_exclusions: HashSet::new(),
+		};
+		let error = normalize_recovery_identities(&mut recovery, &expected, Ref::new()).unwrap_err();
+		assert!(error.to_string().contains("different Carbon Studio session"));
+	}
+}
+
 fn validate_unique_snapshot_ids(snapshot: &Snapshot) -> Result<()> {
 	fn visit(snapshot: &Snapshot, seen: &mut HashMap<Ref, String>) -> Result<()> {
 		let location = format!("{} '{}'", snapshot.class, snapshot.name);
@@ -5558,7 +5723,7 @@ mod tests {
 			let changed_output = root.join("changed.rbxl");
 			let materialized = materialize(&project_path).unwrap();
 			assert!(materialized.mapped_refs.contains(&mapped_ref));
-			assert!(materialized.identity_exclusions.contains(&mapped_ref));
+			assert!(!materialized.identity_exclusions.contains(&mapped_ref));
 			let contract = WorktreeContract {
 				endpoint: "http://127.0.0.1:34872".to_owned(),
 				project: "Game".to_owned(),
@@ -6058,7 +6223,8 @@ mod tests {
 					.with_children(vec![Snapshot::new().with_id(mapped_child).with_class("ModuleScript")]),
 			]);
 
-		let exclusions = managed_build_identity_exclusions(&snapshot, &HashSet::from([mapped, mapped_child]));
+		let exclusions =
+			managed_build_identity_exclusions(&snapshot, &HashSet::from([mapped, mapped_child]), &[mapped]);
 		assert_eq!(
 			exclusions,
 			HashSet::from([
@@ -6072,7 +6238,6 @@ mod tests {
 				configure,
 				configure_child,
 				filtered_selection,
-				mapped,
 				mapped_child,
 			])
 		);
@@ -6440,10 +6605,6 @@ mod tests {
 				.collect::<Vec<_>>(),
 			vec![("Library", "ModuleScript")]
 		);
-		let mut locations = Vec::new();
-		find_path_identity_locations(&root, package.id, None, None, &mut locations).unwrap();
-		assert!(matches!(locations.as_slice(), [IdentityLocation::StableLinked]));
-
 		fs::remove_dir_all(root).unwrap();
 	}
 
@@ -6566,76 +6727,6 @@ mod tests {
 		assert!(error.contains("mapped source symlink cycle"));
 
 		fs::remove_dir_all(root).unwrap();
-	}
-
-	#[cfg(unix)]
-	#[test]
-	fn mapped_pesde_dependencies_keep_capture_identity_persistence_read_only() {
-		use std::os::unix::fs::symlink;
-
-		let root = temp("mapped-symlink-capture");
-		let dependency = temp("mapped-symlink-capture-dependency");
-		fs::create_dir_all(&root).unwrap();
-		fs::create_dir_all(dependency.join("src")).unwrap();
-		let project_path = root.join("game.carbon.json");
-		initialize(&project_path, "Game".to_owned()).unwrap();
-		fs::write(dependency.join("src/init.luau"), "return {}\n").unwrap();
-		fs::write(
-			dependency.join("default.project.json"),
-			"{\"tree\":{\"$path\":\"src\"}}\n",
-		)
-		.unwrap();
-		let packages = root.join("roblox_packages");
-		fs::create_dir_all(&packages).unwrap();
-		symlink(&dependency, packages.join("path_dependency")).unwrap();
-		write_json(
-			&project_path,
-			&serde_json::json!({
-				"name": "Game",
-				"tree": {
-					"$className": "DataModel",
-					"ReplicatedStorage": {
-						"Packages": { "$path": "roblox_packages" }
-					}
-				}
-			}),
-		)
-		.unwrap();
-
-		let materialized = materialize_for_capture(&project_path).unwrap();
-		assert_eq!(
-			materialized.mapped_watch_roots,
-			vec![fs::canonicalize(&dependency).unwrap()]
-		);
-		let target = materialized
-			.snapshot
-			.children
-			.iter()
-			.find(|child| child.name == "ReplicatedStorage")
-			.unwrap()
-			.children
-			.iter()
-			.find(|child| child.name == "Packages")
-			.unwrap()
-			.children
-			.first()
-			.unwrap();
-		assert_eq!(target.class, "ModuleScript");
-		assert_eq!(
-			target.properties.get(&Ustr::from("Source")),
-			Some(&Variant::String("return {}\n".to_owned()))
-		);
-		let target = target.id;
-		let policy = live_policy(&project_path, &materialized);
-		let identities = stage_mapped_identities(&policy, &HashSet::from([target]), &|| false).unwrap();
-		assert!(identities.domains.is_empty());
-		assert!(!dependency.join("meta.json").exists());
-		assert!(!dependency.join("src/meta.json").exists());
-
-		drop(identities);
-		fs::remove_dir_all(materialized.directory).unwrap();
-		fs::remove_dir_all(root).unwrap();
-		fs::remove_dir_all(dependency).unwrap();
 	}
 
 	#[test]
@@ -6987,126 +7078,6 @@ mod tests {
 		persist_studio_domain(&policy).unwrap();
 		fs::remove_dir_all(materialized.directory).unwrap();
 		(project_root, composite_root, policy, snapshot)
-	}
-
-	#[test]
-	fn capture_atomically_appends_a_mapped_directory_identity_to_existing_meta() {
-		let root = temp("capture-directory-identity");
-		fs::create_dir_all(&root).unwrap();
-		let project_path = root.join("game.carbon.json");
-		initialize(&project_path, "Game".to_owned()).unwrap();
-		let meta_path = root.join("src/ReplicatedStorage/Shared/meta.json");
-		write_json(
-			&meta_path,
-			&serde_json::json!({"attributes": {"IdentityRegression": "preserved"}}),
-		)
-		.unwrap();
-		let materialized = materialize_for_capture(&project_path).unwrap();
-		let target = materialized
-			.snapshot
-			.children
-			.iter()
-			.find(|child| child.name == "ReplicatedStorage")
-			.unwrap()
-			.children
-			.iter()
-			.find(|child| child.name == "Shared")
-			.unwrap()
-			.id;
-		let policy = live_policy(&project_path, &materialized);
-		let composite = artifact_store::stage_snapshot_capture(
-			&materialized.snapshot,
-			"Game".to_owned(),
-			&policy.mapped_refs,
-			&materialized.manifest_path,
-			&|| false,
-		)
-		.unwrap();
-		let studio = stage_captured_studio_domain(&policy, &composite, &|| false).unwrap();
-		let identities = stage_mapped_identities(&policy, &HashSet::from([target]), &|| false).unwrap();
-		assert!(serde_json::from_slice::<Value>(&fs::read(&meta_path).unwrap()).unwrap()["id"].is_null());
-		let promotion = prepare_capture_promotion_with_identities(composite, studio, identities).unwrap();
-		drop(promote_capture_domains(&promotion).unwrap());
-		drop(promotion);
-
-		let meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
-		assert_eq!(meta["id"], target.to_string());
-		assert_eq!(meta["attributes"]["IdentityRegression"], "preserved");
-		let rematerialized = materialize(&project_path).unwrap();
-		assert!(rematerialized.mapped_refs.contains(&target));
-		fs::remove_dir_all(rematerialized.directory).unwrap();
-		fs::remove_dir_all(materialized.directory).unwrap();
-		fs::remove_dir_all(root).unwrap();
-	}
-
-	#[test]
-	fn capture_promotes_a_referenced_script_and_missing_id_fails_future_builds() {
-		let root = temp("capture-script-identity");
-		fs::create_dir_all(&root).unwrap();
-		let project_path = root.join("game.carbon.json");
-		initialize(&project_path, "Game".to_owned()).unwrap();
-		let materialized = materialize_for_capture(&project_path).unwrap();
-		let target = materialized
-			.snapshot
-			.children
-			.iter()
-			.find(|child| child.name == "ServerScriptService")
-			.unwrap()
-			.children
-			.iter()
-			.find(|child| child.name == "Server")
-			.unwrap()
-			.id;
-		let policy = live_policy(&project_path, &materialized);
-		let mut loaded = artifact_store::load_live(&materialized.manifest_path).unwrap();
-		let workspace = loaded
-			.tree
-			.root()
-			.children()
-			.iter()
-			.copied()
-			.find(|id| loaded.tree.get_instance(*id).unwrap().class.as_str() == "Workspace")
-			.unwrap();
-		let holder = Ref::new();
-		let mut changes = Changes::new();
-		changes.add(
-			Snapshot::new()
-				.with_id(holder)
-				.with_name("MappedScriptReference")
-				.with_class("ObjectValue")
-				.with_properties(UstrMap::from_iter([(Ustr::from("Value"), Variant::Ref(target))])),
-			workspace,
-		);
-		loaded.store.apply(&mut loaded.tree, changes).unwrap();
-		let composite = artifact_store::stage_compiled_noop(&materialized.manifest_path).unwrap();
-		let studio = stage_captured_studio_domain(&policy, &composite, &|| false).unwrap();
-		let identities = stage_mapped_identities(&policy, &HashSet::from([target]), &|| false).unwrap();
-		let promotion = prepare_capture_promotion_with_identities(composite, studio, identities).unwrap();
-		let failure_after_last_staged_domain = promotion.domains.len() - 1;
-		let error = promote_capture_domains_impl(&promotion, Some(failure_after_last_staged_domain)).unwrap_err();
-		assert!(error.to_string().contains("synchronous roll-forward completed"));
-		drop(promotion);
-
-		let old_path = root.join("src/ServerScriptService/Server.server.luau");
-		let promoted = root.join("src/ServerScriptService/Server");
-		assert!(!old_path.exists());
-		assert!(promoted.join("init.server.luau").is_file());
-		let meta: Value = serde_json::from_slice(&fs::read(promoted.join("meta.json")).unwrap()).unwrap();
-		assert_eq!(meta["id"], target.to_string());
-		let project: Value = serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
-		assert_eq!(
-			project["tree"]["ServerScriptService"]["Server"]["$path"],
-			"src/ServerScriptService/Server"
-		);
-		let built = materialize(&project_path).unwrap();
-		fs::remove_dir_all(built.directory).unwrap();
-
-		write_json(&promoted.join("meta.json"), &serde_json::json!({})).unwrap();
-		let error = materialize(&project_path).unwrap_err().to_string();
-		assert!(error.contains(&target.to_string()));
-		assert!(error.contains("modify the relevant manifest reference"));
-		fs::remove_dir_all(materialized.directory).unwrap();
-		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]

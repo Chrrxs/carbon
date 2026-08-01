@@ -3,6 +3,7 @@ use crate::{
 		Action, CheckOperation, JsonCheck, JsonSelection, Outcome, QualificationReport, Scenario, ScenarioReport, Step,
 		StepReport, Suite,
 	},
+	place_assertion,
 	runtime::{CommandRequest, Observation, RuntimeAction, RuntimeAdapter, SpawnRequest},
 	snapshot::PathSnapshot,
 	template::Variables,
@@ -13,8 +14,6 @@ use chrono::Utc;
 use serde_json::Value;
 use std::{
 	collections::{BTreeMap, HashMap},
-	fs::{self, OpenOptions},
-	io::{self, Write},
 	path::{Path, PathBuf},
 	time::{Duration, Instant},
 };
@@ -500,37 +499,6 @@ impl<'a, R: RuntimeAdapter> QualificationRunner<'a, R> {
 				snapshot.compare(&path, *check_mtime)?;
 				Ok((format!("{} remained unchanged", path.display()), Vec::new()))
 			}
-			Action::StartCrashWatch {
-				watcher,
-				crash_dir,
-				rml_log_dir,
-			} => {
-				let watcher = variables.resolve_string(watcher)?;
-				let crash_dir = resolve_path(&variables.resolve_string(crash_dir)?, self.suite_dir());
-				let rml_log_dir = resolve_path(&variables.resolve_string(rml_log_dir)?, self.suite_dir());
-				match self.runtime.execute(RuntimeAction::StartCrashWatch {
-					watcher: watcher.clone(),
-					crash_dir,
-					rml_log_dir,
-				})? {
-					Observation::CrashWatch { watcher, artifacts } => {
-						Ok((format!("started crash watcher {watcher:?}"), artifacts))
-					}
-					_ => bail!("runtime returned the wrong observation for crash watcher start"),
-				}
-			}
-			Action::AssertNoCrash { watcher } => {
-				let watcher = variables.resolve_string(watcher)?;
-				match self.runtime.execute(RuntimeAction::AssertNoCrash {
-					watcher: watcher.clone(),
-					artifact_stem: artifact_stem.to_owned(),
-				})? {
-					Observation::CrashWatch { watcher, artifacts } => {
-						Ok((format!("crash watcher {watcher:?} remained clean"), artifacts))
-					}
-					_ => bail!("runtime returned the wrong observation for crash assertion"),
-				}
-			}
 			Action::AssertNumericDelta {
 				before,
 				after,
@@ -554,59 +522,27 @@ impl<'a, R: RuntimeAdapter> QualificationRunner<'a, R> {
 					Vec::new(),
 				))
 			}
-			Action::ExportStudioPlace {
-				endpoint,
-				token,
-				output,
-				timeout_seconds,
+			Action::AssertPlaceInstance {
+				path,
+				instance_path,
+				class_name,
+				properties,
+				attributes,
 			} => {
-				let endpoint = variables.resolve_string(endpoint)?;
-				let token = variables.resolve_string(token)?;
-				let output = resolve_path(&variables.resolve_string(output)?, self.suite_dir());
-				if let Some(parent) = output.parent() {
-					fs::create_dir_all(parent)?;
-				}
-				let temporary =
-					output.with_extension(format!("rbxl.qualification-{}.tmp", uuid::Uuid::new_v4().simple()));
-				let result = (|| -> Result<u64> {
-					let client = reqwest::blocking::Client::builder()
-						.connect_timeout(Duration::from_secs(5))
-						.timeout(Duration::from_secs(*timeout_seconds))
-						.build()?;
-					let response = client
-						.post(format!(
-							"{}/diagnostics/qualification/export-place",
-							endpoint.trim_end_matches('/')
-						))
-						.bearer_auth(&token)
-						.send()
-						.context("failed to request Studio's serialized place")?;
-					let status = response.status();
-					if !status.is_success() {
-						bail!(
-							"Studio place export returned {status}: {}",
-							response.text().unwrap_or_else(|error| error.to_string())
-						);
-					}
-					let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
-					let mut response = response;
-					let copied = io::copy(&mut response, &mut file)?;
-					ensure!(copied >= 8, "Studio place export was truncated");
-					file.flush()?;
-					file.sync_all()?;
-					if output.exists() {
-						fs::remove_file(&output)?;
-					}
-					fs::rename(&temporary, &output)?;
-					Ok(copied)
-				})();
-				if result.is_err() {
-					let _ = fs::remove_file(&temporary);
-				}
-				let copied = result?;
+				let path = resolve_path(&variables.resolve_string(path)?, self.suite_dir());
+				let instance_path = resolve_strings(variables, instance_path)?;
+				let class_name = variables.resolve_string(class_name)?;
+				let properties = resolve_value_map(variables, properties)?;
+				let attributes = resolve_value_map(variables, attributes)?;
+				place_assertion::assert_place_instance(&path, &instance_path, &class_name, &properties, &attributes)?;
 				Ok((
-					format!("Studio serialized {copied} bytes to {}", output.display()),
-					vec![output.to_string_lossy().into_owned()],
+					format!(
+						"verified {} as {} in {}",
+						instance_path.join("/"),
+						class_name,
+						path.display()
+					),
+					Vec::new(),
 				))
 			}
 		}
@@ -815,6 +751,13 @@ fn resolve_map(variables: &Variables, values: &BTreeMap<String, String>) -> Resu
 		.collect()
 }
 
+fn resolve_value_map(variables: &Variables, values: &BTreeMap<String, Value>) -> Result<BTreeMap<String, Value>> {
+	values
+		.iter()
+		.map(|(key, value)| Ok((key.clone(), variables.resolve_value(value)?)))
+		.collect()
+}
+
 fn resolve_optional_path(variables: &Variables, value: Option<&str>, base: &Path) -> Result<Option<PathBuf>> {
 	value
 		.map(|value| variables.resolve_string(value).map(|value| resolve_path(&value, base)))
@@ -840,10 +783,8 @@ fn action_kind(action: &Action) -> &'static str {
 		Action::Sleep { .. } => "sleep",
 		Action::SnapshotPath { .. } => "snapshot_path",
 		Action::AssertPathUnchanged { .. } => "assert_path_unchanged",
-		Action::StartCrashWatch { .. } => "start_crash_watch",
-		Action::AssertNoCrash { .. } => "assert_no_crash",
 		Action::AssertNumericDelta { .. } => "assert_numeric_delta",
-		Action::ExportStudioPlace { .. } => "export_studio_place",
+		Action::AssertPlaceInstance { .. } => "assert_place_instance",
 	}
 }
 

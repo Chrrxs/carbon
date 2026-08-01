@@ -2,7 +2,7 @@
 
 -- Reflection-driven policy for serialized engine state. The database is the
 -- source of truth: new canonical non-scriptable serialized properties become
--- protected automatically until the active privileged adapter reports support.
+-- excluded automatically when ordinary Studio plugin APIs cannot represent them.
 
 local BINARY_TYPES = {
 	BinaryString = true,
@@ -15,7 +15,7 @@ local BINARY_TYPES = {
 
 local ALWAYS_MATERIALIZED_TYPES = {
 	-- CapabilityControl can reject writes even when API security reports None.
-	-- Native serialized access preserves the persisted value consistently.
+	-- Ordinary plugin APIs cannot preserve the persisted value consistently.
 	SecurityCapabilities = true,
 }
 

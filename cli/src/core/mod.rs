@@ -10,23 +10,17 @@ use rbx_dom_weak::{
 };
 use rbx_reflection::ClassTag;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
 	collections::{BTreeMap, HashMap, HashSet},
-	fs::{self, File},
-	io::{BufWriter, Write},
 	path::Path,
 	path::PathBuf,
 	sync::{
 		atomic::{AtomicBool, AtomicU8, Ordering},
-		Arc, Condvar, Mutex, MutexGuard, RwLock,
+		Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
 	},
 	thread::{self, Builder},
 	time::{Duration, Instant, SystemTime},
 };
-
-pub(crate) const CAPTURE_BRIDGE_NOT_READY_MESSAGE: &str =
-	"Capture Manifest requires the connected Studio RML bridge; wait for Carbon to finish connecting";
 
 use self::{
 	processor::artifact::{ArtifactProcessor, CapturePrecommitAttestation},
@@ -34,18 +28,7 @@ use self::{
 	snapshot::SnapshotPage,
 	tree::Tree,
 };
-use crate::{
-	artifact_store,
-	capture_provider::{
-		wait_until_ready_with_progress, CapturePayloadSpool, CaptureProvider, CaptureRequest, CaptureShellClassRequest,
-		RmlCaptureProvider,
-	},
-	lock,
-	privileged_bridge::{Bridge, Capabilities, ManagedHierarchyAttachment, ManagedHierarchyStage, StudioIdentity},
-	project,
-	source::SourceDetails,
-	util,
-};
+use crate::{artifact_store, lock, project, source::SourceDetails, util};
 
 pub mod changes;
 pub mod processor;
@@ -60,7 +43,6 @@ pub mod tree;
 pub struct Core {
 	name: String,
 	worktree: Option<(String, String)>,
-	manifest_identity_bootstrap: Option<ManifestIdentityBootstrapContract>,
 	live_session_token: Option<String>,
 	is_place: bool,
 	tree: Arc<Mutex<Tree>>,
@@ -76,62 +58,13 @@ pub struct Core {
 	project_snapshot: Option<Arc<RwLock<snapshot::Snapshot>>>,
 	project_state_lock: Option<Arc<Mutex<()>>>,
 	manifest_capture: Mutex<Option<ManifestCaptureOperation>>,
-	last_capture_epoch: Mutex<Option<CaptureEpochReceipt>>,
 	ephemeral_paths: Mutex<Vec<PathBuf>>,
-	qualification_export: Mutex<Option<QualificationExport>>,
+	served_place_path: Mutex<Option<PathBuf>>,
 	restart_required: Arc<AtomicBool>,
 	managed_reload_transition: Mutex<Option<String>>,
+	automatic_capture_enabled: AtomicBool,
+	shutdown_capture_requested: AtomicBool,
 	shutdown_coordinator: ShutdownCoordinator,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CaptureEpochReceipt {
-	bridge_id: String,
-	process_id: u32,
-	studio_session_id: String,
-	instance_id: String,
-	engine_generation: u64,
-	hierarchy_sequence: u64,
-	change_sequence: u64,
-	source_generation: String,
-	managed_contract_id: String,
-	project_realization_generation: String,
-	artifact_generation: String,
-	artifact_fingerprint: String,
-	artifact_len: u64,
-	artifact_modified: SystemTime,
-}
-
-fn capture_epoch_changed_fields(expected: &CaptureEpochReceipt, observed: &CaptureEpochReceipt) -> Vec<&'static str> {
-	let mut fields = Vec::new();
-	macro_rules! changed {
-		($field:ident) => {
-			if expected.$field != observed.$field {
-				fields.push(stringify!($field));
-			}
-		};
-	}
-	changed!(bridge_id);
-	changed!(process_id);
-	changed!(studio_session_id);
-	changed!(instance_id);
-	changed!(engine_generation);
-	changed!(hierarchy_sequence);
-	changed!(change_sequence);
-	changed!(source_generation);
-	changed!(managed_contract_id);
-	changed!(project_realization_generation);
-	changed!(artifact_generation);
-	changed!(artifact_fingerprint);
-	changed!(artifact_len);
-	changed!(artifact_modified);
-	fields
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct QualificationExport {
-	pub path: PathBuf,
-	token: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -238,8 +171,6 @@ impl ShutdownCoordinator {
 }
 
 const AUTOMATIC_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MANIFEST_CAPTURE_MAX_ATTEMPTS: usize = 3;
-const MANIFEST_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const PROJECT_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROJECT_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -285,169 +216,16 @@ where
 	}
 }
 
-fn ensure_capture_startup_ready(has_managed_worktree: bool, route: &queue::StudioRoute) -> Result<()> {
-	ensure!(
-		route.bridge_id.as_ref().is_some_and(|bridge_id| !bridge_id.is_empty())
-			&& (!has_managed_worktree || route.manifest_identities_authoritative),
-		CAPTURE_BRIDGE_NOT_READY_MESSAGE
-	);
-	Ok(())
-}
-
-fn run_manifest_capture_attempts<T, Attempt, Retry, Wait>(
-	phase: &AtomicU8,
-	mut attempt: Attempt,
-	mut on_retry: Retry,
-	mut wait: Wait,
-) -> Result<T>
-where
-	Attempt: FnMut() -> Result<T>,
-	Retry: FnMut(usize, &anyhow::Error) -> Result<()>,
-	Wait: FnMut(Duration),
-{
-	for attempt_number in 1..=MANIFEST_CAPTURE_MAX_ATTEMPTS {
-		ensure!(
-			phase.load(Ordering::Acquire) == CAPTURE_COLLECTING,
-			"Capture Manifest stopped before a native snapshot retry"
-		);
-		match attempt() {
-			Ok(value) => return Ok(value),
-			Err(error)
-				if attempt_number < MANIFEST_CAPTURE_MAX_ATTEMPTS && is_transient_manifest_capture_error(&error) =>
-			{
-				on_retry(attempt_number, &error)?;
-				wait(MANIFEST_CAPTURE_RETRY_DELAY);
-			}
-			Err(error) => return Err(error),
-		}
-	}
-	unreachable!("the bounded manifest capture attempt loop always returns")
-}
-
 pub(crate) fn is_transient_manifest_capture_error(error: &anyhow::Error) -> bool {
 	let message = format!("{error:#}");
-	if message.contains("native capture lease cleanup also failed") {
-		return false;
-	}
-	[
-		"native snapshot failed: capture page-table plan is no longer active",
-		"native snapshot failed: capture page-table epochs changed before staging",
-		"DataModel changed between the native hierarchy read and serializer launch",
-		"Studio changed during Capture Manifest staging; retry the capture",
-	]
-	.iter()
-	.any(|transient| message.contains(transient))
+	["Studio changed during Capture Manifest staging; retry the capture"]
+		.iter()
+		.any(|transient| message.contains(transient))
 }
 
 #[cfg(test)]
 mod manifest_capture_retry_tests {
 	use super::*;
-
-	#[test]
-	fn managed_capture_waits_for_launch_identity_bootstrap() {
-		let mut route = queue::StudioRoute {
-			studio_session_id: "studio".to_owned(),
-			instance_id: "instance".to_owned(),
-			bridge_id: Some("bridge".to_owned()),
-			manifest_identities_authoritative: false,
-		};
-
-		let error = ensure_capture_startup_ready(true, &route).unwrap_err();
-		assert!(error.to_string().contains(CAPTURE_BRIDGE_NOT_READY_MESSAGE));
-		assert!(ensure_capture_startup_ready(false, &route).is_ok());
-
-		route.manifest_identities_authoritative = true;
-		assert!(ensure_capture_startup_ready(true, &route).is_ok());
-	}
-
-	#[test]
-	fn transient_studio_invalidations_retry_the_same_manifest_capture() {
-		let phase = AtomicU8::new(CAPTURE_COLLECTING);
-		let mut attempts = 0;
-		let mut retries = Vec::new();
-		let mut waits = 0;
-
-		let result = run_manifest_capture_attempts(
-			&phase,
-			|| {
-				attempts += 1;
-				match attempts {
-					1 => anyhow::bail!(
-						"native snapshot failed: edit DataModel changed between the native hierarchy read and serializer launch"
-					),
-					2 => anyhow::bail!("Studio changed during Capture Manifest staging; retry the capture"),
-					_ => Ok("complete"),
-				}
-			},
-			|attempt, error| {
-				retries.push((attempt, error.to_string()));
-				Ok(())
-			},
-			|_| waits += 1,
-		)
-		.unwrap();
-
-		assert_eq!(result, "complete");
-		assert_eq!(attempts, 3);
-		assert_eq!(retries.len(), 2);
-		assert_eq!(waits, 2);
-	}
-
-	#[test]
-	fn unrelated_and_unclean_capture_failures_are_not_retried() {
-		for message in [
-			"capture payload digest does not match its envelope",
-			"native capture lease cleanup also failed: native snapshot failed: capture page-table plan is no longer active",
-		] {
-			let phase = AtomicU8::new(CAPTURE_COLLECTING);
-			let mut attempts = 0;
-			let error = run_manifest_capture_attempts(
-				&phase,
-				|| -> Result<()> {
-					attempts += 1;
-					anyhow::bail!(message)
-				},
-				|_, _| panic!("non-retryable failure reached the retry callback"),
-				|_| panic!("non-retryable failure waited for another attempt"),
-			)
-			.unwrap_err();
-			assert_eq!(error.to_string(), message);
-			assert_eq!(attempts, 1);
-		}
-	}
-
-	#[test]
-	fn transient_capture_retries_are_bounded_and_cancellable() {
-		let phase = AtomicU8::new(CAPTURE_COLLECTING);
-		let mut attempts = 0;
-		let error = run_manifest_capture_attempts(
-			&phase,
-			|| -> Result<()> {
-				attempts += 1;
-				anyhow::bail!("Studio changed during Capture Manifest staging; retry the capture")
-			},
-			|_, _| Ok(()),
-			|_| {},
-		)
-		.unwrap_err();
-		assert!(error.to_string().contains("Studio changed"));
-		assert_eq!(attempts, MANIFEST_CAPTURE_MAX_ATTEMPTS);
-
-		let phase = AtomicU8::new(CAPTURE_COLLECTING);
-		let mut attempts = 0;
-		let error = run_manifest_capture_attempts(
-			&phase,
-			|| -> Result<()> {
-				attempts += 1;
-				anyhow::bail!("native snapshot failed: capture page-table plan is no longer active")
-			},
-			|_, _| Ok(()),
-			|_| phase.store(CAPTURE_CANCELLED, Ordering::Release),
-		)
-		.unwrap_err();
-		assert!(error.to_string().contains("stopped before a native snapshot retry"));
-		assert_eq!(attempts, 1);
-	}
 
 	#[test]
 	fn pending_project_realization_waits_for_synchronization() {
@@ -484,10 +262,10 @@ mod manifest_capture_retry_tests {
 	}
 
 	#[test]
-	fn shutdown_capture_joins_an_active_manual_capture() {
+	fn shutdown_capture_joins_only_an_active_capture() {
 		let operation = |worker_active| {
 			Some(ManifestCaptureOperation {
-				request_id: "manual-capture".to_owned(),
+				request_id: "capture".to_owned(),
 				client_id: 7,
 				source_generation: "served-generation".to_owned(),
 				state: "running".to_owned(),
@@ -498,11 +276,11 @@ mod manifest_capture_retry_tests {
 		};
 		let active = operation(true);
 
-		let status = joinable_manifest_capture_status(&active).unwrap();
-		assert_eq!(status.request_id, "manual-capture");
+		let status = joinable_automatic_manifest_capture_status(&active).unwrap();
+		assert_eq!(status.request_id, "capture");
 		assert_eq!(status.state, "running");
 
-		assert!(joinable_manifest_capture_status(&operation(false)).is_none());
+		assert!(joinable_automatic_manifest_capture_status(&operation(false)).is_none());
 	}
 
 	#[test]
@@ -530,110 +308,6 @@ mod manifest_capture_retry_tests {
 	}
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ManifestIdentityBootstrapContract {
-	pub root_source_id: String,
-	pub expected_source_instances: u32,
-	pub expected_digest: String,
-	pub expected_source_ids: Vec<String>,
-	pub service_anchors: Vec<ManifestIdentityServiceAnchorContract>,
-	pub rebindings: Vec<ManifestIdentityRebindingContract>,
-	pub replace_authoritative: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ManifestIdentityServiceAnchorContract {
-	pub source_id: String,
-	pub class_name: String,
-	pub name: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ManifestIdentityRebindingContract {
-	pub source_id: String,
-	pub parent_source_id: String,
-	pub class_name: String,
-	pub name: String,
-	pub kind: &'static str,
-	pub related_source_id: Option<String>,
-}
-
-fn manifest_identity_bootstrap_contract(
-	snapshot: &snapshot::Snapshot,
-	excluded: &HashSet<Ref>,
-	rebindings: &[project::ManagedIdentityRebinding],
-) -> Result<ManifestIdentityBootstrapContract> {
-	fn collect(
-		snapshot: &snapshot::Snapshot,
-		excluded: &HashSet<Ref>,
-		rebound: &HashSet<Ref>,
-		identities: &mut Vec<Ref>,
-	) {
-		if excluded.contains(&snapshot.id) && !rebound.contains(&snapshot.id) {
-			return;
-		}
-		identities.push(snapshot.id);
-		for child in &snapshot.children {
-			collect(child, excluded, rebound, identities);
-		}
-	}
-	let rebound: HashSet<_> = rebindings.iter().map(|rebinding| rebinding.source_id).collect();
-	ensure!(
-		rebound.len() == rebindings.len(),
-		"manifest identity bootstrap repeats a Studio rehydration identity"
-	);
-	ensure!(
-		rebound.iter().all(|identity| excluded.contains(identity)),
-		"manifest identity bootstrap rebinds an identity that still carries a marker"
-	);
-	let mut identities = Vec::new();
-	collect(snapshot, excluded, &rebound, &mut identities);
-	let included: HashSet<_> = identities.iter().copied().collect();
-	ensure!(
-		rebindings
-			.iter()
-			.all(|rebinding| included.contains(&rebinding.parent_source_id)),
-		"manifest identity bootstrap rebinds beneath a non-authoritative parent"
-	);
-	identities.sort_unstable_by_key(ToString::to_string);
-	let mut digest = Sha256::new();
-	for identity in &identities {
-		let uuid = uuid::Uuid::parse_str(&identity.to_string())?;
-		digest.update(uuid.as_bytes());
-	}
-	Ok(ManifestIdentityBootstrapContract {
-		root_source_id: snapshot.id.to_string(),
-		expected_source_instances: u32::try_from(identities.len())?,
-		expected_digest: format!("{:x}", digest.finalize()),
-		expected_source_ids: identities.iter().map(ToString::to_string).collect(),
-		service_anchors: snapshot
-			.children
-			.iter()
-			.filter(|child| included.contains(&child.id) && project::is_service(child.class.as_str()))
-			.map(|child| ManifestIdentityServiceAnchorContract {
-				source_id: child.id.to_string(),
-				class_name: child.class.to_string(),
-				name: child.name.clone(),
-			})
-			.collect(),
-		rebindings: rebindings
-			.iter()
-			.map(|rebinding| ManifestIdentityRebindingContract {
-				source_id: rebinding.source_id.to_string(),
-				parent_source_id: rebinding.parent_source_id.to_string(),
-				class_name: rebinding.class_name.clone(),
-				name: rebinding.name.clone(),
-				kind: rebinding.kind.wire_name(),
-				related_source_id: rebinding.related_source_id.map(|identity| identity.to_string()),
-			})
-			.collect(),
-		replace_authoritative: false,
-	})
-}
-
 struct ManifestCaptureOperation {
 	request_id: String,
 	client_id: u32,
@@ -653,20 +327,23 @@ fn manifest_capture_status(operation: &ManifestCaptureOperation) -> ManifestCapt
 	}
 }
 
-fn joinable_manifest_capture_status(operation: &Option<ManifestCaptureOperation>) -> Option<ManifestCaptureStatus> {
+fn joinable_automatic_manifest_capture_status(
+	operation: &Option<ManifestCaptureOperation>,
+) -> Option<ManifestCaptureStatus> {
 	operation
 		.as_ref()
-		.filter(|capture| capture.worker_active)
+		.filter(|capture| capture.worker_active && capture.state == "running")
 		.map(manifest_capture_status)
 }
 
-#[derive(Clone)]
+struct ManifestCaptureSource {
+	sources: Vec<crate::recovery::RecoverySource>,
+	started_at: SystemTime,
+}
+
 struct ManifestCaptureLaunch {
 	client_id: u32,
-	bridge_id: String,
-	studio_session_id: String,
-	instance_id: String,
-	force_full: bool,
+	source: ManifestCaptureSource,
 	managed_reload_transition_id: Option<String>,
 }
 
@@ -713,18 +390,18 @@ fn claim_capture_cancel(phase: &AtomicU8) -> Result<()> {
 
 impl Core {
 	pub fn new_artifact(manifest_path: &Path) -> Result<Self> {
-		Self::new_artifact_with_contract(manifest_path, None, None, None, None, None)
+		Self::new_artifact_with_contract(manifest_path, None, None, None, None)
 	}
 
 	pub fn new_artifact_with_worktree(
 		manifest_path: &Path,
 		worktree: Option<(String, String, String)>,
 	) -> Result<Self> {
-		Self::new_artifact_with_contract(manifest_path, worktree, None, None, None, None)
+		Self::new_artifact_with_contract(manifest_path, worktree, None, None, None)
 	}
 
 	pub fn new_artifact_with_live_session(manifest_path: &Path, session_token: String) -> Result<Self> {
-		Self::new_artifact_with_contract(manifest_path, None, Some(session_token), None, None, None)
+		Self::new_artifact_with_contract(manifest_path, None, Some(session_token), None, None)
 	}
 
 	pub fn new_project_with_worktree(
@@ -741,17 +418,11 @@ impl Core {
 		worktree: (String, String, String),
 		control_tx: impl Into<Option<crate::server::ServeControlSender>>,
 	) -> Result<Self> {
-		let manifest_identity_bootstrap = manifest_identity_bootstrap_contract(
-			&materialized.snapshot,
-			&materialized.identity_exclusions,
-			&materialized.identity_rebindings,
-		)?;
 		Self::new_artifact_with_contract(
 			&materialized.manifest_path,
 			Some(worktree),
 			None,
 			Some(project::live_policy(project_path, materialized)),
-			Some(manifest_identity_bootstrap),
 			control_tx.into(),
 		)
 	}
@@ -761,7 +432,6 @@ impl Core {
 		worktree: Option<(String, String, String)>,
 		live_session_token: Option<String>,
 		live_policy: Option<project::LivePolicy>,
-		manifest_identity_bootstrap: Option<ManifestIdentityBootstrapContract>,
 		control_tx: Option<crate::server::ServeControlSender>,
 	) -> Result<Self> {
 		let loaded = match live_policy.as_ref() {
@@ -837,7 +507,6 @@ impl Core {
 				.map(|(project, _, _)| project.clone())
 				.unwrap_or(loaded.name),
 			worktree: worktree.map(|(_, id, token)| (id, token)),
-			manifest_identity_bootstrap,
 			live_session_token,
 			is_place,
 			tree,
@@ -853,11 +522,12 @@ impl Core {
 			project_snapshot,
 			project_state_lock,
 			manifest_capture: Mutex::new(None),
-			last_capture_epoch: Mutex::new(None),
 			ephemeral_paths: Mutex::new(Vec::new()),
-			qualification_export: Mutex::new(None),
+			served_place_path: Mutex::new(None),
 			restart_required,
 			managed_reload_transition: Mutex::new(None),
+			automatic_capture_enabled: AtomicBool::new(false),
+			shutdown_capture_requested: AtomicBool::new(false),
 			shutdown_coordinator: ShutdownCoordinator::new(),
 		})
 	}
@@ -918,34 +588,8 @@ impl Core {
 		self.ephemeral_paths.lock().unwrap().push(path);
 	}
 
-	pub(crate) fn enable_qualification_export(&self, path: PathBuf, token: String) -> Result<()> {
-		ensure!(!token.is_empty(), "qualification export token is empty");
-		ensure!(path.is_file(), "qualification launch place is unavailable");
-		ensure!(
-			path.extension().is_some_and(|extension| extension == "rbxl"),
-			"qualification launch place must be an .rbxl file"
-		);
-		*self.qualification_export.lock().unwrap() = Some(QualificationExport { path, token });
-		Ok(())
-	}
-
-	pub(crate) fn authorize_qualification_export(&self, supplied: &str) -> Result<QualificationExport> {
-		let export = self
-			.qualification_export
-			.lock()
-			.unwrap()
-			.clone()
-			.context("qualification place export is disabled")?;
-		let expected = export.token.as_bytes();
-		let supplied = supplied.as_bytes();
-		let mut difference = expected.len() ^ supplied.len();
-		for index in 0..expected.len().max(supplied.len()) {
-			difference |= usize::from(
-				expected.get(index).copied().unwrap_or_default() ^ supplied.get(index).copied().unwrap_or_default(),
-			);
-		}
-		ensure!(difference == 0, "qualification place export is unauthorized");
-		Ok(export)
+	pub fn register_served_place(&self, path: PathBuf) {
+		*self.served_place_path.lock().unwrap() = Some(path);
 	}
 
 	pub fn cleanup_ephemeral_paths(&self) {
@@ -965,7 +609,7 @@ impl Core {
 	}
 
 	pub fn begin_manifest_capture(self: &Arc<Self>) -> Result<ManifestCaptureStatus> {
-		self.begin_manifest_capture_mode_internal(false, false, None)
+		self.begin_manifest_capture_mode_internal(true, None)
 	}
 
 	pub(crate) fn begin_managed_reload_transition(&self, transition_id: String) -> Result<()> {
@@ -991,25 +635,7 @@ impl Core {
 		self.managed_reload_transition.lock().unwrap().is_some()
 	}
 
-	pub(crate) fn validate_manifest_identity_refresh(&self, supplied: Option<&str>) -> Result<bool> {
-		let pending = self.managed_reload_transition();
-		match (pending, supplied) {
-			(None, None) => Ok(false),
-			(Some(_), None) => {
-				anyhow::bail!("synchronization reload identity refresh requires the active transition identity")
-			}
-			(None, Some(_)) => anyhow::bail!("no managed synchronization reload permits identity refresh"),
-			(Some(expected), Some(observed)) => {
-				ensure!(
-					expected == observed,
-					"managed synchronization reload transition identity does not match"
-				);
-				Ok(true)
-			}
-		}
-	}
-
-	fn validate_managed_reload_capture(&self, supplied: Option<&str>, force_full: bool) -> Result<Option<String>> {
+	fn validate_managed_reload_capture(&self, supplied: Option<&str>) -> Result<Option<String>> {
 		let pending = self.managed_reload_transition();
 		match (pending, supplied) {
 			(None, None) => Ok(None),
@@ -1021,10 +647,6 @@ impl Core {
 				ensure!(
 					expected == observed,
 					"managed synchronization reload transition identity does not match"
-				);
-				ensure!(
-					force_full,
-					"managed synchronization reload acknowledgement requires a full capture"
 				);
 				Ok(Some(expected))
 			}
@@ -1045,6 +667,8 @@ impl Core {
 	}
 
 	pub fn capture_before_shutdown(self: &Arc<Self>) -> Result<String> {
+		self.shutdown_capture_requested.store(true, Ordering::Release);
+		self.automatic_capture_enabled.store(false, Ordering::Release);
 		self.shutdown_coordinator
 			.execute_or_await(|| self.do_automatic_capture())
 	}
@@ -1056,9 +680,9 @@ impl Core {
 	fn do_automatic_capture(self: &Arc<Self>) -> Result<String> {
 		let capture_result = wait_for_automatic_capture(
 			|| {
-				let status = self.begin_manifest_capture_mode_internal(false, true, None)?;
+				let status = self.begin_manifest_capture_mode_internal(true, None)?;
 				crate::carbon_info!(
-					"Automatic transition is waiting for Capture Manifest {} for served generation {}",
+					"Automatic capture request {} is waiting for Studio auto-recovery or a manual save to the temporary served place for served generation {}",
 					status.request_id,
 					status.source_generation
 				);
@@ -1095,9 +719,6 @@ impl Core {
 			"no connected client listener",
 			"exact connected Studio route",
 			"connected Studio place",
-			"connected Studio RML bridge",
-			"RML bridge is unavailable",
-			"bridge identity changed",
 		]
 		.iter()
 		.any(|keyword| message.contains(keyword))
@@ -1107,25 +728,118 @@ impl Core {
 		artifact_store::validated_artifact_receipt(&self.manifest_path).is_ok()
 	}
 
+	pub fn start_automatic_capture_monitor(self: &Arc<Self>) -> Result<bool> {
+		ensure!(
+			self.live_policy.is_some(),
+			"automatic Studio auto-recovery capture requires an active served project"
+		);
+		let client_id = self.queue.single_listener_id()?;
+		self.queue
+			.studio_route(client_id)
+			.context("automatic Studio auto-recovery capture requires an exact connected Studio route")?;
+		if self
+			.automatic_capture_enabled
+			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+			.is_err()
+		{
+			return Ok(false);
+		}
+		self.shutdown_capture_requested.store(false, Ordering::Release);
+		let weak = Arc::downgrade(self);
+		if let Err(error) = Builder::new()
+			.name("carbon-auto-recovery-monitor".to_owned())
+			.spawn(move || Self::run_automatic_capture_monitor(weak))
+		{
+			self.automatic_capture_enabled.store(false, Ordering::Release);
+			return Err(error).context("failed to start Studio auto-recovery monitor");
+		}
+		crate::carbon_info!("Automatic Studio auto-recovery capture is active");
+		Ok(true)
+	}
+
+	fn run_automatic_capture_monitor(weak: Weak<Self>) {
+		loop {
+			let Some(core) = weak.upgrade() else {
+				break;
+			};
+			if !core.automatic_capture_enabled.load(Ordering::Acquire)
+				|| core.shutdown_capture_requested.load(Ordering::Acquire)
+				|| !core.queue.has_subscribers()
+			{
+				break;
+			}
+			match core.do_automatic_capture() {
+				Ok(message) => crate::carbon_info!("Automatic Studio auto-recovery capture completed: {message}"),
+				Err(error) if core.is_studio_disconnected_error(&error) => break,
+				Err(error) => crate::carbon_error!("Automatic Studio auto-recovery capture failed: {error:#}"),
+			}
+			drop(core);
+			thread::sleep(AUTOMATIC_CAPTURE_POLL_INTERVAL);
+		}
+		if let Some(core) = weak.upgrade() {
+			core.automatic_capture_enabled.store(false, Ordering::Release);
+		}
+	}
+
+	pub(crate) fn stop_automatic_capture_monitor(&self) {
+		self.automatic_capture_enabled.store(false, Ordering::Release);
+		loop {
+			let worker_active = {
+				let mut capture = self.manifest_capture.lock().unwrap();
+				let Some(operation) = capture.as_mut().filter(|operation| operation.worker_active) else {
+					return;
+				};
+				if operation.state == "running" && claim_capture_cancel(&operation.phase).is_ok() {
+					operation.state = "failed".to_owned();
+					operation.message = Some("Automatic auto-recovery monitoring stopped".to_owned());
+				}
+				operation.worker_active
+			};
+			if !worker_active {
+				return;
+			}
+			thread::sleep(Duration::from_millis(25));
+		}
+	}
+
 	pub(crate) fn begin_manifest_capture_mode_transition(
 		self: &Arc<Self>,
-		force_full: bool,
 		managed_reload_transition_id: Option<String>,
 	) -> Result<ManifestCaptureStatus> {
-		self.begin_manifest_capture_mode_internal(force_full, false, managed_reload_transition_id)
+		let join_active = managed_reload_transition_id.is_none();
+		self.begin_manifest_capture_mode_internal(join_active, managed_reload_transition_id)
 	}
 
 	fn begin_manifest_capture_mode_internal(
 		self: &Arc<Self>,
-		force_full: bool,
 		join_active: bool,
 		managed_reload_transition_id: Option<String>,
 	) -> Result<ManifestCaptureStatus> {
 		if join_active {
-			if let Some(status) = joinable_manifest_capture_status(&self.manifest_capture.lock().unwrap()) {
+			let operation = self.manifest_capture.lock().unwrap();
+			if let Some(status) = joinable_automatic_manifest_capture_status(&operation) {
 				return Ok(status);
 			}
 		}
+		let autosaves = crate::recovery::autosaves_dir()?;
+		let mut sources = vec![crate::recovery::RecoverySource::studio_auto_recovery(autosaves)?];
+		if let Some(path) = self.served_place_path.lock().unwrap().clone() {
+			sources.push(crate::recovery::RecoverySource::served_place(path)?);
+		}
+		let started_at = SystemTime::now();
+		self.begin_manifest_capture_internal(
+			ManifestCaptureSource { sources, started_at },
+			join_active,
+			managed_reload_transition_id,
+		)
+	}
+
+	fn begin_manifest_capture_internal(
+		self: &Arc<Self>,
+		source: ManifestCaptureSource,
+		join_active: bool,
+		managed_reload_transition_id: Option<String>,
+	) -> Result<ManifestCaptureStatus> {
 		ensure!(
 			self.live_policy.is_some(),
 			"Capture Manifest requires an active served project"
@@ -1135,43 +849,42 @@ impl Core {
 			"serve state requires a hard restart before Capture Manifest"
 		);
 		let managed_reload_transition_id =
-			self.validate_managed_reload_capture(managed_reload_transition_id.as_deref(), force_full)?;
+			self.validate_managed_reload_capture(managed_reload_transition_id.as_deref())?;
 		let client_id = self.queue.single_listener_id()?;
-		let route = self
-			.queue
+		self.queue
 			.studio_route(client_id)
 			.context("Capture Manifest requires an exact connected Studio route")?;
-		ensure_capture_startup_ready(self.has_managed_worktree(), &route)?;
-		let bridge_id = route
-			.bridge_id
-			.clone()
-			.filter(|bridge_id| !bridge_id.is_empty())
-			.context(CAPTURE_BRIDGE_NOT_READY_MESSAGE)?;
 		let source_generation = self.source_generation();
 		let request_id = uuid::Uuid::new_v4().simple().to_string();
 		let phase = Arc::new(AtomicU8::new(CAPTURE_COLLECTING));
-		let joined_status = {
+		{
 			let mut operation = self.manifest_capture.lock().unwrap();
-			if let Some(status) = joinable_manifest_capture_status(&operation) {
-				if !join_active {
-					anyhow::bail!("another Capture Manifest operation is already running");
+			if let Some(active) = operation
+				.as_mut()
+				.filter(|active| active.worker_active && active.state == "running")
+			{
+				if join_active {
+					return Ok(manifest_capture_status(active));
 				}
-				Some(status)
-			} else {
-				*operation = Some(ManifestCaptureOperation {
-					request_id: request_id.clone(),
-					client_id,
-					source_generation: source_generation.clone(),
-					state: "running".to_owned(),
-					message: Some("RML is acquiring one native Studio snapshot lease".to_owned()),
-					phase: phase.clone(),
-					worker_active: true,
-				});
-				None
+				anyhow::bail!("another Capture Manifest operation is already running");
 			}
-		};
-		if let Some(status) = joined_status {
-			return Ok(status);
+			let message = if let Some(path) = self.served_place_path.lock().unwrap().as_ref() {
+				format!(
+					"Waiting up to six minutes for Studio auto-recovery or a manual save to {}",
+					path.display()
+				)
+			} else {
+				"Waiting up to six minutes for Studio to write a new auto-recovery place".to_owned()
+			};
+			*operation = Some(ManifestCaptureOperation {
+				request_id: request_id.clone(),
+				client_id,
+				source_generation: source_generation.clone(),
+				state: "running".to_owned(),
+				message: Some(message),
+				phase: phase.clone(),
+				worker_active: true,
+			});
 		}
 		let core = Arc::clone(self);
 		let worker_request_id = request_id.clone();
@@ -1180,38 +893,22 @@ impl Core {
 			.spawn(move || {
 				let launch = ManifestCaptureLaunch {
 					client_id,
-					bridge_id,
-					studio_session_id: route.studio_session_id,
-					instance_id: route.instance_id,
-					force_full,
+					source,
 					managed_reload_transition_id,
 				};
-				if let Err(error) = run_manifest_capture_attempts(
-					&phase,
-					|| core.run_native_manifest_capture(&worker_request_id, launch.clone(), phase.clone()),
-					|attempt, error| {
-						let message = format!(
-							"Studio changed during native capture attempt {attempt}; retrying attempt {} of {}: {error:#}",
-							attempt + 1,
-							MANIFEST_CAPTURE_MAX_ATTEMPTS,
-						);
-						crate::carbon_info!("{message}");
-						core.update_manifest_capture_message(&worker_request_id, &message)
-					},
-					thread::sleep,
-				) {
+				if let Err(error) = core.run_manifest_capture(&worker_request_id, launch, phase) {
 					core.fail_manifest_capture(&worker_request_id, format!("{error:#}"));
 				}
 				core.settle_manifest_capture_worker(&worker_request_id);
 			}) {
-			self.fail_manifest_capture(&request_id, format!("failed to start native capture worker: {error}"));
+			self.fail_manifest_capture(&request_id, format!("failed to start Capture Manifest worker: {error}"));
 			self.settle_manifest_capture_worker(&request_id);
 			return Err(error.into());
 		}
 		self.manifest_capture_status(&request_id)
 	}
 
-	fn run_native_manifest_capture(
+	fn run_manifest_capture(
 		&self,
 		request_id: &str,
 		launch: ManifestCaptureLaunch,
@@ -1219,49 +916,54 @@ impl Core {
 	) -> Result<()> {
 		let ManifestCaptureLaunch {
 			client_id,
-			bridge_id,
-			studio_session_id,
-			instance_id,
-			force_full,
+			source,
 			managed_reload_transition_id,
 		} = launch;
-		let capture_started = Instant::now();
-		let bridge = Bridge::discover(&bridge_id).context("connected Studio RML bridge is unavailable")?;
-		let identity: StudioIdentity = bridge.get("v1/identity")?;
-		ensure!(
-			identity.bridge_id == bridge_id
-				&& identity.studio_session_id == studio_session_id
-				&& identity.instance_id == instance_id,
-			"RML capture route no longer identifies the connected Studio place"
-		);
-		let capabilities: Capabilities = bridge.get("v1/capabilities")?;
-		ensure!(
-			capabilities.bridge_id == bridge_id,
-			"RML capture bridge identity changed"
-		);
-		ensure!(capabilities.engine_ready, "RML capture engine is not ready");
-		ensure!(
-			capabilities.engine_generation != 0,
-			"RML capture engine generation is unavailable"
-		);
-		ensure!(
-			capabilities.capture_lease_protocol == crate::capture_provider::CAPTURE_ENVELOPE_VERSION,
-			"RML capture lease protocol is incompatible with this Carbon server"
-		);
-		let route_identity_authority = self
-			.queue
-			.studio_route(client_id)
-			.context("Studio route disappeared before capture")?
-			.manifest_identities_authoritative;
-		ensure!(
-			!route_identity_authority || capabilities.manifest_identities_authoritative,
-			"RML lost the authoritative manifest identity ledger after an engine restart; reconnect Studio and reopen a fresh Carbon build"
-		);
-		self.queue
-			.set_manifest_identities_authoritative(client_id, capabilities.manifest_identities_authoritative)?;
-		let manifest_identities_authoritative = capabilities.manifest_identities_authoritative;
-		let contract = self.managed_hierarchy_contract()?;
 		let source_generation = self.source_generation();
+		let (worktree_id, session_token) = self
+			.worktree
+			.as_ref()
+			.context("Capture Manifest requires a managed Studio worktree")?;
+		let policy = self
+			.live_policy
+			.as_ref()
+			.context("Capture Manifest requires a served project")?
+			.read()
+			.unwrap()
+			.clone();
+		let canonical = self
+			.project_snapshot
+			.as_ref()
+			.context("hybrid project snapshot is unavailable")?
+			.read()
+			.unwrap()
+			.clone();
+		let expected = artifact_store::WorktreeContract {
+			endpoint: String::new(),
+			project: self.name.clone(),
+			worktree_id: worktree_id.clone(),
+			session_token: session_token.clone(),
+			identity_exclusions: HashSet::new(),
+		};
+		let ManifestCaptureSource { sources, started_at } = source;
+		let (capture_kind, capture_path, recovered_tree) = crate::recovery::wait_for_new_recovery(
+			&sources,
+			started_at,
+			crate::recovery::CAPTURE_TIMEOUT,
+			|| phase.load(Ordering::Acquire) == CAPTURE_CANCELLED || !self.queue.is_subscribed(client_id),
+			|path| match project::decode_captured_place(path, &expected, &canonical, &policy.mapped_roots) {
+				Ok(tree) => Ok(Some(tree)),
+				Err(error) if format!("{error:#}").contains("different Carbon Studio session") => Ok(None),
+				Err(error) => Err(error),
+			},
+		)?;
+		let capture_kind = capture_kind.label();
+		self.update_manifest_capture_message(
+			request_id,
+			&format!("{capture_kind} arrived; validating {}", capture_path.display()),
+		)?;
+
+		self.update_manifest_capture_message(request_id, "Waiting for project source to settle")?;
 		let project_sync_started = Instant::now();
 		let project_realization_generation = wait_for_project_synchronization(
 			|| {
@@ -1271,830 +973,77 @@ impl Core {
 			thread::sleep,
 			|| project_sync_started.elapsed() >= PROJECT_SYNC_WAIT_TIMEOUT,
 		)?;
-		// `/v1/roots` is a point-in-time set and Studio may lazily create a
-		// persistent service between that handshake and native serialization.
-		// Send the complete pinned reflection schema; RML still fails closed if a
-		// captured shell class is unknown to it.
-		let shell_classes = crate::server::privileged::capture_shell_class_names()
-			.into_iter()
-			.map(|class_name| {
-				Ok(CaptureShellClassRequest {
-					properties: crate::server::privileged::capture_shell_property_names(&class_name)?,
-					class_name,
-				})
-			})
-			.collect::<Result<Vec<_>>>()?;
-		let reflection_schema_hash = blake3::hash(&serde_json::to_vec(&shell_classes)?).to_hex().to_string();
-		let mapped_root_source_ids = self
-			.live_policy
-			.as_ref()
-			.map(|policy| {
-				policy
-					.read()
-					.unwrap()
-					.mapped_roots
-					.iter()
-					.map(ToString::to_string)
-					.collect()
-			})
-			.unwrap_or_default();
-		let request = CaptureRequest {
-			capture_id: request_id.to_owned(),
-			studio_session_id,
-			instance_id,
-			engine_generation: capabilities.engine_generation,
-			source_generation: source_generation.clone(),
-			managed_contract_id: contract.contract_id.clone(),
-			reflection_schema_hash,
-			manifest_identities_authoritative,
-			allow_page_reuse: !force_full,
-			mapped_root_source_ids,
-			shell_classes,
-		};
-		// Capture attaches the compact mapping contract only when the user asks
-		// for a snapshot. Connection remains verification-free, and the native
-		// planner uses mapped roots as opaque exclusion barriers rather than
-		// comparing their descendants with filesystem source. Attach before the
-		// epoch proof so a trusted launch can attest the same contract without
-		// acquiring a native serialization lease.
-		refresh_capture_contract_on_bridge(
-			&bridge,
-			&contract,
-			&request.studio_session_id,
-			&request.instance_id,
-			request.engine_generation,
-			capabilities.process_id,
-		)
-		.context("failed to attach mapping barriers for native capture")?;
-		if !force_full
-			&& manifest_identities_authoritative
-			&& self.try_capture_epoch_noop(
-				&bridge,
-				&capabilities,
-				&request.studio_session_id,
-				&request.instance_id,
-				&source_generation,
-				&contract.contract_id,
-				&phase,
-			)? {
-			let mut operation = self.manifest_capture.lock().unwrap();
-			let operation = operation
-				.as_mut()
-				.filter(|operation| operation.request_id == request_id)
-				.context("Capture Manifest request disappeared during epoch no-op validation")?;
-			operation.source_generation = source_generation;
-			operation.state = "complete".to_owned();
-			operation.message =
-				Some("Manifest capture exact no-op was proven by the unchanged native mutation epoch".to_owned());
-			crate::carbon_info!(
-				"Capture Manifest epoch no-op timings for {}: total={:.1}ms",
-				request_id,
-				capture_started.elapsed().as_secs_f64() * 1_000.0,
-			);
-			return Ok(());
-		}
-		let precommit_bridge = bridge.clone();
-		let provider = RmlCaptureProvider::new(bridge);
-		let lease = provider
-			.start(&request)
-			.context("RML rejected the native capture lease")?;
+		let cancelled = || phase.load(Ordering::Acquire) == CAPTURE_CANCELLED;
+		ensure!(
+			self.source_generation() == source_generation,
+			"served source changed during Capture Manifest"
+		);
+		let metadata = artifact_store::validated_artifact_receipt(&self.manifest_path)?
+			.metadata()
+			.clone();
+		self.update_manifest_capture_message(request_id, "Staging the recovered Studio place")?;
+		let staged_composite = artifact_store::stage_compiled_capture(
+			&recovered_tree,
+			recovered_tree.root_ref(),
+			self.name.clone(),
+			metadata,
+			&policy.mapped_refs,
+			&self.manifest_path,
+			&cancelled,
+		)?;
+		let projected_tree = artifact_store::load_projected_live(
+			staged_composite.artifact(),
+			&policy.mapped_refs,
+			&policy.routing_refs,
+		)?
+		.tree;
+		let staged_studio = project::stage_captured_studio_domain(&policy, &staged_composite, &cancelled)?;
+		let promotion = project::prepare_capture_promotion(staged_composite, staged_studio)?;
+		ensure!(
+			self.exact_project_realization_generation()? == project_realization_generation,
+			"filesystem mapping realization changed during Capture Manifest; retry after project source settles"
+		);
+		self.update_manifest_capture_message(request_id, "Committing the recovered manifest atomically")?;
+		let generation = self.writer.commit_prepared_capture(
+			projected_tree,
+			promotion,
+			phase,
+			source_generation,
+			CapturePrecommitAttestation {
+				project_path: policy.project_path.clone(),
+				project_document: policy.project_document.clone(),
+				previous_projected: canonical,
+				mapped_refs: policy.mapped_refs.clone(),
+				project_generation: project_realization_generation,
+			},
+		)?;
+		let contract = self.encode_current_managed_hierarchy()?;
+		let projected_source_ids = contract.source_ids.clone();
+		install_managed_hierarchy_contract(&self.managed_hierarchy, contract);
+		self.source_reader
+			.install_projected_state(projected_source_ids, generation.clone())?;
 		{
 			let mut operation = self.manifest_capture.lock().unwrap();
 			let operation = operation
 				.as_mut()
 				.filter(|operation| operation.request_id == request_id)
-				.context("Capture Manifest request disappeared before lease acquisition")?;
-			operation.message = Some("Studio is serializing bounded native RBXM chunks".to_owned());
+				.context("Capture Manifest request disappeared after recovery commit")?;
+			operation.source_generation = generation;
+			operation.state = "complete".to_owned();
+			operation.message = Some(format!(
+				"{capture_kind} {} was captured and committed atomically",
+				capture_path.display()
+			));
 		}
-
-		let lease_id = lease.lease_id;
-		let parent = self.manifest_path.parent().unwrap_or_else(|| Path::new("."));
-		let prefix = format!(".carbon-capture-{request_id}");
-		let envelope_path = parent.join(format!("{prefix}.envelope"));
-		let payload_path = parent.join(format!("{prefix}.rbxm"));
-		let result = (|| -> Result<(
-			String,
-			Vec<crate::capture_provider::ManifestIdentityRemap>,
-			bool,
-			u64,
-			u64,
-			artifact_store::ValidatedArtifactReceipt,
-		)> {
-			let progressive_payload = provider.supports_progressive_payload();
-			let mut payload_spool = CapturePayloadSpool::new(BufWriter::new(File::create(&payload_path)?));
-			let mut progressive_bytes = 0_u64;
-			let mut reported_chunks = 0_u32;
-			let native_wait_started = Instant::now();
-			let ready = wait_until_ready_with_progress(
-				&provider,
-				&lease_id,
-				Duration::from_secs(300),
-				|| phase.load(Ordering::Acquire) == CAPTURE_CANCELLED,
-				|status| {
-					if !progressive_payload {
-						return Ok(());
-					}
-					if !matches!(status.state.as_str(), "serializing" | "spooling" | "ready") {
-						return Ok(());
-					}
-					if status.completed_chunks != reported_chunks {
-						reported_chunks = status.completed_chunks;
-						let total = status
-							.total_chunks
-							.map(|total| total.to_string())
-							.unwrap_or_else(|| "?".to_owned());
-						self.update_manifest_capture_message(
-							request_id,
-							&format!(
-								"Studio serialized and streamed {}/{total} bounded chunks",
-								status.completed_chunks
-							),
-						)?;
-					}
-					if status.committed_model_bytes <= progressive_bytes {
-						return Ok(());
-					}
-					let length = status.committed_model_bytes - progressive_bytes;
-					if status.state != "ready" && length < 4 * 1024 * 1024 {
-						return Ok(());
-					}
-					let copied =
-						provider.copy_payload_range(&lease_id, progressive_bytes, length, &mut payload_spool)?;
-					ensure!(copied == length, "RML returned an incomplete progressive capture range");
-					progressive_bytes += copied;
-					Ok(())
-				},
-			)?;
-			let native_wait_elapsed = native_wait_started.elapsed();
-			ensure!(
-				ready.serializer_settled,
-				"RML reported a ready capture before its serializer settled"
-			);
-			self.update_manifest_capture_message(request_id, "Transferring native capture artifacts")?;
-			let capture_result =
-				(|| -> Result<(
-					String,
-					Vec<crate::capture_provider::ManifestIdentityRemap>,
-					bool,
-					u64,
-					u64,
-					artifact_store::ValidatedArtifactReceipt,
-				)> {
-				let transfer_started = Instant::now();
-				{
-					let mut output = BufWriter::new(File::create(&envelope_path)?);
-					provider.copy_envelope(&lease_id, &mut output)?;
-					output.flush()?;
-				}
-				if progressive_payload {
-					ensure!(
-						Some(progressive_bytes) == ready.model_bytes,
-						"progressive capture length disagrees with the final RML seal"
-					);
-				} else {
-					provider.copy_payload(&lease_id, &mut payload_spool)?;
-				}
-				let transfer_elapsed = transfer_started.elapsed();
-				self.update_manifest_capture_message(request_id, "Validating the native Studio snapshot")?;
-				ensure!(
-					phase.load(Ordering::Acquire) == CAPTURE_COLLECTING,
-					"Capture Manifest was cancelled before native artifacts were decoded"
-				);
-				let validation_started = Instant::now();
-				let envelope_bytes = fs::read(&envelope_path)?;
-				let envelope = crate::capture_provider::CaptureEnvelope::decode(&envelope_bytes)?;
-				drop(envelope_bytes);
-				envelope.validate_request(&request)?;
-				payload_spool.finish(&envelope)?;
-				let validation_elapsed = validation_started.elapsed();
-				let _project_state = self.project_state_lock.as_ref().map(|lock| lock.lock().unwrap());
-				ensure!(
-					self.source_generation() == request.source_generation,
-					"served mapped source changed during Capture Manifest; retry after Studio is synchronized"
-				);
-				ensure!(
-					!self.restart_required.load(Ordering::Acquire),
-					"serve state requires a hard restart before Capture Manifest can commit"
-				);
-				let validated_capture = crate::capture_store::classify_validated_capture(
-					&envelope,
-					&self.name,
-					&project_realization_generation,
-					&self.manifest_path,
-				)?;
-				let exact_noop_receipt = if force_full {
-					None
-				} else if let crate::capture_store::ValidatedCaptureClass::ExactNoop(receipt) = &validated_capture {
-					Some(receipt)
-				} else {
-					None
-				};
-				if let Some(receipt) = exact_noop_receipt {
-					ensure!(
-						receipt.generation() == request.source_generation,
-						"validated exact capture does not match the served source generation"
-					);
-					let policy = self
-						.live_policy
-						.as_ref()
-						.context("Capture Manifest requires a served project")?
-						.read()
-						.unwrap()
-						.clone();
-					ensure!(
-						self.exact_project_realization_generation()? == project_realization_generation,
-						"filesystem mapping realization changed during Capture Manifest; retry after project source settles"
-					);
-					ensure!(
-						phase.load(Ordering::Acquire) == CAPTURE_COLLECTING,
-						"Capture Manifest was cancelled before the exact no-op claim"
-					);
-					let commit_started = Instant::now();
-					let generation = self.writer.commit_capture_noop(
-						receipt.clone(),
-						phase.clone(),
-						request.source_generation.clone(),
-						CapturePrecommitAttestation {
-							bridge: precommit_bridge.clone(),
-							bridge_id: bridge_id.clone(),
-							process_id: capabilities.process_id,
-							studio_session_id: request.studio_session_id.clone(),
-							instance_id: request.instance_id.clone(),
-							engine_generation: request.engine_generation,
-							hierarchy_sequence: envelope.hierarchy_sequence_after,
-							change_sequence: envelope.change_sequence_after,
-							project_path: policy.project_path.clone(),
-							project_document: policy.project_document.clone(),
-							previous_projected: self
-								.project_snapshot
-								.as_ref()
-								.context("hybrid project snapshot is unavailable")?
-								.read()
-								.unwrap()
-								.clone(),
-							mapped_refs: policy.mapped_refs.clone(),
-							project_generation: project_realization_generation.clone(),
-						},
-					)?;
-					crate::carbon_info!(
-							"Capture Manifest exact no-op timings for {}: native-wait={:.1}ms, artifact-transfer={:.1}ms, artifact-validation={:.1}ms, commit={:.1}ms, total={:.1}ms",
-							request_id,
-							native_wait_elapsed.as_secs_f64() * 1_000.0,
-							transfer_elapsed.as_secs_f64() * 1_000.0,
-							validation_elapsed.as_secs_f64() * 1_000.0,
-							commit_started.elapsed().as_secs_f64() * 1_000.0,
-							capture_started.elapsed().as_secs_f64() * 1_000.0,
-						);
-					return Ok((
-						generation,
-						Vec::new(),
-						true,
-						envelope.hierarchy_sequence_after,
-						envelope.change_sequence_after,
-						receipt.clone(),
-					));
-				}
-				let baseline = match validated_capture {
-					crate::capture_store::ValidatedCaptureClass::Rebuild(receipt)
-					| crate::capture_store::ValidatedCaptureClass::ExactNoop(receipt) => receipt,
-				};
-				let cancelled = || phase.load(Ordering::Acquire) == CAPTURE_CANCELLED;
-				self.update_manifest_capture_message(request_id, "Compiling the captured Studio state")?;
-				let compile_started = Instant::now();
-				let compiled = {
-					let canonical = self
-						.project_snapshot
-						.as_ref()
-						.context("hybrid project snapshot is unavailable")?
-						.read()
-						.unwrap();
-					crate::capture_store::compile_validated(
-						&payload_path,
-						&envelope,
-						&canonical,
-						&self.name,
-						&self.manifest_path,
-						&baseline,
-						&project_realization_generation,
-						&cancelled,
-					)?
-				};
-				let compile_elapsed = compile_started.elapsed();
-				let referenced_mapped_refs = compiled.referenced_mapped_refs.clone();
-				self.update_manifest_capture_message(request_id, "Staging the captured manifest")?;
-				let composite_stage_started = Instant::now();
-				let (projected_tree, staged_composite, identity_remap) =
-					compiled.stage_composite(self.name.clone(), &self.manifest_path, &cancelled)?;
-				let composite_stage_elapsed = composite_stage_started.elapsed();
-				let policy = self
-					.live_policy
-					.as_ref()
-					.context("Capture Manifest requires a served project")?
-					.read()
-					.unwrap()
-					.clone();
-				if staged_composite.is_noop()? {
-					ensure!(
-						self.exact_project_realization_generation()? == project_realization_generation,
-						"filesystem mapping realization changed during Capture Manifest; retry after project source settles"
-					);
-					ensure!(
-						phase.load(Ordering::Acquire) == CAPTURE_COLLECTING,
-						"Capture Manifest was cancelled before the authored no-op claim"
-					);
-					let commit_started = Instant::now();
-					let generation = self.writer.commit_capture_noop(
-						baseline.clone(),
-						phase.clone(),
-						request.source_generation.clone(),
-						CapturePrecommitAttestation {
-							bridge: precommit_bridge.clone(),
-							bridge_id: bridge_id.clone(),
-							process_id: capabilities.process_id,
-							studio_session_id: request.studio_session_id.clone(),
-							instance_id: request.instance_id.clone(),
-							engine_generation: request.engine_generation,
-							hierarchy_sequence: envelope.hierarchy_sequence_after,
-							change_sequence: envelope.change_sequence_after,
-							project_path: policy.project_path.clone(),
-							project_document: policy.project_document.clone(),
-							previous_projected: self
-								.project_snapshot
-								.as_ref()
-								.context("hybrid project snapshot is unavailable")?
-								.read()
-								.unwrap()
-								.clone(),
-							mapped_refs: policy.mapped_refs.clone(),
-							project_generation: project_realization_generation.clone(),
-						},
-					)?;
-					let capture_kind = if force_full {
-						"full rebuild authored no-op"
-					} else {
-						"authored no-op"
-					};
-					crate::carbon_info!(
-						"Capture Manifest {capture_kind} timings for {}: native-wait={:.1}ms, artifact-transfer={:.1}ms, artifact-validation={:.1}ms, compile={:.1}ms, composite-stage={:.1}ms, commit={:.1}ms, total={:.1}ms",
-						request_id,
-						native_wait_elapsed.as_secs_f64() * 1_000.0,
-						transfer_elapsed.as_secs_f64() * 1_000.0,
-						validation_elapsed.as_secs_f64() * 1_000.0,
-						compile_elapsed.as_secs_f64() * 1_000.0,
-						composite_stage_elapsed.as_secs_f64() * 1_000.0,
-						commit_started.elapsed().as_secs_f64() * 1_000.0,
-						capture_started.elapsed().as_secs_f64() * 1_000.0,
-					);
-					return Ok((
-						generation,
-						identity_remap,
-						true,
-						envelope.hierarchy_sequence_after,
-						envelope.change_sequence_after,
-						baseline,
-					));
-				}
-				let studio_stage_started = Instant::now();
-				let staged_studio = project::stage_captured_studio_domain(&policy, &staged_composite, &cancelled)?;
-				let staged_identities = project::stage_mapped_identities(&policy, &referenced_mapped_refs, &cancelled)?;
-				let studio_stage_elapsed = studio_stage_started.elapsed();
-				let precommit_started = Instant::now();
-				let capture_receipt = staged_composite.receipt().clone();
-				let promotion = project::prepare_capture_promotion_with_identities(
-					staged_composite,
-					staged_studio,
-					staged_identities,
-				)?;
-				ensure!(
-					self.exact_project_realization_generation()? == project_realization_generation,
-					"filesystem mapping realization changed during Capture Manifest; retry after project source settles"
-				);
-				ensure!(
-					phase.load(Ordering::Acquire) == CAPTURE_COLLECTING,
-					"Capture Manifest was cancelled before staged promotion"
-				);
-				let precommit_elapsed = precommit_started.elapsed();
-				self.update_manifest_capture_message(request_id, "Committing the captured manifest atomically")?;
-				let commit_started = Instant::now();
-				let generation = self.writer.commit_prepared_capture(
-					projected_tree,
-					promotion,
-					phase.clone(),
-					request.source_generation.clone(),
-					CapturePrecommitAttestation {
-						bridge: precommit_bridge.clone(),
-						bridge_id: bridge_id.clone(),
-						process_id: capabilities.process_id,
-						studio_session_id: request.studio_session_id.clone(),
-						instance_id: request.instance_id.clone(),
-						engine_generation: request.engine_generation,
-						hierarchy_sequence: envelope.hierarchy_sequence_after,
-						change_sequence: envelope.change_sequence_after,
-						project_path: policy.project_path.clone(),
-						project_document: policy.project_document.clone(),
-						previous_projected: self
-							.project_snapshot
-							.as_ref()
-							.context("hybrid project snapshot is unavailable")?
-							.read()
-							.unwrap()
-							.clone(),
-						mapped_refs: policy.mapped_refs.clone(),
-						project_generation: project_realization_generation.clone(),
-					},
-				)?;
-				let commit_elapsed = commit_started.elapsed();
-				let refresh_started = Instant::now();
-				let contract = self.encode_current_managed_hierarchy()?;
-				let projected_source_ids = contract.source_ids.clone();
-				install_managed_hierarchy_contract(&self.managed_hierarchy, contract);
-				self.source_reader
-					.install_projected_state(projected_source_ids, generation.clone())?;
-				let refresh_elapsed = refresh_started.elapsed();
-				crate::carbon_info!(
-					"Capture Manifest phase timings for {}: pre-lease={:.1}ms, native-wait={:.1}ms, artifact-transfer={:.1}ms, artifact-validation={:.1}ms, compile={:.1}ms, composite-stage={:.1}ms, Studio-stage={:.1}ms, precommit-attestation={:.1}ms, commit={:.1}ms, local-refresh={:.1}ms, total={:.1}ms",
-					request_id,
-					native_wait_started.duration_since(capture_started).as_secs_f64() * 1_000.0,
-					native_wait_elapsed.as_secs_f64() * 1_000.0,
-					transfer_elapsed.as_secs_f64() * 1_000.0,
-					validation_elapsed.as_secs_f64() * 1_000.0,
-					compile_elapsed.as_secs_f64() * 1_000.0,
-					composite_stage_elapsed.as_secs_f64() * 1_000.0,
-					studio_stage_elapsed.as_secs_f64() * 1_000.0,
-					precommit_elapsed.as_secs_f64() * 1_000.0,
-					commit_elapsed.as_secs_f64() * 1_000.0,
-					refresh_elapsed.as_secs_f64() * 1_000.0,
-					capture_started.elapsed().as_secs_f64() * 1_000.0,
-				);
-				Ok((
-					generation,
-					identity_remap,
-					false,
-					envelope.hierarchy_sequence_after,
-					envelope.change_sequence_after,
-					capture_receipt,
-				))
-			})();
-			capture_result
-		})();
-		let _ = fs::remove_file(&envelope_path);
-		let _ = fs::remove_file(&payload_path);
-
-		match result {
-			Ok((generation, identity_remap, exact_noop, hierarchy_sequence, change_sequence, artifact)) => {
-				let identity_finalize = if request.manifest_identities_authoritative {
-					Ok(())
-				} else {
-					provider
-						.finalize_manifest_identities(&request.capture_id, &identity_remap)
-						.and_then(|()| self.queue.mark_manifest_identities_authoritative(client_id))
-						.context("failed to finalize adopted manifest identities in RML")
-				};
-				let identity_error = identity_finalize.err().map(|error| format!("{error:#}"));
-				let refresh_error = if exact_noop {
-					None
-				} else {
-					self.refresh_capture_managed_hierarchy(&provider, &request, capabilities.process_id)
-						.context("failed to refresh RML after the manifest commit")
-						.err()
-						.map(|error| format!("{error:#}"))
-				};
-				let acknowledgement_error = if identity_error.is_none() && refresh_error.is_none() {
-					provider
-						.acknowledge(&lease_id)
-						.context("failed to acknowledge the committed capture page table")
-						.err()
-						.map(|error| format!("{error:#}"))
-				} else {
-					None
-				};
-				let release = provider
-					.release(&lease_id)
-					.context("failed to release completed RML capture lease")
-					.and_then(|result| {
-						ensure!(result.released, "RML retained the completed capture lease");
-						Ok(())
-					});
-				let finalization_error = [
-					identity_error,
-					refresh_error,
-					acknowledgement_error,
-					release.err().map(|error| format!("{error:#}")),
-				]
-				.into_iter()
-				.flatten()
-				.reduce(|left, right| format!("{left}; {right}"));
-				if finalization_error.is_none() {
-					let capture_fingerprint = artifact.capture_fingerprint().unwrap_or_else(|| artifact.generation());
-					if let Err(error) = self.remember_capture_epoch_if_current(
-						&precommit_bridge,
-						&capabilities,
-						&request.studio_session_id,
-						&request.instance_id,
-						hierarchy_sequence,
-						change_sequence,
-						&generation,
-						&artifact,
-						capture_fingerprint,
-					) {
-						crate::carbon_info!("Capture epoch no-op cache was not retained: {error:#}");
-					}
-				}
-				let transition_completed = finalization_error.is_none() && managed_reload_transition_id.is_some();
-				{
-					let mut operation = self.manifest_capture.lock().unwrap();
-					let operation = operation
-						.as_mut()
-						.filter(|operation| operation.request_id == request_id)
-						.context("Capture Manifest request disappeared after commit")?;
-					operation.source_generation = generation;
-					if let Some(error) = finalization_error {
-						operation.state = "failed".to_owned();
-						self.restart_required.store(true, Ordering::Release);
-						let message = format!(
-							"Manifest capture committed atomically, but post-commit RML finalization failed; \
-						 hard restart serve before any further capture: {error}"
-						);
-						operation.message = Some(message.clone());
-						let _ = self.queue.push(
-							crate::server::Message::RestartRequired(crate::server::RestartRequired { message }),
-							Some(client_id),
-						);
-					} else {
-						operation.state = "complete".to_owned();
-						operation.message = Some(if exact_noop {
-							if force_full {
-								"Manifest capture full rebuild verified an exact authored no-op and retained the canonical artifact"
-								.to_owned()
-							} else {
-								"Manifest capture exact no-op was fully validated and retained the exact RML hierarchy contract"
-								.to_owned()
-							}
-						} else {
-							"Manifest capture full rebuild committed atomically and refreshed the exact RML hierarchy contract"
-							.to_owned()
-						});
-					}
-				}
-				if transition_completed {
-					self.complete_managed_reload_transition(managed_reload_transition_id.as_deref().unwrap())?;
-				}
-				Ok(())
-			}
-			Err(error) => {
-				let committed = phase.load(Ordering::Acquire) == CAPTURE_COMMITTED;
-				let release_error = if phase.load(Ordering::Acquire) == CAPTURE_CANCELLED {
-					provider.cancel(&lease_id).err()
-				} else {
-					provider.release(&lease_id).err()
-				};
-				if !committed {
-					if let Some(release_error) = release_error {
-						return Err(error)
-							.context(format!("native capture lease cleanup also failed: {release_error:#}"));
-					}
-					return Err(error);
-				}
-				self.restart_required.store(true, Ordering::Release);
-				let mut message = format!(
-					"Manifest capture changed the served composite, but post-commit persistence failed; hard restart serve before further synchronization: {error:#}"
-				);
-				if let Some(release_error) = release_error {
-					message.push_str(&format!("; capture lease release also failed: {release_error:#}"));
-				}
-				{
-					let mut operation = self.manifest_capture.lock().unwrap();
-					let operation = operation
-						.as_mut()
-						.filter(|operation| operation.request_id == request_id)
-						.context("Capture Manifest request disappeared after composite commit")?;
-					operation.source_generation = self.source_generation();
-					operation.state = "failed".to_owned();
-					operation.message = Some(message.clone());
-				}
-				let _ = self.queue.push(
-					crate::server::Message::RestartRequired(crate::server::RestartRequired { message }),
-					Some(client_id),
-				);
-				Ok(())
-			}
+		if let Some(transition_id) = managed_reload_transition_id {
+			self.complete_managed_reload_transition(&transition_id)?;
 		}
-	}
-
-	#[allow(clippy::too_many_arguments)]
-	fn try_capture_epoch_noop(
-		&self,
-		bridge: &Bridge,
-		capabilities: &Capabilities,
-		studio_session_id: &str,
-		instance_id: &str,
-		source_generation: &str,
-		managed_contract_id: &str,
-		phase: &AtomicU8,
-	) -> Result<bool> {
-		let Some(expected) = self.last_capture_epoch.lock().unwrap().clone() else {
-			crate::carbon_info!("Capture Manifest epoch no-op unavailable: no prior committed capture epoch");
-			return Ok(false);
-		};
-		let observed = CaptureEpochReceipt {
-			bridge_id: capabilities.bridge_id.clone(),
-			process_id: capabilities.process_id,
-			studio_session_id: studio_session_id.to_owned(),
-			instance_id: instance_id.to_owned(),
-			engine_generation: capabilities.engine_generation,
-			hierarchy_sequence: capabilities.hierarchy_sequence,
-			change_sequence: capabilities.change_sequence,
-			source_generation: source_generation.to_owned(),
-			managed_contract_id: managed_contract_id.to_owned(),
-			project_realization_generation: expected.project_realization_generation.clone(),
-			artifact_generation: expected.artifact_generation.clone(),
-			artifact_fingerprint: expected.artifact_fingerprint.clone(),
-			artifact_len: expected.artifact_len,
-			artifact_modified: expected.artifact_modified,
-		};
-		let changed_fields = capture_epoch_changed_fields(&expected, &observed);
-		if !changed_fields.is_empty() {
-			crate::carbon_info!(
-				"Capture Manifest epoch no-op unavailable: changed {}",
-				changed_fields.join(", ")
-			);
-			return Ok(false);
+		if let Err(error) = self
+			.queue
+			.push(crate::server::Message::SyncDetails(self.details()), Some(client_id))
+		{
+			log::warn!("captured manifest committed, but Studio did not receive refreshed source details: {error:#}");
 		}
-
-		let _project_state = self.project_state_lock.as_ref().map(|lock| lock.lock().unwrap());
-		let project_realization_generation = self.exact_project_realization_generation()?;
-		let source_changed = self.source_generation() != source_generation;
-		let contract_changed = self.managed_hierarchy_contract()?.contract_id != managed_contract_id;
-		let project_changed = project_realization_generation != expected.project_realization_generation;
-		if source_changed || contract_changed || project_changed {
-			let mut reasons = Vec::new();
-			if source_changed {
-				reasons.push("served source");
-			}
-			if contract_changed {
-				reasons.push("managed hierarchy contract");
-			}
-			if project_changed {
-				reasons.push("project realization");
-			}
-			crate::carbon_info!(
-				"Capture Manifest epoch no-op unavailable: changed {}",
-				reasons.join(", ")
-			);
-			return Ok(false);
-		}
-		let artifact_metadata = fs::metadata(&self.manifest_path)?;
-		let artifact_modified = artifact_metadata.modified()?;
-		let generation_changed = expected.artifact_generation != source_generation;
-		let fingerprint_missing = expected.artifact_fingerprint.is_empty();
-		let length_changed = artifact_metadata.len() != expected.artifact_len;
-		let modified_changed = artifact_modified != expected.artifact_modified;
-		if generation_changed || fingerprint_missing || length_changed || modified_changed {
-			let mut reasons = Vec::new();
-			if generation_changed {
-				reasons.push("artifact generation");
-			}
-			if fingerprint_missing {
-				reasons.push("missing artifact fingerprint");
-			}
-			if length_changed {
-				reasons.push("artifact length");
-			}
-			if modified_changed {
-				reasons.push("artifact modification time");
-			}
-			crate::carbon_info!(
-				"Capture Manifest epoch no-op unavailable: changed {}",
-				reasons.join(", ")
-			);
-			return Ok(false);
-		}
-		ensure!(
-			phase.load(Ordering::Acquire) == CAPTURE_COLLECTING,
-			"Capture Manifest was cancelled before epoch no-op validation"
-		);
-		let current: Capabilities = bridge.get("v1/capabilities")?;
-		let exact = current.bridge_id == observed.bridge_id
-			&& current.process_id == observed.process_id
-			&& current.studio_session_id == observed.studio_session_id
-			&& current.instance_id == observed.instance_id
-			&& current.engine_ready
-			&& current.engine_generation == observed.engine_generation
-			&& current.hierarchy_sequence == observed.hierarchy_sequence
-			&& current.change_sequence == observed.change_sequence
-			&& current.managed_contract_id == observed.managed_contract_id
-			&& current.manifest_identities_authoritative;
-		if !exact {
-			crate::carbon_info!(
-				"Capture Manifest epoch no-op unavailable: final native capability attestation changed"
-			);
-		}
-		Ok(exact)
-	}
-
-	/// Retain the generation-matched managed launch as the first capture epoch.
-	/// The caller invokes this only after native manifest identities bootstrap.
-	pub(crate) fn remember_trusted_managed_launch_epoch_if_current(
-		&self,
-		bridge: &impl ManagedHierarchyRefreshBridge,
-		capabilities: &Capabilities,
-	) -> Result<()> {
-		let source_generation = self.source_generation();
-		let result = (|| -> Result<()> {
-			let contract = self.managed_hierarchy_contract()?;
-			refresh_capture_contract_on_bridge(
-				bridge,
-				&contract,
-				&capabilities.studio_session_id,
-				&capabilities.instance_id,
-				capabilities.engine_generation,
-				capabilities.process_id,
-			)?;
-			ensure!(
-				self.managed_hierarchy_contract()?.contract_id == contract.contract_id,
-				"managed hierarchy changed during trusted launch attachment"
-			);
-			let attached_capabilities = bridge.capabilities()?;
-			let artifact = artifact_store::validated_artifact_receipt(&self.manifest_path)?;
-			let launch_fingerprint = artifact.generation().to_owned();
-			self.remember_capture_epoch_if_current(
-				bridge,
-				&attached_capabilities,
-				&attached_capabilities.studio_session_id,
-				&attached_capabilities.instance_id,
-				attached_capabilities.hierarchy_sequence,
-				attached_capabilities.change_sequence,
-				&source_generation,
-				&artifact,
-				&launch_fingerprint,
-			)?;
-			Ok(())
-		})();
-		if let Err(error) = &result {
-			crate::carbon_info!("Managed launch capture epoch was not retained: {error:#}");
-		}
-		result
-	}
-
-	#[allow(clippy::too_many_arguments)]
-	fn remember_capture_epoch_if_current(
-		&self,
-		bridge: &impl ManagedHierarchyRefreshBridge,
-		capabilities: &Capabilities,
-		studio_session_id: &str,
-		instance_id: &str,
-		hierarchy_sequence: u64,
-		change_sequence: u64,
-		source_generation: &str,
-		artifact: &artifact_store::ValidatedArtifactReceipt,
-		artifact_fingerprint: &str,
-	) -> Result<()> {
-		let receipt = (|| -> Result<CaptureEpochReceipt> {
-			let current = bridge.capabilities()?;
-			ensure!(
-				current.bridge_id == capabilities.bridge_id
-					&& current.process_id == capabilities.process_id
-					&& current.studio_session_id == studio_session_id
-					&& current.instance_id == instance_id
-					&& current.engine_ready
-					&& current.engine_generation == capabilities.engine_generation
-					&& current.hierarchy_sequence == hierarchy_sequence
-					&& current.change_sequence == change_sequence
-					&& current.manifest_identities_authoritative,
-				"Studio changed before the capture epoch could be retained"
-			);
-			let _project_state = self.project_state_lock.as_ref().map(|lock| lock.lock().unwrap());
-			ensure!(
-				self.source_generation() == source_generation,
-				"served source changed before the capture epoch could be retained"
-			);
-			let project_realization_generation = self.exact_project_realization_generation()?;
-			let managed_contract_id = self.managed_hierarchy_contract()?.contract_id;
-			ensure!(
-				artifact.generation() == source_generation
-					&& artifact.name() == self.name
-					&& !artifact_fingerprint.is_empty(),
-				"served artifact cannot seed an epoch no-op"
-			);
-			let artifact_metadata = fs::metadata(&self.manifest_path)?;
-			Ok(CaptureEpochReceipt {
-				bridge_id: current.bridge_id,
-				process_id: current.process_id,
-				studio_session_id: current.studio_session_id,
-				instance_id: current.instance_id,
-				engine_generation: current.engine_generation,
-				hierarchy_sequence,
-				change_sequence,
-				source_generation: source_generation.to_owned(),
-				managed_contract_id,
-				project_realization_generation,
-				artifact_generation: artifact.generation().to_owned(),
-				artifact_fingerprint: artifact_fingerprint.to_owned(),
-				artifact_len: artifact_metadata.len(),
-				artifact_modified: artifact_metadata.modified()?,
-			})
-		})()?;
-		*self.last_capture_epoch.lock().unwrap() = Some(receipt);
 		Ok(())
 	}
 
@@ -2133,28 +1082,6 @@ impl Core {
 		);
 		operation.message = Some(message.to_owned());
 		Ok(())
-	}
-
-	fn refresh_capture_managed_hierarchy(
-		&self,
-		provider: &RmlCaptureProvider,
-		request: &CaptureRequest,
-		expected_process_id: u32,
-	) -> Result<ManagedHierarchyAttachment> {
-		let contract = self.managed_hierarchy_contract()?;
-		let attachment = refresh_capture_contract_on_bridge(
-			provider.bridge(),
-			&contract,
-			&request.studio_session_id,
-			&request.instance_id,
-			request.engine_generation,
-			expected_process_id,
-		)?;
-		ensure!(
-			self.managed_hierarchy_contract()?.contract_id == contract.contract_id,
-			"managed hierarchy changed while RML attached the post-capture contract"
-		);
-		Ok(attachment)
 	}
 
 	pub fn manifest_capture_status(&self, request_id: &str) -> Result<ManifestCaptureStatus> {
@@ -2230,30 +1157,6 @@ impl Core {
 
 	pub(crate) fn requires_hard_restart(&self) -> bool {
 		self.restart_required.load(Ordering::Acquire)
-	}
-
-	pub(crate) fn managed_hierarchy_contract(&self) -> Result<ManagedHierarchyContract> {
-		Ok(self.managed_hierarchy.read().unwrap().current.clone())
-	}
-
-	/// Managed identity resolution is lazy, so a running Studio client may ask
-	/// for an identity from the hierarchy it verified before a filesystem
-	/// transaction replaced that source node. Retain every identity authorized
-	/// during this Core lifetime; newly added nodes are installed by SyncChanges,
-	/// while removed nodes still need their pre-transaction identity to be found
-	/// and deleted in Studio.
-	pub(crate) fn is_managed_identity_authorized(&self, id: Ref) -> bool {
-		self.managed_hierarchy.read().unwrap().authorized_ids.contains(&id)
-	}
-
-	pub(crate) fn has_managed_worktree(&self) -> bool {
-		self.worktree.is_some()
-	}
-
-	pub(crate) fn manifest_identity_bootstrap(&self) -> Result<ManifestIdentityBootstrapContract> {
-		self.manifest_identity_bootstrap
-			.clone()
-			.context("managed worktree manifest identity contract is unavailable")
 	}
 
 	/// Materialize the complete canonical source graph for a native apply. The
@@ -2380,103 +1283,13 @@ fn is_redundant_accessory_weld(tree: &Tree, id: Ref) -> bool {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct ManagedHierarchyContract {
 	pub contract_id: String,
 	pub payload: Bytes,
 	pub source_instances: u32,
 	pub excluded_source_ids: Vec<Ref>,
 	pub source_ids: HashSet<Ref>,
-}
-
-pub(crate) trait ManagedHierarchyRefreshBridge {
-	fn bridge_id(&self) -> &str;
-	fn identity(&self) -> Result<StudioIdentity>;
-	fn capabilities(&self) -> Result<Capabilities>;
-	fn stage(&self, contract: &ManagedHierarchyContract) -> Result<ManagedHierarchyStage>;
-	fn attach(&self, contract_id: &str) -> Result<ManagedHierarchyAttachment>;
-}
-
-impl ManagedHierarchyRefreshBridge for Bridge {
-	fn bridge_id(&self) -> &str {
-		Bridge::bridge_id(self)
-	}
-
-	fn identity(&self) -> Result<StudioIdentity> {
-		self.get("v1/identity")
-	}
-
-	fn capabilities(&self) -> Result<Capabilities> {
-		self.get("v1/capabilities")
-	}
-
-	fn stage(&self, contract: &ManagedHierarchyContract) -> Result<ManagedHierarchyStage> {
-		self.post_bytes(
-			&format!("v1/managed/stage/{}", contract.contract_id),
-			contract.payload.clone(),
-		)
-	}
-
-	fn attach(&self, contract_id: &str) -> Result<ManagedHierarchyAttachment> {
-		self.post(
-			"v1/managed/attach-staged",
-			&serde_json::json!({ "contractId": contract_id }),
-		)
-	}
-}
-
-fn refresh_capture_contract_on_bridge(
-	bridge: &impl ManagedHierarchyRefreshBridge,
-	contract: &ManagedHierarchyContract,
-	studio_session_id: &str,
-	instance_id: &str,
-	engine_generation: u64,
-	expected_process_id: u32,
-) -> Result<ManagedHierarchyAttachment> {
-	let identity = bridge.identity()?;
-	ensure!(
-		identity.bridge_id == bridge.bridge_id()
-			&& identity.process_id == expected_process_id
-			&& identity.studio_session_id == studio_session_id
-			&& identity.instance_id == instance_id,
-		"RML capture route changed before managed hierarchy refresh"
-	);
-	let capabilities = bridge.capabilities()?;
-	ensure!(
-		capabilities.bridge_id == bridge.bridge_id()
-			&& capabilities.process_id == expected_process_id
-			&& capabilities.engine_ready
-			&& capabilities.engine_generation == engine_generation,
-		"RML capture runtime changed before managed hierarchy refresh"
-	);
-	if capabilities.managed_contract_id == contract.contract_id {
-		ensure!(
-			capabilities.managed_contract_source_instances == contract.source_instances,
-			"RML attached managed hierarchy receipt has the wrong source instance count"
-		);
-		return Ok(ManagedHierarchyAttachment {
-			attached: true,
-			source_instances: capabilities.managed_contract_source_instances,
-			hierarchy_sequence: capabilities.hierarchy_sequence,
-			change_sequence: capabilities.change_sequence,
-			excluded_source_ids: Vec::new(),
-			source_root_debug_ids: Vec::new(),
-		});
-	}
-	let staged = bridge.stage(contract)?;
-	ensure!(
-		staged.contract_id == contract.contract_id && staged.source_instances == contract.source_instances,
-		"RML staged the wrong post-capture managed hierarchy contract"
-	);
-	let attachment = bridge.attach(&contract.contract_id)?;
-	ensure!(
-		attachment.attached,
-		"RML rejected the post-capture managed hierarchy attachment"
-	);
-	ensure!(
-		attachment.source_instances == contract.source_instances,
-		"RML attached the wrong post-capture managed source instance count"
-	);
-	Ok(attachment)
 }
 
 struct ManagedHierarchyState {
@@ -3361,33 +2174,6 @@ mod source_watcher_tests {
 	use std::thread;
 
 	#[test]
-	fn capture_epoch_diagnostics_name_the_invalidated_evidence() {
-		let expected = CaptureEpochReceipt {
-			bridge_id: "bridge".to_owned(),
-			process_id: 42,
-			studio_session_id: "studio".to_owned(),
-			instance_id: "instance".to_owned(),
-			engine_generation: 7,
-			hierarchy_sequence: 11,
-			change_sequence: 13,
-			source_generation: "source".to_owned(),
-			managed_contract_id: "contract".to_owned(),
-			project_realization_generation: "project".to_owned(),
-			artifact_generation: "artifact".to_owned(),
-			artifact_fingerprint: "fingerprint".to_owned(),
-			artifact_len: 100,
-			artifact_modified: SystemTime::UNIX_EPOCH,
-		};
-		let mut observed = expected.clone();
-		observed.change_sequence += 1;
-		observed.artifact_len += 1;
-		assert_eq!(
-			capture_epoch_changed_fields(&expected, &observed),
-			["change_sequence", "artifact_len"]
-		);
-	}
-
-	#[test]
 	fn project_watches_external_pesde_targets_without_duplicate_nested_roots() {
 		let project_root = Path::new("/workspace/game");
 		let roots = project_watch_roots(
@@ -3402,366 +2188,6 @@ mod source_watcher_tests {
 		assert_eq!(
 			roots,
 			vec![project_root.to_owned(), PathBuf::from("/dependencies/package")]
-		);
-	}
-
-	#[test]
-	fn manifest_identity_bootstrap_excludes_the_complete_filesystem_domain() {
-		let root = Ref::new();
-		let mapped = Ref::new();
-		let mapped_child = Ref::new();
-		let studio = Ref::new();
-		let snapshot = snapshot::Snapshot::new()
-			.with_id(root)
-			.with_name("DataModel")
-			.with_class("DataModel")
-			.with_children(vec![
-				snapshot::Snapshot::new()
-					.with_id(mapped)
-					.with_name("Mapped")
-					.with_class("Folder")
-					.with_children(vec![snapshot::Snapshot::new()
-						.with_id(mapped_child)
-						.with_name("Script")
-						.with_class("ModuleScript")]),
-				snapshot::Snapshot::new()
-					.with_id(studio)
-					.with_name("Workspace")
-					.with_class("Workspace"),
-			]);
-		let contract =
-			manifest_identity_bootstrap_contract(&snapshot, &HashSet::from([mapped, mapped_child]), &[]).unwrap();
-		assert_eq!(contract.root_source_id, root.to_string());
-		assert_eq!(contract.expected_source_instances, 2);
-		assert_eq!(contract.expected_digest.len(), 64);
-		let mut expected_source_ids = vec![root.to_string(), studio.to_string()];
-		expected_source_ids.sort();
-		assert_eq!(contract.expected_source_ids, expected_source_ids);
-		assert_eq!(contract.service_anchors.len(), 1);
-		assert_eq!(contract.service_anchors[0].source_id, studio.to_string());
-		assert_eq!(contract.service_anchors[0].class_name, "Workspace");
-		assert_eq!(contract.service_anchors[0].name, "Workspace");
-	}
-
-	#[test]
-	fn manifest_identity_bootstrap_rebinds_studio_rehydrated_identity() {
-		let root = Ref::new();
-		let workspace = Ref::new();
-		let accessory = Ref::new();
-		let handle = Ref::new();
-		let weld = Ref::new();
-		let weld_snapshot = snapshot::Snapshot::new()
-			.with_id(weld)
-			.with_name("AccessoryWeld")
-			.with_class("Weld");
-		let handle_snapshot = snapshot::Snapshot::new()
-			.with_id(handle)
-			.with_name("Handle")
-			.with_class("Part")
-			.with_children(vec![weld_snapshot]);
-		let accessory_snapshot = snapshot::Snapshot::new()
-			.with_id(accessory)
-			.with_name("Hat")
-			.with_class("Accessory")
-			.with_children(vec![handle_snapshot]);
-		let workspace_snapshot = snapshot::Snapshot::new()
-			.with_id(workspace)
-			.with_name("Workspace")
-			.with_class("Workspace")
-			.with_children(vec![accessory_snapshot]);
-		let snapshot = snapshot::Snapshot::new()
-			.with_id(root)
-			.with_name("DataModel")
-			.with_class("DataModel")
-			.with_children(vec![workspace_snapshot]);
-
-		let rebindings = project::managed_build_identity_rebindings(&snapshot, &HashSet::new());
-		let contract = manifest_identity_bootstrap_contract(&snapshot, &HashSet::from([weld]), &rebindings).unwrap();
-		assert_eq!(contract.expected_source_instances, 5);
-		assert_eq!(
-			serde_json::to_value(&contract).unwrap()["rebindings"],
-			serde_json::json!([{
-				"sourceId": weld.to_string(),
-				"parentSourceId": handle.to_string(),
-				"className": "Weld",
-				"name": "AccessoryWeld",
-				"kind": "accessoryWeld",
-				"relatedSourceId": null
-			}])
-		);
-	}
-
-	struct FakeRefreshBridge {
-		calls: Mutex<Vec<String>>,
-		staged: Mutex<Option<(String, u32)>>,
-		attached: Mutex<Option<(String, u32)>>,
-		manifest_identities_authoritative: bool,
-	}
-
-	impl FakeRefreshBridge {
-		fn new() -> Self {
-			Self {
-				calls: Mutex::new(Vec::new()),
-				staged: Mutex::new(None),
-				attached: Mutex::new(None),
-				manifest_identities_authoritative: false,
-			}
-		}
-
-		fn authoritative() -> Self {
-			Self {
-				manifest_identities_authoritative: true,
-				..Self::new()
-			}
-		}
-	}
-
-	impl ManagedHierarchyRefreshBridge for FakeRefreshBridge {
-		fn bridge_id(&self) -> &str {
-			"bridge"
-		}
-
-		fn identity(&self) -> Result<StudioIdentity> {
-			Ok(StudioIdentity {
-				studio_session_id: "studio".to_owned(),
-				instance_id: "instance".to_owned(),
-				bridge_id: "bridge".to_owned(),
-				process_id: 42,
-			})
-		}
-
-		fn capabilities(&self) -> Result<Capabilities> {
-			let attached = self.attached.lock().unwrap().clone();
-			Ok(Capabilities {
-				protocol_version: 2,
-				bridge_id: "bridge".to_owned(),
-				process_id: 42,
-				engine_ready: true,
-				engine_generation: 7,
-				studio_session_id: "studio".to_owned(),
-				instance_id: "instance".to_owned(),
-				hierarchy_sequence: 0,
-				change_sequence: 0,
-				binary_types: Vec::new(),
-				scalar_types: Vec::new(),
-				blittable_types: Vec::new(),
-				raw_types: Vec::new(),
-				native_observation: true,
-				engine_creation: true,
-				per_root_availability: true,
-				serialized_references: true,
-				managed_hierarchy_attachment: true,
-				managed_contract_id: attached
-					.as_ref()
-					.map(|(contract_id, _)| contract_id.clone())
-					.unwrap_or_default(),
-				managed_contract_source_instances: attached.map(|(_, instances)| instances).unwrap_or_default(),
-				manifest_identity_ledger: true,
-				manifest_identities_authoritative: self.manifest_identities_authoritative,
-				capture_lease_protocol: crate::capture_provider::CAPTURE_ENVELOPE_VERSION,
-				local_place_save_diagnostic: true,
-			})
-		}
-
-		fn stage(&self, contract: &ManagedHierarchyContract) -> Result<ManagedHierarchyStage> {
-			self.calls
-				.lock()
-				.unwrap()
-				.push(format!("stage:{}", contract.contract_id));
-			*self.staged.lock().unwrap() = Some((contract.contract_id.clone(), contract.source_instances));
-			Ok(ManagedHierarchyStage {
-				contract_id: contract.contract_id.clone(),
-				source_instances: contract.source_instances,
-			})
-		}
-
-		fn attach(&self, contract_id: &str) -> Result<ManagedHierarchyAttachment> {
-			self.calls.lock().unwrap().push(format!("attach:{contract_id}"));
-			let (staged_id, source_instances) = self.staged.lock().unwrap().clone().unwrap();
-			ensure!(staged_id == contract_id, "test attached an unstaged contract");
-			*self.attached.lock().unwrap() = Some((contract_id.to_owned(), source_instances));
-			Ok(ManagedHierarchyAttachment {
-				attached: true,
-				source_instances,
-				hierarchy_sequence: 1,
-				change_sequence: 1,
-				excluded_source_ids: Vec::new(),
-				source_root_debug_ids: Vec::new(),
-			})
-		}
-	}
-
-	#[test]
-	fn trusted_managed_launch_seeds_first_capture_epoch() {
-		let directory =
-			std::env::temp_dir().join(format!("carbon-trusted-launch-capture-epoch-{}", uuid::Uuid::new_v4()));
-		std::fs::create_dir_all(&directory).unwrap();
-		let project_path = directory.join("game.carbon.json");
-		project::initialize(&project_path, "Game".to_owned()).unwrap();
-
-		let materialized = project::materialize(&project_path).unwrap();
-		let core = Core::new_project_with_worktree(
-			&project_path,
-			&materialized,
-			("Game".to_owned(), "worktree".to_owned(), "session".to_owned()),
-		)
-		.unwrap();
-		let bridge = FakeRefreshBridge::authoritative();
-		let capabilities = bridge.capabilities().unwrap();
-		let source_generation = core.source_generation();
-		core.remember_trusted_managed_launch_epoch_if_current(&bridge, &capabilities)
-			.unwrap();
-
-		let epoch = core
-			.last_capture_epoch
-			.lock()
-			.unwrap()
-			.clone()
-			.expect("a trusted unchanged launch must be ready for its first epoch no-op");
-		assert_eq!(epoch.artifact_fingerprint, source_generation);
-		assert_eq!(
-			*bridge.calls.lock().unwrap(),
-			[
-				format!("stage:{}", epoch.managed_contract_id),
-				format!("attach:{}", epoch.managed_contract_id),
-			],
-			"the epoch must be recorded after the launch attaches its managed contract"
-		);
-		assert_eq!(epoch.source_generation, source_generation);
-		assert_eq!(
-			epoch.managed_contract_id,
-			core.managed_hierarchy_contract().unwrap().contract_id
-		);
-
-		drop(core);
-		std::fs::remove_dir_all(materialized.directory).unwrap();
-		std::fs::remove_dir_all(directory).unwrap();
-	}
-
-	#[test]
-	fn trusted_managed_launch_propagates_epoch_seed_failure() {
-		let directory = std::env::temp_dir().join(format!(
-			"carbon-trusted-launch-capture-epoch-failure-{}",
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&directory).unwrap();
-		let project_path = directory.join("game.carbon.json");
-		project::initialize(&project_path, "Game".to_owned()).unwrap();
-
-		let materialized = project::materialize(&project_path).unwrap();
-		let core = Core::new_project_with_worktree(
-			&project_path,
-			&materialized,
-			("Game".to_owned(), "worktree".to_owned(), "session".to_owned()),
-		)
-		.unwrap();
-		let bridge = FakeRefreshBridge::new();
-		let capabilities = bridge.capabilities().unwrap();
-
-		let error = core
-			.remember_trusted_managed_launch_epoch_if_current(&bridge, &capabilities)
-			.unwrap_err();
-		assert!(
-			error
-				.to_string()
-				.contains("Studio changed before the capture epoch could be retained"),
-			"{error:#}"
-		);
-		assert!(core.last_capture_epoch.lock().unwrap().is_none());
-
-		drop(core);
-		std::fs::remove_dir_all(materialized.directory).unwrap();
-		std::fs::remove_dir_all(directory).unwrap();
-	}
-
-	#[test]
-	fn two_successive_captures_stage_and_attach_each_committed_contract() {
-		let bridge = FakeRefreshBridge::new();
-		let request = CaptureRequest {
-			capture_id: "00000000000000000000000000000000".to_owned(),
-			studio_session_id: "studio".to_owned(),
-			instance_id: "instance".to_owned(),
-			engine_generation: 7,
-			source_generation: "generation".to_owned(),
-			managed_contract_id: "prior".to_owned(),
-			reflection_schema_hash: "schema".to_owned(),
-			manifest_identities_authoritative: false,
-			allow_page_reuse: true,
-			mapped_root_source_ids: Vec::new(),
-			shell_classes: Vec::new(),
-		};
-		for (contract_id, source_instances) in [("first", 16), ("second", 17)] {
-			let contract = ManagedHierarchyContract {
-				contract_id: contract_id.to_owned(),
-				payload: Bytes::from_static(b"contract"),
-				source_instances,
-				excluded_source_ids: Vec::new(),
-				source_ids: HashSet::new(),
-			};
-			let attachment = refresh_capture_contract_on_bridge(
-				&bridge,
-				&contract,
-				&request.studio_session_id,
-				&request.instance_id,
-				request.engine_generation,
-				42,
-			)
-			.unwrap();
-			assert!(attachment.attached);
-			assert_eq!(attachment.source_instances, source_instances);
-		}
-		assert_eq!(
-			*bridge.calls.lock().unwrap(),
-			["stage:first", "attach:first", "stage:second", "attach:second"]
-		);
-	}
-
-	#[test]
-	fn repeated_capture_reuses_the_attached_managed_contract_receipt() {
-		let bridge = FakeRefreshBridge::new();
-		let request = CaptureRequest {
-			capture_id: "00000000000000000000000000000000".to_owned(),
-			studio_session_id: "studio".to_owned(),
-			instance_id: "instance".to_owned(),
-			engine_generation: 7,
-			source_generation: "generation".to_owned(),
-			managed_contract_id: "contract".to_owned(),
-			reflection_schema_hash: "schema".to_owned(),
-			manifest_identities_authoritative: true,
-			allow_page_reuse: true,
-			mapped_root_source_ids: Vec::new(),
-			shell_classes: Vec::new(),
-		};
-		let contract = ManagedHierarchyContract {
-			contract_id: "contract".to_owned(),
-			payload: Bytes::from_static(b"contract"),
-			source_instances: 1_000_000,
-			excluded_source_ids: Vec::new(),
-			source_ids: HashSet::new(),
-		};
-
-		refresh_capture_contract_on_bridge(
-			&bridge,
-			&contract,
-			&request.studio_session_id,
-			&request.instance_id,
-			request.engine_generation,
-			42,
-		)
-		.unwrap();
-		refresh_capture_contract_on_bridge(
-			&bridge,
-			&contract,
-			&request.studio_session_id,
-			&request.instance_id,
-			request.engine_generation,
-			42,
-		)
-		.unwrap();
-		assert_eq!(
-			*bridge.calls.lock().unwrap(),
-			["stage:contract", "attach:contract"],
-			"an already-attached million-node contract must not be uploaded or parsed again"
 		);
 	}
 

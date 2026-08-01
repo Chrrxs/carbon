@@ -29,33 +29,6 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "${root}/worktree-a" "${root}/worktree-b"
 
-first_rml_build="$(qualification_rml_build_dir "${root}/worktree-a" "${root}/windows-cache")"
-second_rml_build="$(qualification_rml_build_dir "${root}/worktree-b" "${root}/windows-cache")"
-[[ "$first_rml_build" != "$second_rml_build" ]] || die "worktrees shared an RML CMake build directory"
-[[ "$first_rml_build" == "$(qualification_rml_build_dir "${root}/worktree-a" "${root}/windows-cache")" ]] ||
-	die "RML CMake build directory was not stable for one worktree"
-[[ "$(basename "$first_rml_build")" == "carbon-rml-build" ]] ||
-	die "RML CMake build directory does not satisfy the build-script safety guard"
-
-state_dir="${root}/component-state"
-first_rml_package="${root}/worktree-a/rml/roblox_modloader.dll"
-second_rml_package="${root}/worktree-b/rml/roblox_modloader.dll"
-mkdir -p "$(dirname "$first_rml_package")" "$(dirname "$second_rml_package")"
-printf 'worktree-a-rml\n' > "$first_rml_package"
-printf 'worktree-b-rml\n' > "$second_rml_package"
-first_rml_component="rml-$(qualification_worktree_key "${root}/worktree-a")"
-second_rml_component="rml-$(qualification_worktree_key "${root}/worktree-b")"
-[[ "$first_rml_component" != "$second_rml_component" ]] || die "worktrees shared an RML component identity"
-write_component_stamp "$first_rml_component" fingerprint-a "$first_rml_package"
-write_component_stamp "$second_rml_component" fingerprint-b "$second_rml_package"
-component_is_current "$first_rml_component" fingerprint-a "$first_rml_package" ||
-	die "first worktree's RML package stamp was not current"
-component_is_current "$second_rml_component" fingerprint-b "$second_rml_package" ||
-	die "second worktree's RML package stamp was not current"
-printf 'worktree-a-rml-updated\n' > "$first_rml_package"
-component_is_current "$second_rml_component" fingerprint-b "$second_rml_package" ||
-	die "updating one RML package invalidated another worktree"
-
 run_context_probe() {
 	local repository="$1"
 	local output="$2"
@@ -153,6 +126,16 @@ fi
 if qualification_mcp_server_can_be_reused 0 0 0; then
 	die "qualification reused an unhealthy MCP server"
 fi
+
+daemon_spawn="$({
+	awk '
+		/nohup setsid bash -c/ { capture = 1 }
+		capture { print }
+		capture && /mcp_daemon_pid=\$!/ { exit }
+	' "${SCRIPT_DIR}/lib/qualify-tree"
+} 2>/dev/null)"
+grep -Fq 'exec {stack_lock_fd}>&-' <<< "$daemon_spawn" ||
+	die "qualification MCP daemon inherits the installed-stack lock"
 
 owned_process_repo="${root}/owned-process-repo"
 mkdir -p "$owned_process_repo"

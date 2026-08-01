@@ -66,7 +66,6 @@ show_status() {
 
 run_workflow_tests() {
 	"${SCRIPT_DIR}/test-build-optimization"
-	"${SCRIPT_DIR}/test-rml-build-optimization"
 	"${SCRIPT_DIR}/test-release-installer"
 	"${SCRIPT_DIR}/test-release-workflow"
 	"${SCRIPT_DIR}/test-public-readiness"

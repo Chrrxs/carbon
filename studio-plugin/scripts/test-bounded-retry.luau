@@ -35,40 +35,40 @@ local slowWaits = {}
 local slowSuccess, slowCapabilities = BoundedRetry.runUntil(function()
 	slowAttempts += 1
 	if slowAttempts < 25 then
-		error("bridge still launching")
+		error("managed service still launching")
 	end
-	return { identity = "late-bridge" }
+	return { identity = "late-service" }
 end, function(delay)
 	table.insert(slowWaits, delay)
 end, function()
 	return true
 end)
-assert(slowSuccess and slowCapabilities.identity == "late-bridge", "managed startup must accept a slow bridge")
+assert(slowSuccess and slowCapabilities.identity == "late-service", "managed startup must accept a slow service")
 assert(slowAttempts == 25 and #slowWaits == 24, "managed startup must not inherit the bounded retry limit")
 assert(slowWaits[#slowWaits] == 2, "managed startup retry delay must remain capped")
 
 local cancellationChecks = 0
 local cancelled, cancellationReason = BoundedRetry.runUntil(function()
-	error("bridge absent")
+	error("managed service absent")
 end, function() end, function()
 	cancellationChecks += 1
 	return cancellationChecks <= 3
 end)
 assert(
-	not cancelled and tostring(cancellationReason):find("bridge absent", 1, true),
-	"managed startup cancellation must return the last bridge error"
+	not cancelled and tostring(cancellationReason):find("managed service absent", 1, true),
+	"managed startup cancellation must return the last service error"
 )
 
 local boundedAttempts = 0
 local bounded, boundedReason = BoundedRetry.runUntil(function()
 	boundedAttempts += 1
-	error("bridge never attached")
+	error("managed service never attached")
 end, function() end, function()
 	return boundedAttempts < 61
 end)
 assert(
-	not bounded and tostring(boundedReason):find("bridge never attached", 1, true),
-	"managed startup exhaustion must return the last bridge error"
+	not bounded and tostring(boundedReason):find("managed service never attached", 1, true),
+	"managed startup exhaustion must return the last service error"
 )
 assert(boundedAttempts == 60, "managed startup must fail after its generous bounded retry window")
 

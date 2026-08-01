@@ -19,7 +19,6 @@ product_paths=(
 	Cargo.toml
 	Cargo.lock
 	cli
-	rml
 	studio-plugin
 	qualification
 	scripts

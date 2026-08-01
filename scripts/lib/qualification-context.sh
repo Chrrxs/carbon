@@ -9,13 +9,6 @@ qualification_worktree_key() {
 	printf '%s\0' "$(realpath "$repository")" | sha256sum | cut -c 1-16
 }
 
-qualification_rml_build_dir() {
-	local repository="$1"
-	local windows_cache_root="${2:-/mnt/c/cq}"
-	printf '%s/carbon-rml-builds/%s/carbon-rml-build\n' \
-		"${windows_cache_root%/}" "$(qualification_worktree_key "$repository")"
-}
-
 qualification_http_is_healthy() {
 	local url="$1"
 	curl --silent --fail --connect-timeout 0.2 --max-time 0.5 "$url" >/dev/null 2>&1

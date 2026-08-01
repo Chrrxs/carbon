@@ -70,10 +70,10 @@ assert(
 	"the internal diff safety limit must not remain a user-facing setting"
 )
 assert(
-	string.find(help, "Capture Manifest", 1, true)
+	string.find(help, "Wait for Auto-Capture", 1, true)
 		and string.find(help, "filesystem-authoritative", 1, true)
 		and not string.find(help, "Two-Way Sync", 1, true),
-	"help must describe Carbon's current one-way mapping and explicit capture model"
+	"help must describe Carbon's current one-way mapping and automatic/manual capture model"
 )
 
 print("PASS: front-facing Studio plugin exposes Carbon's current settings without image branding")

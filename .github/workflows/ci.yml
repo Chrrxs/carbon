@@ -40,21 +40,11 @@ jobs:
       - name: Test repository workflows
         run: |
           ./scripts/test-build-optimization
-          ./scripts/test-rml-build-optimization
           ./scripts/test-release-installer
           ./scripts/test-release-workflow
           ./scripts/test-public-readiness
           ./scripts/test-production-readiness-isolation
           ./scripts/test-change-workflow
-
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
-        with:
-          dotnet-version: "10.0.302"
-      - name: Test managed RML
-        run: |
-          dotnet test rml/code/dotnet/Runtime/Runtime.slnx -c Release --nologo
-          dotnet test rml/code/dotnet/Roblox/Roblox.slnx -c Release --nologo
-          dotnet test rml/code/dotnet/CarbonBridge.Tests/CarbonBridge.Tests.csproj -c Release --nologo
 
       - name: Install Rokit
         shell: bash
@@ -97,29 +87,3 @@ jobs:
 
       - name: Build and test every Rust target
         run: cargo test --locked --all-targets --verbose
-
-      - name: Configure native RML
-        run: >
-          cmake -S rml -B rml/build/ci -A x64
-          -DROBLOX_MODLOADER_BUILD_MANAGED_PROJECTS=OFF
-          -DROBLOX_MODLOADER_USE_CMAKE_CSHARP=OFF
-          -DROBLOX_MODLOADER_BUILD_PROXY_GENERATOR=OFF
-          -DROBLOX_MODLOADER_BUILD_PROXY_DLL=OFF
-          -DROBLOX_MODLOADER_BUILD_DUMPER=OFF
-          -DROBLOX_MODLOADER_BUILD_EXAMPLES=OFF
-      - name: Build native RML and tests
-        run: >
-          cmake --build rml/build/ci --config Release --target
-          roblox_modloader
-          instance_child_reorder_tests
-          hierarchy_capture_fast_path_tests
-          serialized_property_event_gate_tests
-          foreground_activation_policy_tests
-          job_registry_tests
-          reflection_runtime_resolver_tests
-          datamodel_rtti_capability_tests
-          offline_abi_resolver_tests
-      - name: Test native RML
-        run: >
-          ctest --test-dir rml/build/ci -C Release --output-on-failure
-          -R "^(instance_child_reorder|hierarchy_capture_fast_path|serialized_property_event_gate|foreground_activation_policy|job_registry|reflection_runtime_resolver|datamodel_rtti_capability|offline_abi_resolver)$"

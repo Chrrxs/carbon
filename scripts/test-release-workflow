@@ -13,11 +13,6 @@ die() {
 # shellcheck source=scripts/lib/release-artifact.sh
 . "${SCRIPT_DIR}/lib/release-artifact.sh"
 
-(
-	cd "$REPO"
-	cargo test --locked -p carbon 'rml::tests::bundled_rml_files'
-)
-
 [[ -f "${SCRIPT_DIR}/lib/release-version.sh" ]] || die "release version library is missing"
 # shellcheck source=scripts/lib/release-version.sh
 . "${SCRIPT_DIR}/lib/release-version.sh"
@@ -131,10 +126,8 @@ grep -Fq 'windows_asset="carbon-${version}-windows-x86_64.zip"' "$workflow" ||
 windows_builder="${SCRIPT_DIR}/build-windows-release.ps1"
 [[ -f "$windows_builder" ]] || die "native Windows release builder is missing"
 for requirement in \
-	'scripts\build-rml.ps1' \
 	'./scripts/build-studio-plugin' \
 	'CARBON_STUDIO_PLUGIN_BUNDLE' \
-	'CARBON_RML_BUNDLE' \
 	'cargo.exe' \
 	'Compress-Archive'; do
 	grep -Fq -- "$requirement" "$windows_builder" ||
@@ -166,35 +159,13 @@ if grep -Eq 'release\\.json|SHA256SUMS' "${SCRIPT_DIR}/release" "${SCRIPT_DIR}/l
 fi
 
 if grep -R -Eq 'GIT_TAG +(master|main)|/archive/(master|main)|/rokit/main/' \
-	"${REPO}/rml/cmake" "${REPO}/.github/workflows"; then
+	"${REPO}/.github/workflows"; then
 	die "release inputs still follow a mutable branch"
 fi
-for dependency in minhook spdlog toml polyhooks tracy; do
-	grep -Eq 'GIT_TAG +[0-9a-f]{40}' "${REPO}/rml/cmake/${dependency}.cmake" ||
-		die "${dependency} is not pinned to a full commit"
-done
-grep -Fq 'URL_HASH' "${REPO}/rml/cmake/zlib.cmake" ||
-	die "zlib wrapper archive is not content verified"
-grep -Fq 'URL_HASH' "${REPO}/rml/cmake/json.cmake" ||
-	die "JSON archive is not content verified"
-grep -Fq 'EXPECTED_HASH' "${REPO}/rml/cmake/cpm.cmake" ||
-	die "CPM bootstrap is not content verified"
-grep -Fq 'EXPECTED_HASH' "${REPO}/rml/cmake/dotnet_hosting.cmake" ||
-	die ".NET hosting downloads are not content verified"
-if grep -Fq 'https://dot.net/v1/dotnet-install.ps1' "${REPO}/scripts/build-rml.ps1"; then
-	die "RML build still bootstraps the mutable .NET installer"
-fi
-grep -Fq 'dotnet-sdk-10.0.302-win-x64.zip' "${REPO}/scripts/build-rml.ps1" ||
-	die "RML build does not pin the exact .NET SDK archive"
-grep -Fq '7d170ed75fa9af34c00646621d92011dbd71943952e2787cd15df9be78e6452b55dadef34d7eff77b802e6af4959e071a55855ac649afeac70901c3a2a258716' \
-	"${REPO}/scripts/build-rml.ps1" ||
-	die "RML build does not content-verify the pinned .NET SDK"
 while IFS= read -r action_ref; do
 	[[ "$action_ref" =~ ^[0-9a-f]{40}$ ]] ||
 		die "GitHub Action is not pinned to a full commit: ${action_ref}"
 done < <(sed -nE 's/^[[:space:]]*- uses: [^@]+@([0-9A-Za-z._-]+).*/\1/p' "${REPO}"/.github/workflows/*.yml)
-grep -Fq 'dotnet-version: "10.0.302"' "${REPO}/.github/workflows/ci.yml" ||
-	die "CI does not pin the exact .NET SDK patch version"
 grep -Fq '2f2618428ef31279e2fc80b0b1d73485bc929ddd/scripts/install.sh' \
 	"${REPO}/.github/workflows/ci.yml" ||
 	die "Rokit installer is not pinned to a full commit"

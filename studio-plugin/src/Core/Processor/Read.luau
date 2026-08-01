@@ -30,19 +30,6 @@ local function encodePropertyValue(value: any, propertyType: string, tree): (boo
 	then
 		return true, { BinaryString = buffer.fromstring(value) }
 	end
-	if
-		propertyType == "Content"
-		and typeof(value) == "Content"
-		and value.SourceType == Enum.ContentSourceType.Object
-	then
-		local object = value.Object
-		if object ~= nil and tree:getId(object) == nil then
-			local encoded = Dom.encodePrivilegedContentObject(object)
-			if encoded ~= nil then
-				return true, encoded
-			end
-		end
-	end
 	return Dom.EncodedValue.encode(value, propertyType, tree)
 end
 
@@ -191,18 +178,6 @@ function ReadProcessor:captureAdditions(instances: { Instance }): { Types.AddedS
 			self:reserve(instance, reserved)
 		end
 	end
-	local batchInstances = {}
-	for instance in reserved do
-		table.insert(batchInstances, instance)
-	end
-	local batchSuccess, batchError = Dom.beginPrivilegedBatch(batchInstances)
-	if not batchSuccess then
-		for instance in reserved do
-			self.tree:removeByInstance(instance)
-		end
-		error(`Failed to batch exact serialized-property reads for added instances: {tostring(batchError)}`)
-	end
-
 	local knownDescendants = {}
 	for instance in self.tree.idMap do
 		if not reserved[instance] then
@@ -227,7 +202,6 @@ function ReadProcessor:captureAdditions(instances: { Instance }): { Types.AddedS
 			end
 		end
 	end)
-	Dom.endPrivilegedBatch()
 	if not captureSuccess then
 		for instance in reserved do
 			self.tree:removeByInstance(instance)
@@ -324,27 +298,12 @@ function ReadProcessor:onAdd(
 	end
 
 	if not __reserved then
-		-- One batch covers the whole inclusion boundary. Recursive calls below are
-		-- marked reserved and consume this cache instead of issuing one HTTP request
-		-- per protected property per instance.
 		local reserved = {}
 		self:reserve(instance, reserved, __claimSourceId)
-		local batchInstances = {}
-		for descendant in reserved do
-			table.insert(batchInstances, descendant)
-		end
-		local batchSuccess, batchError = Dom.beginPrivilegedBatch(batchInstances)
-		if not batchSuccess then
-			for descendant in reserved do
-				self.tree:removeByInstance(descendant)
-			end
-			error(`Failed to batch exact serialized-property reads for added subtree: {tostring(batchError)}`)
-		end
 
 		local captureSuccess, snapshot = pcall(function()
 			return self:onAdd(instance, parentId, true, state, __claimSourceId)
 		end)
-		Dom.endPrivilegedBatch()
 		if not captureSuccess then
 			for descendant in reserved do
 				self.tree:removeByInstance(descendant)
@@ -376,7 +335,6 @@ function ReadProcessor:onAdd(
 	local properties = {}
 	local children = {}
 	local defaults = Dom.getDefaultProperties(instance.ClassName)
-	local privilegedDescriptors = Dom.getPrivilegedSerializedProperties(instance.ClassName)
 
 	for property, default in defaults do
 		local readSuccess, instanceValue = Dom.readProperty(instance, property)
@@ -417,34 +375,6 @@ function ReadProcessor:onAdd(
 
 			properties[property] = encodedValue
 		end
-	end
-
-	for _, descriptor in privilegedDescriptors do
-		if state.failed then
-			break
-		end
-		if defaults[descriptor.name] ~= nil then
-			continue
-		end
-		local readSuccess, instanceValue = Dom.readProperty(instance, descriptor.name)
-		if not readSuccess then
-			local err = Error.new(Error.ReadFailed, descriptor.name, instance, instanceValue.kind)
-			Log.warn(err)
-			state.failed = true
-			state.failedInstance = instance
-			state.failedProperty = descriptor.name
-			break
-		end
-		local encodeSuccess, encodedValue = encodePropertyValue(instanceValue, descriptor.dataType, self.tree)
-		if not encodeSuccess then
-			local err = Error.new(Error.EncodeFailed, descriptor.name, instanceValue)
-			Log.warn(err)
-			state.failed = true
-			state.failedInstance = instance
-			state.failedProperty = descriptor.name
-			break
-		end
-		properties[descriptor.name] = encodedValue
 	end
 
 	for _, property in Dom.getRefProperties(instance.ClassName) do
@@ -518,10 +448,6 @@ function ReadProcessor:onChange(instance: Instance, property: string?, reference
 	local removed = {}
 	local defaults = Dom.getDefaultProperties(instance.ClassName)
 	local refs = Dom.getRefProperties(instance.ClassName)
-	local privileged = {}
-	for _, descriptor in Dom.getPrivilegedSerializedProperties(instance.ClassName) do
-		privileged[descriptor.name] = descriptor
-	end
 
 	local function readDefault(changedProperty: string, default)
 		local readSuccess, instanceValue, overlaid = NativeReferenceOverlay.read(
@@ -619,36 +545,12 @@ function ReadProcessor:onChange(instance: Instance, property: string?, reference
 		end
 	end
 
-	local function readPrivileged(descriptor)
-		local readSuccess, instanceValue, overlaid = NativeReferenceOverlay.read(
-			referenceOverlays,
-			descriptor.name,
-			function()
-				return Dom.readProperty(instance, descriptor.name)
-			end
-		)
-		if not readSuccess then
-			error(Error.new(Error.ReadFailed, descriptor.name, instance, instanceValue.kind))
-		end
-		if overlaid then
-			properties[descriptor.name] = instanceValue
-			return
-		end
-		local encodeSuccess, encodedValue = encodePropertyValue(instanceValue, descriptor.dataType, self.tree)
-		if not encodeSuccess then
-			error(Error.new(Error.EncodeFailed, descriptor.name, instanceValue))
-		end
-		properties[descriptor.name] = encodedValue
-	end
-
 	if property then
 		local default = defaults[property]
 		if default then
 			readDefault(property, default)
 		elseif table.find(refs, property) then
 			readRef(property)
-		elseif privileged[property] then
-			readPrivileged(privileged[property])
 		end
 	else
 		for changedProperty, default in defaults do
@@ -656,11 +558,6 @@ function ReadProcessor:onChange(instance: Instance, property: string?, reference
 		end
 		for _, changedProperty in refs do
 			readRef(changedProperty)
-		end
-		for changedProperty, descriptor in privileged do
-			if defaults[changedProperty] == nil then
-				readPrivileged(descriptor)
-			end
 		end
 	end
 
@@ -739,11 +636,6 @@ function ReadProcessor.shouldSyncProperties(instance: Instance, property: string
 		or table.find(Dom.getRefProperties(instance.ClassName), property) ~= nil
 	then
 		return true
-	end
-	for _, descriptor in Dom.getPrivilegedSerializedProperties(instance.ClassName) do
-		if descriptor.name == property then
-			return true
-		end
 	end
 	return false
 end

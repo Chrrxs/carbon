@@ -118,7 +118,7 @@ return function(props: Props): DockWidgetPluginGui
 					},
 					Entry {
 						Header "5. Save Studio-owned state",
-						Paragraph "Select <b>Capture Manifest</b> to save the Studio-authored complement outside every mapping. Capture never writes mapped files or changes the project topology.",
+						Paragraph "Carbon continuously saves the Studio-authored complement from Studio auto-recovery. <b>Wait for Auto-Capture</b> shows the current cycle; use <b>carbon capture game.carbon.json saved.rbxl</b> for a manual File > Save to File place. During stop, saving over the temporary served place completes the wait immediately. Capture never writes mapped files or changes project topology.",
 					},
 				},
 			},

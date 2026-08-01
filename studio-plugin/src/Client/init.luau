@@ -4,7 +4,6 @@ local HttpService = RuntimeServices.get("HttpService") :: HttpService
 local CoreGui = RuntimeServices.get("CoreGui") :: CoreGui
 
 local Promise = require(Carbon.Packages.Promise)
-local MsgPack = require(Carbon.Lib.MsgPack)
 
 local Types = require(Carbon.Types)
 local Place = require(Carbon.Place)
@@ -239,239 +238,12 @@ function Client:reportWarnings(warnings: { string }): Promise.Promise
 	})
 end
 
-function Client:getPrivilegedCapabilities(): Promise.Promise
-	return Http.post(self:getUrl("privileged/capabilities"), {
-		clientId = self.clientId,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:attachManagedHierarchy(): Promise.Promise
-	return Http.post(self:getUrl("privileged/managed/attach"), {
-		clientId = self.clientId,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:bootstrapManifestIdentities(managedReloadTransitionId: string?): Promise.Promise
-	return Http.post(self:getUrl("privileged/manifest-identities/bootstrap"), {
-		clientId = self.clientId,
-		managedReloadTransitionId = managedReloadTransitionId,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:resolveManagedIdentities(sourceIds: { Types.Ref }, debugIds: { string }?): Promise.Promise
-	local requestId = HttpService:GenerateGUID(false)
-	local function decode(response)
-		return response:decode()
-	end
-	local function poll(response)
-		if response.pending ~= true then
-			return response
-		end
-		-- The bridge must be able to run its queued engine task outside the
-		-- originating Luau HTTP request. Schedule polling on a fresh Promise turn
-		-- instead of yielding inside this continuation.
-		return Promise.delay(0):andThen(function()
-			return Http.post(self:getUrl("privileged/managed/resolve/poll"), {
-				clientId = self.clientId,
-				requestId = requestId,
-			})
-				:andThen(decode)
-				:andThen(poll)
-		end)
-	end
-	return Http.post(self:getUrl("privileged/managed/resolve"), {
-		clientId = self.clientId,
-		requestId = requestId,
-		sourceIds = sourceIds,
-		debugIds = debugIds or {},
-	})
-		:andThen(decode)
-		:andThen(poll)
-end
-
-function Client:readPrivilegedProperty(debugId: string, property: string): Promise.Promise
-	return Http.post(self:getUrl("privileged/property/read"), {
-		clientId = self.clientId,
-		debugId = debugId,
-		property = property,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:readPrivilegedProperties(requests: { { debugId: string, property: string } }): Promise.Promise
-	return Http.post(self:getUrl("privileged/properties/read"), {
-		clientId = self.clientId,
-		requests = requests,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:readPrivilegedReferences(requests: { { debugId: string, property: string } }): Promise.Promise
-	return Http.post(self:getUrl("privileged/references/read"), {
-		clientId = self.clientId,
-		requests = requests,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:readPrivilegedDefaults(className: string, properties: { string }): Promise.Promise
-	return Http.post(self:getUrl("privileged/defaults/read"), {
-		clientId = self.clientId,
-		className = className,
-		properties = properties,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:writePrivilegedProperty(debugId: string, property: string, value: string): Promise.Promise
-	return Http.post(self:getUrl("privileged/property/write"), {
-		clientId = self.clientId,
-		debugId = debugId,
-		property = property,
-		value = value,
-	})
-end
-
-function Client:writePrivilegedReference(debugId: string, property: string, targetDebugId: string?): Promise.Promise
-	return Http.post(self:getUrl("privileged/reference/write"), {
-		clientId = self.clientId,
-		debugId = debugId,
-		property = property,
-		targetDebugId = targetDebugId,
-	})
-end
-
-function Client:copyPrivilegedProperty(sourceDebugId: string, targetDebugId: string, property: string): Promise.Promise
-	return Http.post(self:getUrl("privileged/property/copy"), {
-		clientId = self.clientId,
-		sourceDebugId = sourceDebugId,
-		targetDebugId = targetDebugId,
-		property = property,
-	})
-end
-
-function Client:materializePrivilegedProperty(
-	className: string,
-	property: string,
-	dataType: string,
-	value: buffer
-): Promise.Promise
-	return Http.post(self:getUrl("privileged/property/materialize"), {
-		clientId = self.clientId,
-		className = className,
-		property = property,
-		dataType = dataType,
-		value = value,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:writeMaterializedPrivilegedProperty(
-	debugId: string,
-	className: string,
-	property: string,
-	dataType: string,
-	value: buffer
-): Promise.Promise
-	return Http.post(self:getUrl("privileged/property/materialized-write"), {
-		clientId = self.clientId,
-		debugId = debugId,
-		className = className,
-		property = property,
-		dataType = dataType,
-		value = value,
-	})
-end
-
-function Client:createPrivilegedInstance(className: string, parentDebugId: string, name: string): Promise.Promise
-	return Http.post(self:getUrl("privileged/instance/create"), {
-		clientId = self.clientId,
-		className = className,
-		parentDebugId = parentDebugId,
-		name = name,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:getPrivilegedRoots(): Promise.Promise
-	return Http.post(self:getUrl("privileged/roots"), {
-		clientId = self.clientId,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:getPrivilegedRootSnapshots(
-	debugIds: { string },
-	parent: Types.Ref,
-	sourceGeneration: string,
-	rootSourceIds: { [string]: Types.Ref }?,
-	sourceInstanceIds: { [string]: Types.Ref }?
-): Promise.Promise
-	return Http.post(self:getUrl("privileged/roots/snapshots"), {
-		clientId = self.clientId,
-		sourceGeneration = sourceGeneration,
-		debugIds = debugIds,
-		parent = parent,
-		rootSourceIds = MsgPack.Map.new(table.clone(rootSourceIds or {})),
-		sourceInstanceIds = MsgPack.Map.new(table.clone(sourceInstanceIds or {})),
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:applyPrivilegedRoots(
-	rootSourceGeneration: string,
-	roots,
-	knownSourceInstances,
-	externalReferences,
-	preflight: boolean?,
-	preflightToken: string?
-): Promise.Promise
-	return Http.post(self:getUrl("privileged/roots/apply"), {
-		clientId = self.clientId,
-		sourceGeneration = rootSourceGeneration,
-		preflight = preflight == true,
-		preflightToken = preflightToken,
-		roots = roots,
-		knownSourceInstances = knownSourceInstances or {},
-		externalReferences = externalReferences or {},
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
-function Client:readPrivilegedChanges(after: number): Promise.Promise
-	return Http.post(self:getUrl("privileged/changes"), {
-		clientId = self.clientId,
-		after = after,
-	}):andThen(function(response)
-		return response:decode()
-	end)
-end
-
 function Client:requestManifestCapture(
 	onStatus: ((status: Types.ManifestCaptureStatus) -> ())?,
-	forceFull: boolean?,
 	managedReloadTransitionId: string?
 ): Promise.TypedPromise<Types.ManifestCaptureStatus>
 	Log.trace("Client request: Capture Manifest")
 	local query = {}
-	if forceFull == true then
-		table.insert(query, "forceFull=true")
-	end
 	if managedReloadTransitionId ~= nil then
 		table.insert(query, `managedReloadTransitionId={HttpService:UrlEncode(managedReloadTransitionId)}`)
 	end
@@ -507,6 +279,11 @@ function Client:requestManifestCapture(
 		end
 		return poll(started)
 	end)
+end
+
+function Client:startAutomaticManifestCapture(): Promise.Promise
+	Log.trace("Client request: start automatic Studio auto-recovery capture")
+	return Http.post(self:getUrl("capture/automatic"))
 end
 
 return Client

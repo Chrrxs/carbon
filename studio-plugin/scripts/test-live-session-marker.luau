@@ -36,7 +36,7 @@ end
 table.insert(coreGui.children, marker)
 
 local resolved = LiveSessionMarker.find(coreGui, httpService)
-assert(resolved ~= nil, "exact RML live-session marker must resolve")
+assert(resolved ~= nil, "exact Carbon live-session marker must resolve")
 assert(resolved.marker == marker, "marker ownership")
 assert(resolved.host == "127.0.0.1" and resolved.port == 41234, "explicit endpoint")
 assert(resolved.project.name == "Captured Place", "project")

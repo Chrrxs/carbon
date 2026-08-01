@@ -32,6 +32,11 @@ check(
 	"the capture client must publish every polled server status to the UI"
 )
 check(
+	string.find(client, "function Client:startAutomaticManifestCapture", 1, true)
+		and string.find(client, 'self:getUrl("capture/automatic")', 1, true),
+	"the connected plugin must enable serve-owned continuous auto-recovery capture"
+)
+check(
 	string.find(core, "function Core:captureManifest", 1, true)
 		and string.find(core, "onStatus: ((status: Types.ManifestCaptureStatus) -> ())?", 1, true)
 		and string.find(core, "self.client:fetchDetails()", 1, true)
@@ -41,7 +46,7 @@ check(
 
 check(
 	string.find(connected, 'local captureState = Value("idle")', 1, true)
-		and string.find(connected, 'else "Capturing..."', 1, true)
+		and string.find(connected, 'else "Waiting for Auto-Capture..."', 1, true)
 		and string.find(connected, "Active = Computed(function(use)", 1, true)
 		and string.find(connected, 'return use(captureState) ~= "running"', 1, true)
 		and string.find(connected, "captureMessage", 1, true)
@@ -50,7 +55,7 @@ check(
 )
 check(
 	string.find(connected, "use(props.App.rootSize).X", 1, true)
-		and string.find(connected, 'then "Capture" else "Capture Manifest"', 1, true)
+		and string.find(connected, 'then "Wait" else "Wait for Auto-Capture"', 1, true)
 		and string.find(connected, "Spacing = 4", 1, true)
 		and string.find(textButton, "use(props.TextSize)", 1, true),
 	"the action row must react to narrow dock widths without clipping its capture button"
@@ -58,11 +63,11 @@ check(
 
 for _, phase in
 	{
-		"Transferring native capture artifacts",
-		"Validating the native Studio snapshot",
-		"Compiling the captured Studio state",
-		"Staging the captured manifest",
-		"Committing the captured manifest atomically",
+		"Waiting up to six minutes for Studio to write a new auto-recovery place",
+		"arrived; validating",
+		"Waiting for project source to settle",
+		"Staging the recovered Studio place",
+		"Committing the recovered manifest atomically",
 	}
 do
 	check(string.find(serverCore, phase, 1, true) ~= nil, `the serve endpoint must report the capture phase: {phase}`)

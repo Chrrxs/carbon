@@ -4,16 +4,10 @@
 /AGENTS.md
 /CONTEXT.md
 /docs/
-/rml/docs/
 /.local/
 
 /target
 /cli/target
-/rml/build
-/rml/build-*
-/rml/.vs
-/rml/**/bin
-/rml/**/obj
 /qualification-artifacts
 /sourcemap.json
 *.rbxm

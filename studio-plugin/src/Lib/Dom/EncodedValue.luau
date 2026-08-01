@@ -349,8 +349,8 @@ types = {
 	},
 
 	NetAssetRef = {
-		-- Roblox exposes privileged NetAssetRef values as their opaque byte
-		-- payload. They use the same wire representation as SharedString, but
+		-- Roblox represents NetAssetRef values as an opaque byte payload. They use
+		-- the same wire representation as SharedString, but
 		-- retain a distinct variant tag in the canonical Carbon data.
 		fromPod = function(pod)
 			if typeof(pod) == "buffer" then

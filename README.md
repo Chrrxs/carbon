@@ -7,8 +7,8 @@ Local files own selected Folder and script subtrees. Studio owns everything
 else. Carbon captures Studio-owned state in a deterministic artifact and uses
 stable instance identities to merge independent changes.
 
-Mapped source syncs from the filesystem to Studio. Run a capture to save
-Studio-owned changes.
+Mapped source syncs from the filesystem to Studio. While `serve` is connected,
+fresh Studio auto-recovery saves continuously capture Studio-owned changes.
 
 > [!IMPORTANT]
 > Carbon is pre-1.0. It supports Roblox Studio on x86_64 Windows, either
@@ -79,6 +79,7 @@ See [Usage and project format](USAGE.md) for the full mapping and capture rules.
 - Roblox Studio on Windows
 - Carbon CLI on native Windows or WSL2
 - [Rokit](https://github.com/rojo-rbx/rokit) in the CLI environment
+- Roblox Studio auto-recovery enabled
 
 ## Install
 
@@ -86,8 +87,9 @@ See [Usage and project format](USAGE.md) for the full mapping and capture rules.
 rokit add Chrrxs/carbon
 ```
 
-The executable includes its matching RML runtime and Studio plugin. Carbon
-installs or updates them when `serve` or `studio` starts.
+The executable includes its matching Studio plugin. Carbon installs or updates
+it when `serve` or `studio` starts. Carbon does not inject code into Studio or
+modify Studio binaries.
 
 ## Start
 
@@ -101,8 +103,11 @@ carbon init --output game.carbon.json --name Game
 # Start live sync and Studio.
 carbon serve game.carbon.json
 
-# Save Studio-owned state with the instance ID from serve.
-carbon capture 'anon:550e8400-e29b-41d4-a716-446655440000'
+# Import a place saved manually with Studio's File > Save to File command.
+carbon capture game.carbon.json manually-saved.rbxl
+
+# Wait for the next auto-recovery capture, then stop serve and Studio.
+carbon stop 'anon:550e8400-e29b-41d4-a716-446655440000'
 
 # Build a place file.
 carbon build game.carbon.json --output game.rbxl

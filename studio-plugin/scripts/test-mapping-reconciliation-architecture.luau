@@ -10,9 +10,8 @@ local app = fs.readFile("src/App/init.luau")
 assert(
 	not string.find(core, "Watcher", 1, true)
 		and not string.find(core, "Syncback", 1, true)
-		and not string.find(core, "readPrivilegedChanges", 1, true)
 		and not string.find(core, "attachManagedHierarchy", 1, true),
-	"the live Core must not install Studio watchers, poll native changes, sync back, or verify a managed hierarchy"
+	"the live Core must not install Studio watchers, sync back, or verify a managed hierarchy"
 )
 assert(
 	not string.find(client, 'getUrl("write/page")', 1, true)
@@ -48,11 +47,11 @@ assert(
 	"managed reload must preserve mapped identity state so removed mappings are deleted from Studio"
 )
 
-local startupCapture = assert(string.find(core, "self.client:requestManifestCapture(nil, true):expect()", 1, true))
+local startupCapture = assert(string.find(core, "self.client:requestManifestCapture(nil):expect()", 1, true))
 local startupReconcile = assert(string.find(core, "local report = self:__reconcileMappings()", startupCapture, true))
 assert(
-	startupCapture < startupReconcile and string.find(client, 'table.insert(query, "forceFull=true")', 1, true),
-	"an ordinary untrusted attach must fully capture Studio before mapped reconciliation"
+	startupCapture < startupReconcile and not string.find(client, "forceFull", 1, true),
+	"an ordinary untrusted attach must capture Studio through auto-recovery before mapped reconciliation"
 )
 
 local primeStart = assert(string.find(reconciler, "function MappingReconciler:prime", 1, true))

@@ -3,9 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $Version,
 
-    [string] $RmlBuildDir = "",
-
-    [string] $OutputDir = ""
+	[string] $OutputDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,21 +51,16 @@ $temporaryRoot = if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
 } else {
     [IO.Path]::GetTempPath()
 }
-if ([string]::IsNullOrWhiteSpace($RmlBuildDir)) {
-    $RmlBuildDir = Join-Path $temporaryRoot "carbon-rml-build"
-}
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $repo "target\release-assets"
 }
 
-$rmlPackage = Join-Path $repo "target\windows-rml-package"
 $studioPlugin = Join-Path $repo "target\Carbon-windows.rbxm"
 $bash = Resolve-GitBash
 $environmentVariableNames = @(
     "CARBON_BUILD_IDENTITY",
     "CARBON_BUILD_VERSION",
-    "CARBON_STUDIO_PLUGIN_BUNDLE",
-    "CARBON_RML_BUNDLE",
+	"CARBON_STUDIO_PLUGIN_BUNDLE",
     "Path",
     "INCLUDE",
     "LIB"
@@ -91,20 +84,13 @@ try {
         throw "scripts/build-identity produced an invalid identity: $buildIdentity"
     }
 
-    $env:CARBON_BUILD_IDENTITY = $buildIdentity
-    & (Join-Path $repo "scripts\build-rml.ps1") `
-        -SourceDir (Join-Path $repo "rml") `
-        -BuildDir $RmlBuildDir `
-        -PackageDir $rmlPackage `
-        -BuildVersion $buildIdentity
-
+	$env:CARBON_BUILD_IDENTITY = $buildIdentity
     $env:CARBON_BUILD_VERSION = $Version
     Invoke-Checked -Program $bash -CommandArguments @(
         "./scripts/build-studio-plugin",
         "target/Carbon-windows.rbxm"
     )
     $env:CARBON_STUDIO_PLUGIN_BUNDLE = $studioPlugin
-    $env:CARBON_RML_BUNDLE = $rmlPackage
     Invoke-Checked -Program "cargo.exe" -CommandArguments @(
         "build",
         "--locked",

@@ -248,20 +248,6 @@ function Processor:diffSyncbackPage(instances: { Types.PropertySnapshot }, refer
 		local success, live = pcall(instance.IsDescendantOf, instance, game)
 		return success and live
 	end
-	local batchInstances = {}
-	for _, snapshot in instances do
-		local instance = self.tree:getInstance(snapshot.id)
-		if instance and isLive(instance) then
-			table.insert(batchInstances, instance)
-		end
-	end
-	local batchSuccess, batchError = InitialReconciliation.beginStableBatch(batchInstances, isLive, function(live)
-		return Dom.beginPrivilegedBatch(live)
-	end)
-	if not batchSuccess then
-		error(`Failed to batch exact serialized-property reads: {tostring(batchError)}`)
-	end
-
 	local success, result = pcall(function()
 		for _, snapshot in instances do
 			local instance = self.tree:getInstance(snapshot.id)
@@ -270,13 +256,10 @@ function Processor:diffSyncbackPage(instances: { Types.PropertySnapshot }, refer
 			end
 
 			-- Arbitrary-place adoption performs the complete canonical comparison,
-			-- including defaults, protected values, and references. Managed builds
+			-- including readable defaults and references. Managed builds
 			-- skip this entire path when their embedded generation matches.
 			local instanceOverlays = NativeReferenceOverlay.forSource(referenceOverlays, snapshot.id)
-			if
-				self:diffProperties(snapshot, instanceOverlays):total() > 0
-				or Dom.hasUnknownPrivilegedDefault(instance.ClassName, snapshot.properties)
-			then
+			if self:diffProperties(snapshot, instanceOverlays):total() > 0 then
 				local update = self.read:onChange(instance, nil, instanceOverlays)
 				if update then
 					changes:update(update)
@@ -284,7 +267,6 @@ function Processor:diffSyncbackPage(instances: { Types.PropertySnapshot }, refer
 			end
 		end
 	end)
-	Dom.endPrivilegedBatch()
 	if not success then
 		error(result)
 	end
@@ -478,34 +460,6 @@ function Processor:diffProperties(snapshot: Types.PropertySnapshot, referenceOve
 			if not DefaultComparison.matches(instanceValue, default, Dom.EncodedValue.decode, equals, self.tree) then
 				updatedProperties[property] = default
 			end
-		end
-	end
-
-	for _, descriptor in Dom.getPrivilegedSerializedProperties(instance.ClassName) do
-		if defaults[descriptor.name] ~= nil then
-			continue
-		end
-		local value = snapshot.properties[descriptor.name]
-		local overlaid, liveValue = NativeReferenceOverlay.get(referenceOverlays, descriptor.name)
-		if overlaid then
-			if not NativeReferenceOverlay.matchesSource(referenceOverlays, descriptor.name, value, equals) then
-				updatedProperties[descriptor.name] = liveValue
-			end
-			continue
-		end
-		if value == nil then
-			continue
-		end
-		local readSuccess, instanceValue = Dom.readProperty(instance, descriptor.name)
-		if not readSuccess then
-			error(Error.new(Error.ReadFailed, descriptor.name, instance, instanceValue.kind))
-		end
-		local decodeSuccess, snapshotValue = Dom.EncodedValue.decode(value, self.tree)
-		if not decodeSuccess then
-			error(Error.new(Error.DecodeFailed, descriptor.name, value))
-		end
-		if not equals(instanceValue, snapshotValue) then
-			updatedProperties[descriptor.name] = value
 		end
 	end
 

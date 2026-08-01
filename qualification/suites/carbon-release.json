@@ -1,36 +1,17 @@
 {
   "schema_version": 1,
   "name": "carbon-production-readiness",
-  "description": "Blocking installed-build qualification for the Carbon monorepo and Roblox Studio MCP.",
+  "description": "Blocking installed-build qualification for Carbon's CLI, Studio plugin, and auto-recovery capture path.",
   "variables": {
     "repo": "${suite_dir}/../..",
     "carbon": "carbon",
     "port": "48125",
     "build_output": "${artifact_dir}/qualification.rbxl",
-    "studio_saved_output": "${artifact_dir}/studio-saved.rbxl",
-    "capture_rebuild_output": "${artifact_dir}/capture-rebuilt.rbxl",
-    "mapped_identity_saved_output": "${artifact_dir}/mapped-identity-studio.rbxl",
-    "mapped_identity_build_output": "${artifact_dir}/mapped-identity-build.rbxl",
-    "mapped_identity_corrected_saved_output": "${artifact_dir}/mapped-identity-corrected-studio.rbxl",
-    "mapped_identity_corrected_build_output": "${artifact_dir}/mapped-identity-corrected-build.rbxl",
-    "mapped_identity_meta_backup": "${artifact_dir}/mapped-identity-meta.json",
-    "mapped_identity_strict_fixture": "${artifact_dir}/mapped-identity-strict-fixture",
-    "mapped_identity_corrected_fixture": "${artifact_dir}/mapped-identity-corrected-fixture",
-    "procedural_generator_saved_output": "${artifact_dir}/procedural-generator-studio.rbxl",
-    "procedural_generator_build_output": "${artifact_dir}/procedural-generator-build.rbxl",
-    "procedural_generator_corrected_saved_output": "${artifact_dir}/procedural-generator-corrected-studio.rbxl",
-    "procedural_generator_corrected_build_output": "${artifact_dir}/procedural-generator-corrected-build.rbxl",
-    "procedural_generator_meta_backup": "${artifact_dir}/procedural-generator-meta.json",
-    "procedural_generator_strict_fixture": "${artifact_dir}/procedural-generator-strict-fixture",
-    "procedural_generator_partial_fixture": "${artifact_dir}/procedural-generator-partial-fixture",
-    "procedural_generator_corrected_fixture": "${artifact_dir}/procedural-generator-corrected-fixture",
-    "foreground_watch_ready": "${artifact_dir}/foreground-watch.ready",
-    "manifest_reload_backup": "${artifact_dir}/manifest-reload-backup.json",
-    "foreground_watch_done": "${artifact_dir}/foreground-watch.done"
+    "capture_rebuild_output": "${artifact_dir}/capture-rebuilt.rbxl"
   },
   "requirements": {
     "operating_systems": ["windows", "linux"],
-    "variables": ["carbon", "project", "data_dir", "fixture_dir", "mapped_identity_meta", "mapped_identity_strict_project", "mapped_identity_strict_meta", "mapped_identity_corrected_project", "mapped_identity_corrected_meta", "procedural_generator_meta", "procedural_generator_strict_project", "procedural_generator_strict_meta", "procedural_generator_partial_project", "procedural_generator_partial_meta", "procedural_generator_corrected_project", "procedural_generator_corrected_meta", "port", "studio_data_model", "rml_cache", "rml_crash_dir", "rml_log_dir"]
+    "variables": ["carbon", "project", "data_dir", "port", "studio_data_model", "studio_launch_path"]
   },
   "policy": {
     "fail_on_command_warnings": true,
@@ -41,20 +22,15 @@
       "determinism",
       "runtime",
       "lifecycle",
-      "diagnostics",
-      "fault_injection",
-      "performance",
-      "memory",
-      "visual",
-      "crash_safety",
-      "mapped_identity"
+      "capture",
+      "crash_safety"
     ],
-    "max_suite_seconds": 1800
+    "max_suite_seconds": 1200
   },
   "scenarios": [
     {
       "name": "candidate-cli-preflight",
-      "description": "Proves the exact installed candidate can start cleanly before Studio is involved.",
+      "description": "Proves the exact installed candidate can start cleanly.",
       "tags": ["preflight"],
       "steps": [
         {
@@ -70,7 +46,7 @@
     },
     {
       "name": "deterministic-installed-build",
-      "description": "Builds twice and requires stable artifact bytes plus zero manifest byte or mtime churn on the fixed point.",
+      "description": "Builds twice and requires stable artifact and manifest bytes.",
       "tags": ["determinism", "preflight"],
       "steps": [
         {
@@ -114,32 +90,31 @@
           "snapshot": "data-after-first-build",
           "path": "${data_dir}",
           "check_mtime": true
+        },
+        {
+          "name": "build-offline-capture-input",
+          "kind": "command",
+          "program": "${carbon}",
+          "args": ["build", "${project}", "--output", "${studio_launch_path}", "--worktree-endpoint", "http://127.0.0.1:1", "--worktree-project", "${studio_data_model}", "--worktree-id", "qualification-offline", "--session-token", "qualification-offline", "--color", "never"],
+          "cwd": "${repo}",
+          "timeout_seconds": 300
+        },
+        {
+          "name": "capture-offline-binary-place",
+          "kind": "command",
+          "program": "${carbon}",
+          "args": ["capture", "${project}", "${studio_launch_path}", "--color", "never"],
+          "cwd": "${repo}",
+          "timeout_seconds": 300,
+          "stderr_contains": ["Capture Manifest committed project generation"]
         }
       ]
     },
     {
-      "name": "managed-studio-runtime",
-      "description": "Exercises managed launch, explicit capture, server/client VMs, network faults, diagnostics, profiles, memory, visual evidence, and teardown.",
-      "tags": [
-        "runtime",
-        "lifecycle",
-        "diagnostics",
-        "fault_injection",
-        "performance",
-        "memory",
-        "visual",
-        "crash_safety",
-        "determinism",
-        "mapped_identity"
-      ],
+      "name": "managed-studio-auto-recovery-capture",
+      "description": "Launches Studio normally, authors an edit, waits for a new auto-recovery save, commits it, and rebuilds the captured project.",
+      "tags": ["runtime", "lifecycle", "capture", "crash_safety", "determinism"],
       "steps": [
-        {
-          "name": "start-rml-crash-watch",
-          "kind": "start_crash_watch",
-          "watcher": "rml",
-          "crash_dir": "${rml_crash_dir}",
-          "rml_log_dir": "${rml_log_dir}"
-        },
         {
           "name": "start-managed-serve",
           "kind": "spawn",
@@ -148,11 +123,7 @@
           "args": ["serve", "${project}", "--port", "${port}", "--yes", "--color", "never"],
           "cwd": "${repo}",
           "env": {
-            "CARBON_QUALIFICATION_EXPORT_TOKEN": "${qualification_token}",
-            "CARBON_QUALIFICATION_STUDIO_NAME": "${studio_data_model}",
-            "CARBON_RML_CACHE_DIR": "${rml_cache}",
-            "CARBON_STUDIO_LIFECYCLE": "mcp",
-            "CARBON_STUDIO_MCP_URL": "${mcp_url}"
+            "CARBON_QUALIFICATION_STUDIO_NAME": "${studio_data_model}"
           }
         },
         {
@@ -175,285 +146,35 @@
           }
         },
         {
-          "name": "verify-mcp-managed-studio-lifecycle",
-          "kind": "mcp",
-          "tool": "manage_instance",
-          "arguments": {"action": "status", "instance_id": "${studio_instance}"},
-          "timeout_seconds": 120,
-          "poll_interval_ms": 100,
-          "checks": [
-            {"pointer": "/managed", "op": "equals", "value": true},
-            {"pointer": "/source", "op": "equals", "value": "local_file"},
-            {"pointer": "/process_running", "op": "equals", "value": true},
-            {"pointer": "/process_authorized", "op": "equals", "value": true},
-            {"pointer": "/process_ownership_released", "op": "equals", "value": true},
-            {"pointer": "/state", "op": "equals", "value": "connected"}
-          ],
-          "capture": {
-            "studio_launch": "/launch_id",
-            "studio_pid": "/pid"
-          }
-        },
-        {
-          "name": "clean-managed-startup-logs",
-          "kind": "mcp",
-          "tool": "get_runtime_logs",
-          "arguments": {"instance_id": "${studio_instance}", "target": "edit"},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "snapshot-managed-launch-baseline",
-          "kind": "snapshot_path",
-          "snapshot": "managed-launch-baseline",
-          "path": "${data_dir}"
-        },
-        {
-          "name": "unchanged-managed-launch-capture",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 60,
-          "stderr_contains": ["exact no-op"]
-        },
-        {
-          "name": "unchanged-managed-launch-preserves-baseline",
-          "kind": "assert_path_unchanged",
-          "snapshot": "managed-launch-baseline",
-          "path": "${data_dir}",
-          "check_mtime": true
-        },
-        {
-          "name": "edit-datamodel-probe",
+          "name": "author-studio-change",
           "kind": "mcp",
           "tool": "execute_luau",
           "arguments": {
             "instance_id": "${studio_instance}",
             "target": "edit",
-            "code": "assert(game ~= nil, 'DataModel missing'); assert(game:GetService('RunService'):IsStudio(), 'not Studio'); return true"
+            "code": "local old = workspace:FindFirstChild('CarbonAutoRecoveryProbe'); if old then old:Destroy() end; local probe = Instance.new('Part'); probe.Name = 'CarbonAutoRecoveryProbe'; probe.Anchored = true; probe.Size = Vector3.new(7, 3, 5); probe:SetAttribute('CapturedThroughAutoRecovery', true); probe.Parent = workspace; return probe:GetFullName()"
           },
           "timeout_seconds": 30,
           "max_duration_ms": 2000
         },
         {
-          "name": "create-manifest-owned-script",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local workspace = game:GetService('Workspace'); local previous = workspace:FindFirstChild('CarbonManifestScriptParent'); if previous then previous:Destroy() end; local parent = Instance.new('Part'); parent.Name = 'CarbonManifestScriptParent'; parent.Anchored = true; parent.Parent = workspace; local script = Instance.new('ModuleScript'); script.Name = 'CarbonManifestScript'; script.Source = \"return 'carbon-manifest-script-v1'\\n\"; script:SetAttribute('CarbonManifestProbe', true); script.Parent = parent; local disposable = Instance.new('Folder'); disposable.Name = 'CarbonManifestDeletedOnMutation'; disposable.Parent = parent; return script:GetFullName()"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 2000
-        },
-        {
-          "name": "first-explicit-capture-by-instance-id",
+          "name": "stop-after-next-auto-recovery",
           "kind": "command",
           "program": "${carbon}",
-          "args": ["capture", "${studio_instance}", "--color", "never"],
+          "args": ["stop", "--port", "${port}", "--color", "never"],
           "cwd": "${repo}",
-          "timeout_seconds": 300
+          "timeout_seconds": 390,
+          "stderr_contains": ["auto-recovery"]
         },
         {
-          "name": "snapshot-captured-manifest",
-          "kind": "snapshot_path",
-          "snapshot": "captured-manifest",
-          "path": "${data_dir}"
-        },
-        {
-          "name": "unchanged-explicit-capture",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stderr_contains": ["exact no-op"]
-        },
-        {
-          "name": "capture-fixed-point",
-          "kind": "assert_path_unchanged",
-          "snapshot": "captured-manifest",
-          "path": "${data_dir}",
-          "check_mtime": true
-        },
-        {
-          "name": "mutate-captured-datamodel",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local workspace = game:GetService('Workspace'); local parent = workspace:FindFirstChild('CarbonManifestScriptParent'); assert(parent and parent:IsA('Part'), 'capture parent missing'); local script = parent:FindFirstChild('CarbonManifestScript'); assert(script and script:IsA('ModuleScript'), 'capture script missing'); local disposable = parent:FindFirstChild('CarbonManifestDeletedOnMutation'); assert(disposable, 'capture deletion probe missing'); disposable:Destroy(); parent.Size = Vector3.new(7, 3, 5); parent.CFrame = CFrame.new(11, 22, 33) * CFrame.Angles(0.1, 0.2, 0.3); parent:SetAttribute('CarbonManifestRevision', 2); game:GetService('CollectionService'):AddTag(parent, 'CarbonCaptureChanged'); game:GetService('Lighting').Brightness += 0.25; script.Name = 'CarbonManifestScriptV2'; script.Source = \"return 'carbon-manifest-script-v2'\\n\"; script:SetAttribute('CarbonManifestProbe', 'changed'); local target = Instance.new('Folder'); target.Name = 'CarbonManifestReferenceTarget'; target:SetAttribute('CarbonTargetRevision', 2); target.Parent = parent; script.Parent = target; local reference = Instance.new('ObjectValue'); reference.Name = 'CarbonManifestReference'; reference.Value = target; reference.Parent = parent; return true"
-          },
+          "name": "wait-for-managed-serve-shutdown",
+          "kind": "wait_process",
+          "process": "carbon-serve",
           "timeout_seconds": 30,
-          "max_duration_ms": 2000
+          "expected_exit_codes": [0]
         },
         {
-          "name": "trigger-in-process-manifest-reload",
-          "kind": "command",
-          "program": "${repo}/qualification/scripts/trigger-manifest-reload",
-          "args": ["trigger", "${project}", "${manifest_reload_backup}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["manifest reload with project rename and mapped subtree triggered atomically"]
-        },
-        {
-          "name": "managed-reload-preserves-studio-process",
-          "kind": "mcp",
-          "tool": "manage_instance",
-          "arguments": {"action": "status", "instance_id": "${studio_instance}"},
-          "timeout_seconds": 120,
-          "poll_interval_ms": 100,
-          "checks": [
-            {"pointer": "/pid", "op": "equals", "value": "${studio_pid}"},
-            {"pointer": "/process_running", "op": "equals", "value": true},
-            {"pointer": "/state", "op": "equals", "value": "connected"}
-          ]
-        },
-        {
-          "name": "wait-for-managed-reload-project-name",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "return workspace:GetAttribute('__StudioWorktree_CarbonProject')"
-          },
-          "timeout_seconds": 30,
-          "poll_interval_ms": 100,
-          "checks": [
-            {"pointer": "/returnValue", "op": "equals", "value": "${studio_data_model}-Reloaded"}
-          ]
-        },
-        {
-          "name": "managed-reload-preserves-pending-studio-change",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "assert(workspace:GetAttribute('__StudioWorktree_CarbonProject') == '${studio_data_model}-Reloaded', 'managed reload retained the stale project name'); local parent = game:GetService('Workspace'):FindFirstChild('CarbonManifestScriptParent'); assert(parent and parent:IsA('Part'), 'capture parent missing after managed reload'); assert(parent:GetAttribute('CarbonManifestRevision') == 2, 'pending Studio attribute was lost during managed reload'); assert(parent.Size == Vector3.new(7, 3, 5), 'pending Studio property was lost during managed reload'); assert(parent:FindFirstChild('CarbonManifestDeletedOnMutation') == nil, 'pending Studio deletion was lost during managed reload'); return true"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 2000
-        },
-        {
-          "name": "managed-reload-applies-new-mapped-subtree",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local folder = game:GetService('ServerStorage'):FindFirstChild('CarbonQualificationReload'); assert(folder and folder:IsA('Folder'), 'managed reload did not create the new mapped subtree'); local module = folder:FindFirstChild('equip_weapon'); assert(module and module:IsA('ModuleScript'), 'managed reload did not create the new mapped module'); return require(module)"
-          },
-          "timeout_seconds": 30,
-          "poll_interval_ms": 100,
-          "checks": [
-            {"pointer": "/returnValue", "op": "equals", "value": "carbon-managed-reload-module"}
-          ]
-        },
-        {
-          "name": "post-reload-capture-is-fixed-point",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stderr_contains": ["exact no-op"]
-        },
-        {
-          "name": "restore-manifest-through-managed-reload",
-          "kind": "command",
-          "program": "${repo}/qualification/scripts/trigger-manifest-reload",
-          "args": ["restore", "${project}", "${manifest_reload_backup}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["manifest restored atomically"]
-        },
-        {
-          "name": "managed-reload-applies-restored-topology",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local parent = workspace:FindFirstChild('CarbonManifestScriptParent'); return workspace:GetAttribute('__StudioWorktree_CarbonProject') == '${studio_data_model}' and game:GetService('ServerStorage'):FindFirstChild('CarbonQualificationReload') == nil and parent ~= nil and parent:GetAttribute('CarbonManifestRevision') == 2"
-          },
-          "timeout_seconds": 30,
-          "poll_interval_ms": 100,
-          "checks": [
-            {"pointer": "/returnValue", "op": "equals", "value": "true"}
-          ]
-        },
-        {
-          "name": "post-restore-capture-is-fixed-point",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stderr_contains": ["exact no-op"]
-        },
-        {
-          "name": "snapshot-optimized-changed-capture",
-          "kind": "snapshot_path",
-          "snapshot": "optimized-changed-capture",
-          "path": "${data_dir}"
-        },
-        {
-          "name": "forced-full-capture-oracle",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--force-full", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stderr_contains": ["full rebuild"]
-        },
-        {
-          "name": "optimized-capture-matches-forced-full-oracle",
-          "kind": "assert_path_unchanged",
-          "snapshot": "optimized-changed-capture",
-          "path": "${data_dir}",
-          "check_mtime": false
-        },
-        {
-          "name": "snapshot-forced-full-oracle",
-          "kind": "snapshot_path",
-          "snapshot": "forced-full-capture",
-          "path": "${data_dir}"
-        },
-        {
-          "name": "warm-capture-after-forced-full",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stderr_contains": ["exact no-op"]
-        },
-        {
-          "name": "warm-capture-preserves-forced-full-fixed-point",
-          "kind": "assert_path_unchanged",
-          "snapshot": "forced-full-capture",
-          "path": "${data_dir}",
-          "check_mtime": true
-        },
-        {
-          "name": "capture-did-not-crash-rml",
-          "kind": "assert_no_crash",
-          "watcher": "rml"
-        },
-        {
-          "name": "studio-full-place-serialization",
-          "kind": "export_studio_place",
-          "endpoint": "http://127.0.0.1:${port}",
-          "token": "${qualification_token}",
-          "output": "${studio_saved_output}",
-          "timeout_seconds": 90
-        },
-        {
-          "name": "rebuild-captured-place",
+          "name": "rebuild-recovered-capture",
           "kind": "command",
           "program": "${carbon}",
           "args": ["build", "${project}", "--output", "${capture_rebuild_output}", "--color", "never"],
@@ -461,755 +182,28 @@
           "timeout_seconds": 300
         },
         {
-          "name": "studio-save-matches-capture-rebuild",
+          "name": "verify-rebuilt-place-contains-live-edit",
           "kind": "command",
           "program": "${carbon}",
-          "args": ["diff", "${studio_saved_output}", "${capture_rebuild_output}", "--json", "--color", "never"],
+          "args": ["diff", "${build_output}", "${capture_rebuild_output}", "--json", "--no-fail", "--color", "never"],
           "cwd": "${repo}",
           "timeout_seconds": 300,
-          "stdout_contains": ["\"blockingDifferences\": 0"]
-        },
-        {
-          "name": "start-solo-playtest",
-          "kind": "mcp",
-          "tool": "solo_playtest",
-          "arguments": {"action": "start", "mode": "play", "instance_id": "${studio_instance}", "timeout": 60},
-          "timeout_seconds": 90
-        },
-        {
-          "name": "server-vm-probe",
-          "kind": "mcp",
-          "tool": "eval_server_runtime",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "code": "assert(game:GetService('RunService'):IsServer(), 'server runtime probe ran outside server VM'); return true"
-          },
-          "timeout_seconds": 30
-        },
-        {
-          "name": "client-vm-probe",
-          "kind": "mcp",
-          "tool": "eval_client_runtime",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "client-1",
-            "code": "assert(game:GetService('RunService'):IsClient(), 'client runtime probe ran outside client VM'); return true"
-          },
-          "timeout_seconds": 30
-        },
-        {
-          "name": "poor-network-profile",
-          "kind": "mcp",
-          "tool": "set_network_profile",
-          "arguments": {"instance_id": "${studio_instance}", "target": "client-1", "profile": "poor"},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "network-state-evidence",
-          "kind": "mcp",
-          "tool": "get_simulation_state",
-          "arguments": {"instance_id": "${studio_instance}", "target": "client-1", "include": "network"},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "server-memory-baseline",
-          "kind": "mcp",
-          "tool": "get_memory_breakdown",
-          "arguments": {"instance_id": "${studio_instance}", "target": "server"},
-          "timeout_seconds": 30,
-          "checks": [
-            {"pointer": "/memory_tracking_enabled", "op": "equals", "value": true}
-          ],
-          "capture": {
-            "server_memory_before_mb": "/total_mb"
-          }
-        },
-        {
-          "name": "server-script-profile",
-          "kind": "mcp",
-          "tool": "capture_script_profiler",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "server",
-            "duration_ms": 500,
-            "max_functions": 25,
-            "include_native": false,
-            "include_plugin": false
-          },
-          "timeout_seconds": 60,
-          "checks": [
-            {"pointer": "/ok", "op": "equals", "value": true}
-          ]
-        },
-        {
-          "name": "server-micro-profile",
-          "kind": "mcp",
-          "tool": "capture_micro_profiler",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "server",
-            "duration_ms": 500,
-            "max_events": 200000,
-            "max_groups": 15,
-            "max_timers": 30
-          },
-          "timeout_seconds": 90,
-          "checks": [
-            {"pointer": "/ok", "op": "equals", "value": true}
-          ]
-        },
-        {
-          "name": "server-memory-after-profiling",
-          "kind": "mcp",
-          "tool": "get_memory_breakdown",
-          "arguments": {"instance_id": "${studio_instance}", "target": "server"},
-          "timeout_seconds": 30,
-          "checks": [
-            {"pointer": "/memory_tracking_enabled", "op": "equals", "value": true}
-          ],
-          "capture": {
-            "server_memory_after_mb": "/total_mb"
-          }
-        },
-        {
-          "name": "bounded-server-memory-growth",
-          "kind": "assert_numeric_delta",
-          "before": "server_memory_before_mb",
-          "after": "server_memory_after_mb",
-          "max_increase": 256.0
-        },
-        {
-          "name": "playtest-screenshot",
-          "kind": "mcp",
-          "tool": "capture_screenshot",
-          "arguments": {"instance_id": "${studio_instance}", "format": "png"},
-          "timeout_seconds": 60
-        },
-        {
-          "name": "profiling-did-not-crash-rml",
-          "kind": "assert_no_crash",
-          "watcher": "rml"
-        },
-        {
-          "name": "clean-playtest-logs",
-          "kind": "mcp",
-          "tool": "get_runtime_logs",
-          "arguments": {"instance_id": "${studio_instance}", "target": "all"},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "reset-network-simulation",
-          "kind": "mcp",
-          "tool": "reset_simulation_state",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "client-1",
-            "network": true,
-            "deviceSimulator": false
-          },
-          "timeout_seconds": 30
-        },
-        {
-          "name": "stop-solo-playtest",
-          "kind": "mcp",
-          "tool": "solo_playtest",
-          "arguments": {"action": "stop", "instance_id": "${studio_instance}", "timeout": 15},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "create-live-mapped-reference",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local workspace = game:GetService('Workspace'); local previous = workspace:FindFirstChild('CarbonMappedReferenceOwner'); if previous then previous:Destroy() end; local target = game:GetService('ReplicatedStorage'):WaitForChild('Shared'); local owner = Instance.new('ObjectValue'); owner.Name = 'CarbonMappedReferenceOwner'; owner.Value = target; owner.Parent = workspace; assert(owner.Value == target, 'live mapped reference was not assigned'); return {owner = owner:GetFullName(), target = target:GetFullName()}"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 2000
-        },
-        {
-          "name": "capture-live-mapped-reference",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "verify-live-mapped-identity-metadata",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "verify-and-backup", "${mapped_identity_meta}", "${mapped_identity_meta_backup}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity metadata persisted and backed up"]
-        },
-        {
-          "name": "verify-live-mapped-reference-after-capture",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local owner = game:GetService('Workspace'):FindFirstChild('CarbonMappedReferenceOwner'); local target = game:GetService('ReplicatedStorage'):FindFirstChild('Shared'); assert(owner and owner:IsA('ObjectValue'), 'manifest reference owner missing after capture'); assert(target and owner.Value == target, 'mapped target reference changed after capture'); return true"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 2000
-        },
-        {
-          "name": "export-live-mapped-reference",
-          "kind": "export_studio_place",
-          "endpoint": "http://127.0.0.1:${port}",
-          "token": "${qualification_token}",
-          "output": "${mapped_identity_saved_output}",
-          "timeout_seconds": 90
-        },
-        {
-          "name": "rebuild-live-mapped-reference",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${project}", "--output", "${mapped_identity_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "live-mapped-reference-rebuild-parity",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["diff", "${mapped_identity_saved_output}", "${mapped_identity_build_output}", "--json", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stdout_contains": ["\"blockingDifferences\": 0"]
-        },
-        {
-          "name": "clone-live-mapped-reference-fixture",
-          "kind": "command",
-          "program": "cp",
-          "args": ["-a", "${fixture_dir}/.", "${mapped_identity_strict_fixture}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30
-        },
-        {
-          "name": "remove-live-mapped-identity",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "remove", "${mapped_identity_strict_meta}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity removed for strict build probe"]
-        },
-        {
-          "name": "missing-live-mapped-identity-blocks-build",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${mapped_identity_strict_project}", "--output", "${mapped_identity_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "expected_exit_code": 1,
-          "stderr_contains": ["modify the relevant manifest reference"],
-          "allowed_diagnostic_contains": ["modify the relevant manifest reference"]
-        },
-        {
-          "name": "restore-live-mapped-identity",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "restore", "${mapped_identity_strict_meta}", "${mapped_identity_meta_backup}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity restored"]
-        },
-        {
-          "name": "clear-live-mapped-reference",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local owner = game:GetService('Workspace'):FindFirstChild('CarbonMappedReferenceOwner'); assert(owner and owner:IsA('ObjectValue'), 'manifest reference owner missing before correction'); owner.Value = nil; assert(owner.Value == nil, 'manifest reference was not cleared'); return true"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 2000
-        },
-        {
-          "name": "capture-corrected-live-manifest",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "export-corrected-live-manifest",
-          "kind": "export_studio_place",
-          "endpoint": "http://127.0.0.1:${port}",
-          "token": "${qualification_token}",
-          "output": "${mapped_identity_corrected_saved_output}",
-          "timeout_seconds": 90
-        },
-        {
-          "name": "build-corrected-live-manifest",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${project}", "--output", "${mapped_identity_corrected_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "corrected-live-manifest-parity",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["diff", "${mapped_identity_corrected_saved_output}", "${mapped_identity_corrected_build_output}", "--json", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stdout_contains": ["\"blockingDifferences\": 0"]
-        },
-        {
-          "name": "clone-corrected-live-manifest-fixture",
-          "kind": "command",
-          "program": "cp",
-          "args": ["-a", "${fixture_dir}/.", "${mapped_identity_corrected_fixture}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30
-        },
-        {
-          "name": "remove-corrected-live-mapped-identity",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "remove", "${mapped_identity_corrected_meta}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity removed for strict build probe"]
-        },
-        {
-          "name": "build-after-live-manifest-correction",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${mapped_identity_corrected_project}", "--output", "${mapped_identity_corrected_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "corrected-live-manifest-rebuild-parity",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["diff", "${mapped_identity_corrected_saved_output}", "${mapped_identity_corrected_build_output}", "--json", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stdout_contains": ["\"blockingDifferences\": 0"]
-        },
-        {
-          "name": "create-live-procedural-models-with-mapped-generator",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local workspace = game:GetService('Workspace'); local generator = game:GetService('ReplicatedStorage'):WaitForChild('Shared'):WaitForChild('ProceduralGenerator'); assert(generator:IsA('ModuleScript'), 'mapped procedural generator is not a ModuleScript'); assert(generator:GetAttribute('CarbonQualificationMetadata') == 'preserved', 'pre-existing generator metadata was not mapped'); for _, name in {'CarbonProceduralMappedFirst', 'CarbonProceduralMappedSecond', 'CarbonProceduralNilGenerator'} do local previous = workspace:FindFirstChild(name); if previous then previous:Destroy() end end; local function generated(model, name) local output = model:FindFirstChild(name, true); assert(output and output:IsA('Part'), model.Name .. ' did not generate ' .. name); return output end; local function create(name, outputName, assignGenerator) local model = Instance.new('ProceduralModel'); model.Name = name; model.Parent = workspace; model.Size = Vector3.new(8, 4, 6); if assignGenerator then model.Generator = generator; assert(model:ForceGeneration(), name .. ' parameter generation did not start'); assert(model:WaitForGenerationAsync(), name .. ' parameter generation failed: ' .. model.GenerationError); model:SetAttribute('OutputName', outputName); assert(model:ForceGeneration(), name .. ' attribute generation did not start'); assert(model:WaitForGenerationAsync(), name .. ' attribute generation failed: ' .. model.GenerationError); assert(model.Generator == generator, name .. ' lost the mapped generator'); generated(model, outputName) else assert(model.Generator == nil, name .. ' unexpectedly acquired a generator') end; return model end; local first = create('CarbonProceduralMappedFirst', 'MappedFirstOutput', true); local second = create('CarbonProceduralMappedSecond', 'MappedSecondOutput', true); local nilGenerator = create('CarbonProceduralNilGenerator', 'NeverGenerated', false); assert(first.Generator == second.Generator and first.Generator == generator, 'shared mapped generator references diverged'); assert(nilGenerator:FindFirstChild('NeverGenerated', true) == nil, 'nil generator produced output'); return {generator = generator:GetFullName(), first = first:GetFullName(), second = second:GetFullName()}"
-          },
-          "timeout_seconds": 60,
-          "max_duration_ms": 15000
-        },
-        {
-          "name": "capture-live-procedural-generator-reference",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "verify-live-procedural-generator-metadata",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "verify-generator-and-backup", "${procedural_generator_meta}", "${procedural_generator_meta_backup}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["procedural generator identity appended without replacing metadata"]
-        },
-        {
-          "name": "verify-live-procedural-regeneration-after-capture",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local workspace = game:GetService('Workspace'); local generator = game:GetService('ReplicatedStorage'):WaitForChild('Shared'):WaitForChild('ProceduralGenerator'); local first = workspace:FindFirstChild('CarbonProceduralMappedFirst'); local second = workspace:FindFirstChild('CarbonProceduralMappedSecond'); local nilGenerator = workspace:FindFirstChild('CarbonProceduralNilGenerator'); assert(generator:IsA('ModuleScript') and generator:GetAttribute('CarbonQualificationMetadata') == 'preserved', 'mapped generator metadata changed after capture'); assert(first and first:IsA('ProceduralModel') and first.Generator == generator, 'first procedural reference did not survive capture'); assert(second and second:IsA('ProceduralModel') and second.Generator == generator, 'second procedural reference did not survive capture'); assert(nilGenerator and nilGenerator:IsA('ProceduralModel') and nilGenerator.Generator == nil, 'nil generator edge case changed after capture'); first:ForceGeneration(); second:ForceGeneration(); assert(first:WaitForGenerationAsync(), 'first regeneration failed: ' .. first.GenerationError); assert(second:WaitForGenerationAsync(), 'second regeneration failed: ' .. second.GenerationError); assert(first:FindFirstChild('MappedFirstOutput', true), 'first regenerated output is missing'); assert(second:FindFirstChild('MappedSecondOutput', true), 'second regenerated output is missing'); return true"
-          },
-          "timeout_seconds": 60,
-          "max_duration_ms": 15000
-        },
-        {
-          "name": "export-live-procedural-generator-reference",
-          "kind": "export_studio_place",
-          "endpoint": "http://127.0.0.1:${port}",
-          "token": "${qualification_token}",
-          "output": "${procedural_generator_saved_output}",
-          "timeout_seconds": 90
-        },
-        {
-          "name": "rebuild-live-procedural-generator-reference",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${project}", "--output", "${procedural_generator_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "live-procedural-generator-rebuild-parity",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["diff", "${procedural_generator_saved_output}", "${procedural_generator_build_output}", "--json", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stdout_contains": ["\"blockingDifferences\": 0"]
-        },
-        {
-          "name": "clone-live-procedural-generator-fixture",
-          "kind": "command",
-          "program": "cp",
-          "args": ["-a", "${fixture_dir}/.", "${procedural_generator_strict_fixture}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30
-        },
-        {
-          "name": "remove-live-procedural-generator-id",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "remove", "${procedural_generator_strict_meta}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity removed for strict build probe"]
-        },
-        {
-          "name": "missing-procedural-generator-id-blocks-build",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${procedural_generator_strict_project}", "--output", "${procedural_generator_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "expected_exit_code": 1,
-          "stderr_contains": ["modify the relevant manifest reference"],
-          "allowed_diagnostic_contains": ["modify the relevant manifest reference"]
-        },
-        {
-          "name": "restore-live-procedural-generator-id",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "restore", "${procedural_generator_strict_meta}", "${procedural_generator_meta_backup}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity restored"]
-        },
-        {
-          "name": "clear-one-of-two-procedural-generators",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local workspace = game:GetService('Workspace'); local generator = game:GetService('ReplicatedStorage'):WaitForChild('Shared'):WaitForChild('ProceduralGenerator'); local first = workspace:FindFirstChild('CarbonProceduralMappedFirst'); local second = workspace:FindFirstChild('CarbonProceduralMappedSecond'); local nilGenerator = workspace:FindFirstChild('CarbonProceduralNilGenerator'); assert(first and second and nilGenerator, 'procedural edge-case models are missing'); local preserved = first:FindFirstChild('MappedFirstOutput', true); assert(preserved, 'first generated contents are missing before clearing'); first.Generator = nil; assert(first.Generator == nil, 'first generator did not clear'); assert(preserved.Parent ~= nil and first:FindFirstChild('MappedFirstOutput', true), 'clearing Generator did not preserve generated contents'); assert(second.Generator == generator, 'clearing first generator changed the shared second reference'); assert(nilGenerator.Generator == nil, 'always-nil generator edge case changed'); return true"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 5000
-        },
-        {
-          "name": "capture-partially-cleared-procedural-manifest",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "clone-partially-cleared-procedural-fixture",
-          "kind": "command",
-          "program": "cp",
-          "args": ["-a", "${fixture_dir}/.", "${procedural_generator_partial_fixture}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30
-        },
-        {
-          "name": "remove-partially-cleared-procedural-generator-id",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "remove", "${procedural_generator_partial_meta}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity removed for strict build probe"]
-        },
-        {
-          "name": "remaining-procedural-generator-reference-still-blocks-build",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${procedural_generator_partial_project}", "--output", "${procedural_generator_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "expected_exit_code": 1,
-          "stderr_contains": ["modify the relevant manifest reference"],
-          "allowed_diagnostic_contains": ["modify the relevant manifest reference"]
-        },
-        {
-          "name": "clear-final-procedural-generator",
-          "kind": "mcp",
-          "tool": "execute_luau",
-          "arguments": {
-            "instance_id": "${studio_instance}",
-            "target": "edit",
-            "code": "local workspace = game:GetService('Workspace'); local first = workspace:FindFirstChild('CarbonProceduralMappedFirst'); local second = workspace:FindFirstChild('CarbonProceduralMappedSecond'); local nilGenerator = workspace:FindFirstChild('CarbonProceduralNilGenerator'); assert(first and second and nilGenerator, 'procedural edge-case models are missing'); assert(first.Generator == nil, 'first generator was unexpectedly restored'); local preserved = second:FindFirstChild('MappedSecondOutput', true); assert(preserved, 'second generated contents are missing before clearing'); second.Generator = nil; assert(second.Generator == nil, 'second generator did not clear'); assert(preserved.Parent ~= nil and second:FindFirstChild('MappedSecondOutput', true), 'clearing final Generator did not preserve generated contents'); assert(nilGenerator.Generator == nil, 'always-nil generator edge case changed'); return true"
-          },
-          "timeout_seconds": 30,
-          "max_duration_ms": 5000
-        },
-        {
-          "name": "capture-corrected-procedural-manifest",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["capture", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "export-corrected-procedural-manifest",
-          "kind": "export_studio_place",
-          "endpoint": "http://127.0.0.1:${port}",
-          "token": "${qualification_token}",
-          "output": "${procedural_generator_corrected_saved_output}",
-          "timeout_seconds": 90
-        },
-        {
-          "name": "build-corrected-procedural-manifest",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${project}", "--output", "${procedural_generator_corrected_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "corrected-procedural-manifest-parity",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["diff", "${procedural_generator_corrected_saved_output}", "${procedural_generator_corrected_build_output}", "--json", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stdout_contains": ["\"blockingDifferences\": 0"]
-        },
-        {
-          "name": "clone-corrected-procedural-generator-fixture",
-          "kind": "command",
-          "program": "cp",
-          "args": ["-a", "${fixture_dir}/.", "${procedural_generator_corrected_fixture}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30
-        },
-        {
-          "name": "remove-corrected-procedural-generator-id",
-          "kind": "command",
-          "program": "bash",
-          "args": ["${repo}/qualification/scripts/mapped-identity-meta", "remove", "${procedural_generator_corrected_meta}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["mapped identity removed for strict build probe"]
-        },
-        {
-          "name": "corrected-procedural-manifest-builds-without-generator-id",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["build", "${procedural_generator_corrected_project}", "--output", "${procedural_generator_corrected_build_output}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300
-        },
-        {
-          "name": "corrected-procedural-manifest-rebuild-parity",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["diff", "${procedural_generator_corrected_saved_output}", "${procedural_generator_corrected_build_output}", "--json", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 300,
-          "stdout_contains": ["\"blockingDifferences\": 0"]
-        },
-        {
-          "name": "mapped-identity-live-crash-gate",
-          "kind": "assert_no_crash",
-          "watcher": "rml"
-        },
-        {
-          "name": "start-focus-regression-playtest",
-          "kind": "mcp",
-          "tool": "solo_playtest",
-          "arguments": {"action": "start", "mode": "play", "instance_id": "${studio_instance}", "timeout": 60},
-          "timeout_seconds": 90
-        },
-        {
-          "name": "launch-secondary-studio",
-          "kind": "mcp",
-          "tool": "manage_instance",
-          "arguments": {
-            "action": "launch",
-            "source": "baseplate",
-            "wait_for_connection": true,
-            "timeout_ms": 120000
-          },
-          "timeout_seconds": 150,
-          "checks": [
-            {"pointer": "/managed", "op": "equals", "value": true},
-            {"pointer": "/state", "op": "equals", "value": "connected"}
-          ],
-          "capture": {
-            "secondary_studio_launch": "/launch_id",
-            "secondary_studio_pid": "/pid"
-          }
-        },
-        {
-          "name": "focus-secondary-studio",
-          "kind": "command",
-          "program": "${repo}/qualification/scripts/studio-foreground",
-          "args": ["focus", "${secondary_studio_pid}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["owns the foreground"]
-        },
-        {
-          "name": "start-foreground-event-watch",
-          "kind": "spawn",
-          "process": "studio-foreground-event-watch",
-          "program": "${repo}/qualification/scripts/studio-foreground",
-          "args": [
-            "watch",
-            "${secondary_studio_pid}",
-            "${studio_pid}",
-            "${foreground_watch_ready}",
-            "${foreground_watch_done}"
-          ],
-          "cwd": "${repo}"
-        },
-        {
-          "name": "wait-for-foreground-event-watch",
-          "kind": "command",
-          "program": "${repo}/qualification/scripts/studio-foreground",
-          "args": ["wait", "${secondary_studio_pid}", "${foreground_watch_ready}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["event watcher is ready"]
-        },
-        {
-          "name": "stop-focus-regression-playtest",
-          "kind": "mcp",
-          "tool": "solo_playtest",
-          "arguments": {"action": "stop", "instance_id": "${studio_instance}", "timeout": 15},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "verify-focus-regression-playtest-ended",
-          "kind": "mcp",
-          "tool": "solo_playtest",
-          "arguments": {"action": "status", "instance_id": "${studio_instance}"},
-          "timeout_seconds": 30,
-          "checks": [
-            {"pointer": "/success", "op": "equals", "value": true},
-            {"pointer": "/running", "op": "equals", "value": false}
-          ]
-        },
-        {
-          "name": "complete-foreground-event-watch",
-          "kind": "command",
-          "program": "${repo}/qualification/scripts/studio-foreground",
-          "args": ["signal", "${secondary_studio_pid}", "${foreground_watch_done}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["completion signaled"]
-        },
-        {
-          "name": "foreground-event-watch-passed",
-          "kind": "wait_process",
-          "process": "studio-foreground-event-watch",
-          "timeout_seconds": 5,
-          "expected_exit_codes": [0]
-        },
-        {
-          "name": "end-test-does-not-focus-managed-studio",
-          "kind": "command",
-          "program": "${repo}/qualification/scripts/studio-foreground",
-          "args": ["assert-not", "${studio_pid}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["does not own the foreground"]
-        },
-        {
-          "name": "close-secondary-studio",
-          "kind": "mcp",
-          "tool": "manage_instance",
-          "arguments": {"action": "close", "launch_id": "${secondary_studio_launch}"},
-          "timeout_seconds": 30
-        }
-      ],
-      "cleanup": [
-        {
-          "name": "restore-qualified-manifest",
-          "kind": "command",
-          "program": "${repo}/qualification/scripts/trigger-manifest-reload",
-          "args": ["restore", "${project}", "${manifest_reload_backup}"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stdout_contains": ["manifest restore"]
-        },
-        {
-          "name": "stop-residual-foreground-event-watch",
-          "kind": "terminate_process",
-          "process": "studio-foreground-event-watch"
-        },
-        {
-          "name": "close-residual-secondary-studio",
-          "kind": "mcp",
-          "tool": "manage_instance",
-          "arguments": {"action": "close", "launch_id": "${secondary_studio_launch}"},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "final-runtime-log-gate",
-          "kind": "mcp",
-          "tool": "get_runtime_logs",
-          "arguments": {"instance_id": "${studio_instance}", "target": "edit"},
-          "timeout_seconds": 30
-        },
-        {
-          "name": "stop-managed-serve-and-studio",
-          "kind": "command",
-          "program": "${carbon}",
-          "args": ["stop", "--port", "${port}", "--color", "never"],
-          "cwd": "${repo}",
-          "timeout_seconds": 30,
-          "stderr_contains": ["Capture Manifest completed", "Carbon stopped successfully"]
-        },
-        {
-          "name": "managed-serve-and-studio-exited-cleanly",
-          "kind": "wait_process",
-          "process": "carbon-serve",
-          "timeout_seconds": 30,
-          "expected_exit_codes": [0]
-        },
-        {
-          "name": "verify-mcp-managed-studio-closed",
-          "kind": "mcp",
-          "tool": "manage_instance",
-          "arguments": {"action": "status", "launch_id": "${studio_launch}"},
-          "timeout_seconds": 30,
-          "checks": [
-            {"pointer": "/managed", "op": "equals", "value": true},
-            {"pointer": "/process_running", "op": "equals", "value": false},
-            {"pointer": "/state", "op": "equals", "value": "exited"}
-          ]
-        },
-        {
-          "name": "final-rml-crash-gate",
-          "kind": "assert_no_crash",
-          "watcher": "rml"
-        },
-        {
-          "name": "terminate-residual-serve-process",
-          "kind": "terminate_process",
-          "process": "carbon-serve"
-        }
+          "stdout_contains": ["CarbonAutoRecoveryProbe"]
+		},
+		{
+		  "name": "verify-rebuilt-capture-state",
+		  "kind": "assert_place_instance",
+		  "path": "${capture_rebuild_output}",
+		  "instance_path": ["Workspace", "CarbonAutoRecoveryProbe"],
+		  "class": "Part",
+		  "properties": {
+		    "Anchored": true,
+		    "Size": [7, 3, 5]
+		  },
+		  "attributes": {
+		    "CapturedThroughAutoRecovery": true
+		  }
+		}
       ]
     }
   ]

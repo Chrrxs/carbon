@@ -112,7 +112,7 @@ receipt="$(realpath "$receipt")"
 verify_change_receipt "$receipt" "$tree_fingerprint" ||
 	die "invalid or incomplete qualification receipt: $receipt"
 
-source_fingerprint="$(release_source_fingerprint "$REPO" Cargo.toml Cargo.lock cli rml studio-plugin qualification scripts)"
+source_fingerprint="$(release_source_fingerprint "$REPO" Cargo.toml Cargo.lock cli studio-plugin qualification scripts)"
 [[ "$source_fingerprint" == "$(jq -er '.source_fingerprint.sha256' "$receipt")" ]] ||
 	die "release sources changed after qualification"
 candidate="$(jq -er '.candidate.path' "$receipt")"

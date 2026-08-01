@@ -17,7 +17,6 @@ mod init;
 mod merge_artifact;
 mod migrate;
 mod resolve;
-mod rml;
 mod serve;
 mod sourcemap;
 mod stop;
@@ -147,7 +146,10 @@ impl Cli {
 				util::init_reflection()?;
 				command.main()
 			}
-			Commands::Capture(command) => command.main(),
+			Commands::Capture(command) => {
+				util::init_reflection()?;
+				command.main()
+			}
 			Commands::Serve(command) => {
 				util::init_reflection()?;
 				command.main()
@@ -164,7 +166,6 @@ impl Cli {
 				command.main()
 			}
 			Commands::Config(command) => command.main(),
-			Commands::Rml(command) => command.main(),
 		}
 	}
 }
@@ -185,7 +186,6 @@ pub enum Commands {
 	Focus(focus::Focus),
 	Sourcemap(sourcemap::Sourcemap),
 	Config(config::Config),
-	Rml(rml::Rml),
 }
 
 #[cfg(test)]
@@ -194,21 +194,16 @@ mod tests {
 	use clap::CommandFactory;
 
 	#[test]
-	fn public_cli_excludes_debug_exec_and_describes_rml() {
+	fn public_cli_excludes_internal_debug_commands() {
 		let command = Cli::command();
 		assert!(command.find_subcommand("debug").is_none());
 		assert!(command.find_subcommand("exec").is_none());
-
-		let rml = command.find_subcommand("rml").expect("rml command");
-		assert_eq!(
-			rml.get_about().map(|about| about.to_string()).as_deref(),
-			Some("Inspect or install the RobloxModLoader bootstrap used by Carbon")
-		);
+		assert!(command.find_subcommand("rml").is_none());
 	}
 
 	#[test]
 	fn serve_and_capture_are_separate_entrypoints() {
-		let cli = Cli::try_parse_from(["carbon", "capture", "--port", "8000"]).unwrap();
+		let cli = Cli::try_parse_from(["carbon", "capture", "game.carbon.json", "saved.rbxl"]).unwrap();
 		assert!(matches!(cli.command, Commands::Capture(_)));
 		assert!(matches!(
 			Cli::try_parse_from(["carbon", "serve", "game.carbon.json"])

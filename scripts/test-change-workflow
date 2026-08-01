@@ -86,7 +86,6 @@ printf '%s\n' '#!/usr/bin/env bash' 'exit 23' > "${quality_repo}/scripts/lib/qua
 chmod +x "${quality_repo}/scripts/lib/qualify-tree"
 for workflow_test in \
 	test-build-optimization \
-	test-rml-build-optimization \
 	test-release-installer \
 	test-release-workflow \
 	test-public-readiness \
@@ -156,8 +155,6 @@ write_receipt() {
 	printf 'candidate\n' > "${evidence}/carbon"
 	printf 'qualifier\n' > "${evidence}/carbon-qualify"
 	printf 'plugin\n' > "${evidence}/Carbon.rbxm"
-	mkdir -p "${evidence}/rml"
-	printf 'rml\n' > "${evidence}/rml/runtime.dll"
 	printf '{"outcome":"pass"}\n' > "${evidence}/report.json"
 	printf '{"suite":"test"}\n' > "${evidence}/suite.json"
 	for phase in "${CHANGE_REQUIRED_PHASES[@]}"; do
@@ -180,8 +177,6 @@ write_receipt() {
 		--arg qualifier_sha256 "$(sha256sum "${evidence}/carbon-qualify" | cut -d ' ' -f 1)" \
 		--arg plugin_path "${evidence}/Carbon.rbxm" \
 		--arg plugin_sha256 "$(sha256sum "${evidence}/Carbon.rbxm" | cut -d ' ' -f 1)" \
-		--arg rml_path "${evidence}/rml" \
-		--arg rml_sha256 "$(fingerprint_tree "${evidence}/rml" .)" \
 		--arg report_path "${evidence}/report.json" \
 		--arg report_sha256 "$(sha256sum "${evidence}/report.json" | cut -d ' ' -f 1)" \
 		--arg red_path "${evidence}/red.log" \
@@ -202,8 +197,7 @@ write_receipt() {
 					qualification_runner_path: $qualifier_path,
 					qualification_runner_sha256: $qualifier_sha256
 				},
-				studio_plugin: {source_path: "studio-plugin", artifact_path: $plugin_path, artifact_sha256: $plugin_sha256},
-				rml: {artifact_path: $rml_path, artifact_sha256: $rml_sha256, artifact_file_count: 1}
+				studio_plugin: {source_path: "studio-plugin", artifact_path: $plugin_path, artifact_sha256: $plugin_sha256}
 			},
 			report: {path: $report_path, sha256: $report_sha256},
 			workflow: {

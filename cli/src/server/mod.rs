@@ -24,7 +24,6 @@ mod details;
 mod diagnostics;
 mod exec;
 mod home;
-pub(crate) mod privileged;
 mod read;
 mod reflection;
 mod snapshot;
@@ -156,6 +155,7 @@ pub fn serve_control_channel() -> (ServeControlSender, crossbeam_channel::Receiv
 #[derive(Debug, Clone, Serialize, FromOne)]
 pub enum Message {
 	SyncChanges(SyncChanges),
+	SyncDetails(crate::source::SourceDetails),
 	RestartRequired(RestartRequired),
 	ExecuteCode(ExecuteCode),
 	Disconnect(Disconnect),
@@ -374,33 +374,14 @@ impl Server {
 				.service(snapshot::page)
 				.service(snapshot::source_page)
 				.service(capture::initiate)
+				.service(capture::automatic)
 				.service(capture::get_status)
 				.service(capture::cancel)
 				.service(diagnostics::warnings)
-				.service(diagnostics::export_place)
 				.service(read::main)
 				.service(exec::main)
 				.service(stop::main)
 				.service(home::main)
-				.service(privileged::capabilities)
-				.service(privileged::attach_managed_hierarchy)
-				.service(privileged::bootstrap_manifest_identities)
-				.service(privileged::resolve_managed_identities)
-				.service(privileged::poll_managed_identities)
-				.service(privileged::read_property)
-				.service(privileged::read_properties)
-				.service(privileged::read_references)
-				.service(privileged::read_default_properties)
-				.service(privileged::write_property)
-				.service(privileged::write_reference)
-				.service(privileged::copy_property)
-				.service(privileged::materialize_property)
-				.service(privileged::write_materialized_property)
-				.service(privileged::create_instance)
-				.service(privileged::roots)
-				.service(privileged::root_snapshots)
-				.service(privileged::apply_hidden_roots)
-				.service(privileged::changes)
 				.default_service(web::to(Self::default_redirect))
 		})
 		.backlog(0)

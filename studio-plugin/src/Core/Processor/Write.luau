@@ -74,18 +74,14 @@ function WriteProcessor:createInstance(
 
 	if Dom.isCreatable(snapshot.class) then
 		local createSuccess, created = pcall(Instance.new, snapshot.class)
-		instance = if createSuccess then created else Dom.createPrivileged(snapshot.class, parent, snapshot.name)
+		instance = if createSuccess then created else nil
 	elseif parent == game then
 		local serviceSuccess, service = pcall(game.FindFirstChildOfClass, game, snapshot.class)
 
 		if serviceSuccess and service then
 			instance = service
 			isService = true
-		else
-			instance = Dom.createPrivileged(snapshot.class, parent, snapshot.name)
 		end
-	else
-		instance = Dom.createPrivileged(snapshot.class, parent, snapshot.name)
 	end
 
 	if not instance then
@@ -183,11 +179,7 @@ function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: bo
 
 		if Dom.isCreatable(snapshot.class) then
 			local createSuccess, created = pcall(Instance.new, snapshot.class)
-			newInstance = if createSuccess
-				then created
-				else Dom.createPrivileged(snapshot.class, instance.Parent, instance.Name)
-		else
-			newInstance = Dom.createPrivileged(snapshot.class, instance.Parent, instance.Name)
+			newInstance = if createSuccess then created else nil
 		end
 		if not newInstance then
 			error(Error.new(Error.NotCreatable, snapshot.class))
@@ -210,20 +202,6 @@ function WriteProcessor:applyUpdate(snapshot: Types.UpdatedSnapshot, initial: bo
 				error(Error.new(Error.WriteFailed, property, newInstance, reason.kind))
 			end
 		end
-		for _, descriptor in Dom.getPrivilegedSerializedProperties(newInstance.ClassName) do
-			if defaultProperties[descriptor.name] ~= nil then
-				continue
-			end
-			local readSuccess, instanceValue = Dom.readProperty(instance, descriptor.name)
-			if not readSuccess then
-				error(Error.new(Error.ReadFailed, descriptor.name, instance, instanceValue.kind))
-			end
-			local writeSuccess, reason = Dom.writeProperty(newInstance, descriptor.name, instanceValue)
-			if not writeSuccess then
-				error(Error.new(Error.WriteFailed, descriptor.name, newInstance, reason.kind))
-			end
-		end
-
 		for _, child in instance:GetChildren() do
 			child.Parent = newInstance
 		end

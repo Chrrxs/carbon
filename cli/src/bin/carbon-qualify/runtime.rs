@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, HashMap},
 	fs::{self, File},
 	io::{Read, Write},
 	path::{Path, PathBuf},
@@ -50,15 +50,6 @@ pub enum RuntimeAction {
 		artifact_stem: String,
 	},
 	Sleep(Duration),
-	StartCrashWatch {
-		watcher: String,
-		crash_dir: PathBuf,
-		rml_log_dir: PathBuf,
-	},
-	AssertNoCrash {
-		watcher: String,
-		artifact_stem: String,
-	},
 }
 
 #[derive(Clone, Debug)]
@@ -84,10 +75,6 @@ pub enum Observation {
 		artifacts: Vec<String>,
 	},
 	Slept,
-	CrashWatch {
-		watcher: String,
-		artifacts: Vec<String>,
-	},
 }
 
 pub trait RuntimeAdapter {
@@ -100,17 +87,10 @@ struct BackgroundProcess {
 	stderr_path: PathBuf,
 }
 
-struct CrashWatch {
-	crash_dir: PathBuf,
-	rml_log_dir: PathBuf,
-	baseline: BTreeSet<PathBuf>,
-}
-
 pub struct RealRuntime {
 	artifact_dir: PathBuf,
 	mcp: McpClient,
 	processes: HashMap<String, BackgroundProcess>,
-	crash_watchers: HashMap<String, CrashWatch>,
 }
 
 impl RealRuntime {
@@ -121,7 +101,6 @@ impl RealRuntime {
 			mcp: McpClient::new(mcp_url, artifact_dir.clone())?,
 			artifact_dir,
 			processes: HashMap::new(),
-			crash_watchers: HashMap::new(),
 		})
 	}
 
@@ -260,73 +239,6 @@ impl RealRuntime {
 	fn artifact_path(&self, stem: &str, suffix: &str) -> PathBuf {
 		self.artifact_dir.join(format!("{}-{suffix}", sanitize(stem)))
 	}
-
-	fn start_crash_watch(&mut self, watcher: String, crash_dir: PathBuf, rml_log_dir: PathBuf) -> Result<Observation> {
-		ensure!(
-			!self.crash_watchers.contains_key(&watcher),
-			"crash watcher {watcher:?} is already registered"
-		);
-		ensure!(
-			crash_dir.is_dir(),
-			"crash watcher directory does not exist: {}",
-			crash_dir.display()
-		);
-		ensure!(
-			rml_log_dir.is_dir(),
-			"RML log directory does not exist: {}",
-			rml_log_dir.display()
-		);
-		let baseline = crash_dumps(&crash_dir)?;
-		self.crash_watchers.insert(
-			watcher.clone(),
-			CrashWatch {
-				crash_dir,
-				rml_log_dir,
-				baseline,
-			},
-		);
-		Ok(Observation::CrashWatch {
-			watcher,
-			artifacts: Vec::new(),
-		})
-	}
-
-	fn assert_no_crash(&self, watcher: &str, artifact_stem: &str) -> Result<Observation> {
-		let watch = self
-			.crash_watchers
-			.get(watcher)
-			.with_context(|| format!("crash watcher {watcher:?} is not registered"))?;
-		let current = crash_dumps(&watch.crash_dir)?;
-		let new = current.difference(&watch.baseline).cloned().collect::<Vec<_>>();
-		if new.is_empty() {
-			return Ok(Observation::CrashWatch {
-				watcher: watcher.to_owned(),
-				artifacts: Vec::new(),
-			});
-		}
-		let dump = new
-			.into_iter()
-			.max_by_key(|path| modified_key(path))
-			.expect("new crash dump list was non-empty");
-		let rml_log = latest_file_recursive(&watch.rml_log_dir, "log")?;
-		let reason = rml_log
-			.as_deref()
-			.map(crash_reason_lines)
-			.transpose()?
-			.unwrap_or_default();
-		let diagnostic = json!({
-			"dump": display_path(&dump),
-			"dump_bytes": fs::metadata(&dump).map(|metadata| metadata.len()).unwrap_or_default(),
-			"rml_log": rml_log.as_deref().map(display_path),
-			"reason": reason,
-		});
-		let path = self.artifact_path(artifact_stem, "rml-crash.json");
-		fs::write(&path, serde_json::to_vec_pretty(&diagnostic)?)?;
-		bail!(
-			"RobloxModLoader crashed during qualification; evidence: {} ({diagnostic})",
-			path.display()
-		)
-	}
 }
 
 impl RuntimeAdapter for RealRuntime {
@@ -356,12 +268,6 @@ impl RuntimeAdapter for RealRuntime {
 				thread::sleep(duration);
 				Ok(Observation::Slept)
 			}
-			RuntimeAction::StartCrashWatch {
-				watcher,
-				crash_dir,
-				rml_log_dir,
-			} => self.start_crash_watch(watcher, crash_dir, rml_log_dir),
-			RuntimeAction::AssertNoCrash { watcher, artifact_stem } => self.assert_no_crash(&watcher, &artifact_stem),
 		}
 	}
 }
@@ -579,65 +485,6 @@ fn load_auth_token() -> Option<String> {
 		.filter(|token| !token.is_empty())
 }
 
-fn crash_dumps(directory: &Path) -> Result<BTreeSet<PathBuf>> {
-	fs::read_dir(directory)?
-		.filter_map(|entry| match entry {
-			Ok(entry) if entry.path().extension().and_then(|value| value.to_str()) == Some("dmp") => {
-				Some(Ok(entry.path()))
-			}
-			Ok(_) => None,
-			Err(error) => Some(Err(error.into())),
-		})
-		.collect()
-}
-
-fn latest_file_recursive(root: &Path, extension: &str) -> Result<Option<PathBuf>> {
-	let mut latest: Option<PathBuf> = None;
-	let mut pending = vec![root.to_owned()];
-	while let Some(directory) = pending.pop() {
-		for entry in fs::read_dir(directory)? {
-			let path = entry?.path();
-			if path.is_dir() {
-				pending.push(path);
-			} else if path.extension().and_then(|value| value.to_str()) == Some(extension)
-				&& latest
-					.as_ref()
-					.is_none_or(|current| modified_key(&path) > modified_key(current))
-			{
-				latest = Some(path);
-			}
-		}
-	}
-	Ok(latest)
-}
-
-fn modified_key(path: &Path) -> std::time::SystemTime {
-	fs::metadata(path)
-		.and_then(|metadata| metadata.modified())
-		.unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-}
-
-fn crash_reason_lines(path: &Path) -> Result<Vec<String>> {
-	const MARKERS: &[&str] = &[
-		"CRITICAL EXCEPTION DETECTED",
-		"Exception Code:",
-		"Exception Address:",
-		"Exception Module:",
-		"Exception Rebased Address:",
-		"[Stack Frame",
-		"Stack Chain:",
-	];
-	let text = fs::read_to_string(path)
-		.unwrap_or_else(|_| String::from_utf8_lossy(&fs::read(path).unwrap_or_default()).into_owned());
-	let lines = text.lines().rev().take(500).collect::<Vec<_>>();
-	Ok(lines
-		.into_iter()
-		.rev()
-		.filter(|line| MARKERS.iter().any(|marker| line.contains(marker)))
-		.map(str::to_owned)
-		.collect())
-}
-
 #[cfg(test)]
 pub struct ScriptedRuntime {
 	responses: std::collections::VecDeque<Result<Observation>>,
@@ -673,48 +520,6 @@ mod tests {
 		let path = std::env::temp_dir().join(format!("carbon-qualify-{label}-{}", uuid::Uuid::new_v4()));
 		fs::create_dir_all(&path).unwrap();
 		path
-	}
-
-	#[test]
-	fn crash_watch_ignores_baseline_and_reports_new_dump_with_log_evidence() {
-		let root = temporary_directory("crash-watch");
-		let artifacts = root.join("artifacts");
-		let crashes = root.join("crashes");
-		let logs = root.join("logs/version-test");
-		fs::create_dir_all(&crashes).unwrap();
-		fs::create_dir_all(&logs).unwrap();
-		fs::write(crashes.join("old.dmp"), b"old").unwrap();
-		let mut runtime = RealRuntime::new(artifacts.clone(), "http://127.0.0.1:58741").unwrap();
-		runtime
-			.execute(RuntimeAction::StartCrashWatch {
-				watcher: "rml".into(),
-				crash_dir: crashes.clone(),
-				rml_log_dir: root.join("logs"),
-			})
-			.unwrap();
-		runtime
-			.execute(RuntimeAction::AssertNoCrash {
-				watcher: "rml".into(),
-				artifact_stem: "before".into(),
-			})
-			.unwrap();
-		fs::write(crashes.join("new.dmp"), b"new").unwrap();
-		fs::write(
-			logs.join("roblox_modloader.log"),
-			"Exception Code: 0xC0000005\nException Module: CarbonBridge.dll\n[Stack Frame 0] Capture\n",
-		)
-		.unwrap();
-		let error = runtime
-			.execute(RuntimeAction::AssertNoCrash {
-				watcher: "rml".into(),
-				artifact_stem: "after".into(),
-			})
-			.unwrap_err()
-			.to_string();
-		assert!(error.contains("0xC0000005"));
-		assert!(error.contains("CarbonBridge.dll"));
-		assert!(artifacts.join("after-rml-crash.json").is_file());
-		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]

@@ -46,10 +46,10 @@ carbon focus 'anon:550e8400-e29b-41d4-a716-446655440000'
 carbon focus --port 8000
 carbon focus --worktree . --restore
 
-# Capture Studio-owned state using the instance ID printed by `serve`.
-carbon capture 'anon:550e8400-e29b-41d4-a716-446655440000'
+# Import a manually saved binary place directly into a project.
+carbon capture game.carbon.json manually-saved.rbxl
 
-# Capture, then stop the server and its managed Studio process.
+# Wait for the next auto-recovery capture, then stop serve and Studio.
 carbon stop 'anon:550e8400-e29b-41d4-a716-446655440000'
 
 # Compare binary parity.
@@ -73,23 +73,13 @@ the same worktree, select it by instance ID or port instead. Serve sessions
 started by an older Carbon version must be restarted once so their Studio
 process and worktree identity are registered.
 
-When `robloxstudio-mcp` owns the Studio lifecycle, the connected message prints
-the instance ID reported by `manage_instance`; pass that ID to `carbon capture`
-or `carbon stop`. Both commands also accept `--port` for explicit endpoint
-selection. During startup, `serve` reports managed-place building, Studio
-launch, and connection waiting separately. The waiting message omits the ID
-until Studio has connected and MCP has assigned it. In automatic lifecycle
-mode, including on Linux/WSL, Carbon delegates launch ownership to a compatible
-broker. The broker's process-identity launch remains suspended until Carbon has
-prepared exact-process RML injection and sends authorization, then retains
-ownership until Carbon attests the injected runtime and completes the launch.
-Carbon uses direct launch when no compatible broker is available or when it can
-prove a selected broker failed before dispatch. If a broker request may have
-been dispatched, Carbon withholds direct fallback to avoid a duplicate or
-unowned Studio process and reports the broker endpoint, failure stage, complete
-cause chain, and recovery command. After inspecting or restarting the broker,
-explicitly select direct lifecycle for a subsequent attempt with
-`CARBON_STUDIO_LIFECYCLE=direct carbon serve`.
+The connected message prints the instance ID for the managed Studio session.
+Pass that ID to `carbon stop`; `stop` also accepts `--port` for explicit
+endpoint selection. `carbon capture` instead takes a project and a saved
+`.rbxl` and never contacts the serve endpoint. During startup, `serve` reports
+managed-place building, Studio launch, and connection waiting separately.
+Carbon launches Studio as an ordinary process and keeps its process identity so
+focus and stop operations target only that managed session.
 
 Project-file changes reload automatically in the existing `serve` process.
 Carbon first captures authored Studio state, then reconnects the plugin to the
@@ -115,17 +105,36 @@ mergeability are.
 
 ## Capture behavior
 
-Capture acquires a fresh native hierarchy and reference lease, validates a
-complete sequence of bounded chunks, and promotes the Studio artifact and any
-new mapped identity metadata atomically. A failed or blocked capture preserves
-the previous canonical state.
+After the plugin finishes its initial mapping reconciliation, `carbon serve`
+continuously waits for new Studio auto-recovery files. Each stable binary
+recovery is verified against the exact served project, worktree, and Studio
+session, its filesystem-authoritative mapped roots are restored, and the new
+Studio artifact is promoted atomically. Carbon immediately starts waiting for
+the following recovery after a successful commit.
+
+`carbon capture game.carbon.json manually-saved.rbxl` is the explicit offline
+path. It validates and commits that existing binary place immediately without
+requiring an instance ID, port, running server, or connected Studio. The
+place's embedded Carbon project identity must match the explicit project.
+
+Studio auto-recovery must be enabled. On Windows Carbon watches
+`%LOCALAPPDATA%\Roblox\RobloxStudio\AutoSaves`; from WSL it watches the same
+Windows directory through `wslpath`. Tests and custom environments may set
+`CARBON_STUDIO_AUTOSAVES_DIR` to an explicit directory. Only new or changed
+`.rbxl` files created after the active automatic wait began are eligible. Each
+wait is bounded to six minutes and then restarts while the serve session remains
+connected. A failed, cancelled, or timed-out attempt preserves the previous
+canonical state.
 
 Carbon blocks capture when persistent state cannot be represented safely,
 including scripts outside mappings and mapped-owned references to Studio-owned
 objects. Studio-owned references may target stable mapped identities.
 
-Closing or disconnecting Studio does not capture. `carbon stop` deliberately
-captures before ending the served session.
+`carbon stop` races the next eligible auto-recovery against a manual save over
+the temporary `carbon-serve-*.rbxl` launch place, then ends the served session
+and its managed Studio process as soon as either verified file arrives.
+Pressing Ctrl+C in the `carbon serve` terminal follows the same default
+shutdown path. A second Ctrl+C forces cleanup.
 
 ## Semantic Git merges
 
@@ -155,12 +164,11 @@ Decisions can take the base, current, or incoming value, set a typed property
 value, or remove an eligible property or metadata value. Carbon validates and
 stages the result but leaves the final Git operation to the user.
 
-## Embedded Studio components
+## Embedded Studio component
 
-Release executables embed their matching Studio plugin and RML package. Before
-launching Studio, Carbon verifies those bytes, replaces a missing or outdated
-plugin, and materializes RML without replacing unrelated mods or user
-configuration.
+Release executables embed their matching Studio plugin. Before launching
+Studio, Carbon verifies those bytes and replaces a missing or outdated plugin.
+No native mod-loader, DLL injection, or Studio binary manipulation is used.
 
 The full installed-stack qualification and release contract is documented in
 [`qualification/README.md`](qualification/README.md).

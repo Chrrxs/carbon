@@ -2,7 +2,7 @@
 
 Filesystem-authoritative Roblox development with explicit place capture.
 
-The Carbon Studio plugin connects one Studio session to an `carbon serve` process. It live-syncs only the Folder/script mappings established when the server started. Studio-owned state outside mappings is never synchronized continuously; the user saves it explicitly with **Capture Manifest**.
+The Carbon Studio plugin connects one Studio session to a `carbon serve` process. It live-syncs only the Folder/script mappings established when the server started. After reconciliation, Studio-owned state outside mappings is captured continuously from Studio auto-recovery saves.
 
 The plugin requires a matching Carbon CLI build. Release CLIs embed that exact plugin and automatically install it before `carbon serve` or `carbon studio` launches Studio, replacing a missing or byte-different local copy.
 
@@ -30,33 +30,32 @@ Mapped source is one-way and filesystem-authoritative:
 - Studio drift beneath a mapping never writes back and is overwritten by the next valid filesystem update;
 - that reconciliation removes invalid Studio-only descendants and reports each removal explicitly;
 - invalid mapped source leaves the last valid realization active; and
-- a project-file change reconnects automatically, applies the replacement mapping topology, and is acknowledged only after a transition-bound full capture proves it.
+- a project-file change reconnects automatically, applies the replacement mapping topology, and is acknowledged only after a transition-bound recovery capture proves it.
 
 The plugin does not write Studio changes into mapped files or project mappings.
 
 ## Capture Manifest
 
-**Capture Manifest** invokes the same server operation as:
+`serve` continuously waits for the next Studio auto-recovery save and atomically commits each verified result. **Capture Manifest** waits for the currently active automatic capture cycle and displays its progress.
+
+To import a place saved manually through Studio's **File > Save to File** command, use:
 
 ```sh
-carbon capture --port 8000
+carbon capture game.carbon.json manually-saved.rbxl
 ```
 
-Capture performs a fresh full native RML scan only on demand, reports progress, supports cancellation, and transfers full chunks whenever equality with the prior manifest cannot be proven. The plugin only requests the operation and displays its status; it never traverses the place, records manifest changes, or constructs capture payloads. Capture validates that mapped state still matches the served generation and blocks:
+Automatic capture verifies the exact project, worktree, and Studio session. Offline manual capture verifies the embedded project identity against the explicit project argument. Both validate that mapped state remains filesystem-authoritative and block:
 
 - scripts outside mappings;
 - mapped-owned instance references targeting manifest-owned state;
 - ambiguous manifest identity reconciliation; and
 - persistent state Carbon cannot represent safely.
 
-Manifest-owned `Ref` properties may target any mapped instance. Capture atomically persists a missing mapped target ID in directory `meta.json` or project `$id` together with the manifest; this identity-only write is not Studio syncback. Capture never writes other mapped state or changes ownership topology. Disconnect, Studio close, and Ctrl-C do not capture automatically; `carbon stop` deliberately captures before ending the served session.
+Manifest-owned `Ref` properties may target any mapped instance. Capture restores filesystem-authoritative mapped roots before committing the Studio-owned complement, so Studio drift beneath a mapping never writes back to source. `carbon stop` and the first Ctrl+C in the serve terminal both wait for the next auto-recovery or a manual save over the temporary served `.rbxl`, whichever arrives first.
 
-## Privileged serialized properties
-
-With the monorepo RML build and `Carbon.RmlBridge`, the CLI can broker serialized properties that ordinary Studio APIs cannot read during explicit capture. The bridge is authenticated and bound to the exact Studio process; its bearer token is never disclosed to the plugin. Missing or incompatible elevation leaves the safe reflection path active and turns unreadable persistent authored state into an actionable capture blocker.
+Studio auto-recovery must be enabled. Carbon launches Studio normally and does not inject native code or modify Studio binaries.
 
 ## Links
 
 - [Carbon CLI and project documentation](https://github.com/Chrrxs/carbon)
 - [Carbon Studio plugin source](.)
-- [Carbon RML bridge source](../rml/code/dotnet/CarbonBridge)
