@@ -234,7 +234,7 @@ impl ShutdownCoordinator {
 	}
 }
 
-const SHUTDOWN_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const AUTOMATIC_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MANIFEST_CAPTURE_MAX_ATTEMPTS: usize = 3;
 const MANIFEST_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const PROJECT_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -261,7 +261,7 @@ where
 	}
 }
 
-pub(crate) fn wait_for_shutdown_capture<Begin, Poll, Wait>(
+pub(crate) fn wait_for_automatic_capture<Begin, Poll, Wait>(
 	begin: Begin,
 	mut poll: Poll,
 	mut wait: Wait,
@@ -271,14 +271,14 @@ where
 	Poll: FnMut(&str) -> Result<ManifestCaptureStatus>,
 	Wait: FnMut(),
 {
-	let mut status = begin().context("failed to start automatic Capture Manifest before shutdown")?;
+	let mut status = begin().context("failed to start automatic Capture Manifest before transition")?;
 	let request_id = status.request_id.clone();
 	loop {
 		if let Some(message) = status.terminal_result()? {
 			return Ok(message);
 		}
 		wait();
-		status = poll(&request_id).context("failed to monitor automatic Capture Manifest before shutdown")?;
+		status = poll(&request_id).context("failed to monitor automatic Capture Manifest before transition")?;
 	}
 }
 
@@ -452,7 +452,6 @@ mod manifest_capture_retry_tests {
 		.unwrap_err();
 		assert!(error.downcast_ref::<project::ProjectSynchronizationPending>().is_some());
 		assert_eq!(waits.get(), 1);
-
 	}
 
 	#[test]
@@ -475,6 +474,30 @@ mod manifest_capture_retry_tests {
 		assert_eq!(status.state, "running");
 
 		assert!(joinable_manifest_capture_status(&operation(false)).is_none());
+	}
+
+	#[test]
+	fn reload_capture_does_not_reuse_a_terminal_shutdown_result() {
+		let directory = std::env::temp_dir().join(format!("carbon-reload-capture-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&directory).unwrap();
+		let manifest_path = directory.join("place.carbon");
+		let tree = tree::Tree::new(
+			snapshot::Snapshot::new()
+				.with_id(rbx_dom_weak::types::Ref::new())
+				.with_class("DataModel")
+				.with_name("ReloadCapture"),
+		);
+		artifact_store::extract_tree(&tree, "ReloadCapture".to_owned(), &manifest_path).unwrap();
+		let core = Arc::new(Core::new_artifact(&manifest_path).unwrap());
+
+		let terminal = core.capture_before_shutdown().unwrap();
+		assert!(terminal.contains("Studio is disconnected"));
+		std::fs::remove_file(&manifest_path).unwrap();
+		assert_eq!(core.capture_before_shutdown().unwrap(), terminal);
+
+		let error = core.capture_before_reload().unwrap_err();
+		assert!(format!("{error:#}").contains("active served project"), "{error:#}");
+		std::fs::remove_dir_all(directory).unwrap();
 	}
 }
 
@@ -953,22 +976,26 @@ impl Core {
 
 	pub fn capture_before_shutdown(self: &Arc<Self>) -> Result<String> {
 		self.shutdown_coordinator
-			.execute_or_await(|| self.do_capture_before_shutdown())
+			.execute_or_await(|| self.do_automatic_capture())
 	}
 
-	fn do_capture_before_shutdown(self: &Arc<Self>) -> Result<String> {
-		let capture_result = wait_for_shutdown_capture(
+	pub fn capture_before_reload(self: &Arc<Self>) -> Result<String> {
+		self.do_automatic_capture()
+	}
+
+	fn do_automatic_capture(self: &Arc<Self>) -> Result<String> {
+		let capture_result = wait_for_automatic_capture(
 			|| {
 				let status = self.begin_manifest_capture_mode_internal(false, true, None)?;
 				crate::carbon_info!(
-					"Automatic shutdown is waiting for Capture Manifest {} for served generation {}",
+					"Automatic transition is waiting for Capture Manifest {} for served generation {}",
 					status.request_id,
 					status.source_generation
 				);
 				Ok(status)
 			},
 			|request_id| self.manifest_capture_status(request_id),
-			|| thread::sleep(SHUTDOWN_CAPTURE_POLL_INTERVAL),
+			|| thread::sleep(AUTOMATIC_CAPTURE_POLL_INTERVAL),
 		);
 
 		match capture_result {

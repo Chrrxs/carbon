@@ -11,25 +11,19 @@ use crate::{
 	server::{StopHandle, StopRequested},
 };
 
-const DISCONNECTED_STOP_MESSAGE: &str = "Studio disconnected; latest committed manifest retained";
 const PENDING_RELOAD_STOP_MESSAGE: &str = "Synchronization reload incomplete; latest committed manifest retained";
 
-fn settle_stop<Pending, Connected, Capture>(pending: Pending, connected: Connected, capture: Capture) -> Result<String>
+fn settle_stop<Pending, Capture>(pending: Pending, capture: Capture) -> Result<String>
 where
 	Pending: Fn() -> bool,
-	Connected: Fn() -> bool,
 	Capture: FnOnce() -> Result<String>,
 {
 	if pending() {
 		return Ok(PENDING_RELOAD_STOP_MESSAGE.to_owned());
 	}
-	if !connected() {
-		return Ok(DISCONNECTED_STOP_MESSAGE.to_owned());
-	}
 	match capture() {
 		Ok(message) => Ok(message),
 		Err(_) if pending() => Ok(PENDING_RELOAD_STOP_MESSAGE.to_owned()),
-		Err(_) if !connected() => Ok(DISCONNECTED_STOP_MESSAGE.to_owned()),
 		Err(error) => Err(error),
 	}
 }
@@ -51,7 +45,6 @@ async fn main(
 	let capture = actix_web::rt::task::spawn_blocking(move || {
 		settle_stop(
 			|| shutdown_core.has_pending_managed_reload(),
-			|| shutdown_core.queue().has_subscribers(),
 			|| shutdown_core.capture_before_shutdown(),
 		)
 	})
@@ -89,13 +82,11 @@ async fn main(
 mod tests {
 	use super::*;
 	use std::cell::Cell;
-
 	#[test]
 	fn stop_waits_for_capture() {
 		let capture_calls = Cell::new(0);
 		let message = settle_stop(
 			|| false,
-			|| true,
 			|| {
 				capture_calls.set(capture_calls.get() + 1);
 				Ok("Studio artifact committed".to_owned())
@@ -112,7 +103,6 @@ mod tests {
 		let capture_calls = Cell::new(0);
 		let error = settle_stop(
 			|| false,
-			|| true,
 			|| {
 				capture_calls.set(capture_calls.get() + 1);
 				anyhow::bail!("capture failed")
@@ -122,40 +112,6 @@ mod tests {
 
 		assert_eq!(error.to_string(), "capture failed");
 		assert_eq!(capture_calls.get(), 1);
-	}
-
-	#[test]
-	fn stop_retains_the_latest_capture_when_studio_is_already_disconnected() {
-		let capture_calls = Cell::new(0);
-		let message = settle_stop(
-			|| false,
-			|| false,
-			|| {
-				capture_calls.set(capture_calls.get() + 1);
-				anyhow::bail!("capture must not run")
-			},
-		)
-		.unwrap();
-
-		assert_eq!(message, "Studio disconnected; latest committed manifest retained");
-		assert_eq!(capture_calls.get(), 0);
-	}
-
-	#[test]
-	fn stop_tolerates_a_disconnect_while_capture_starts() {
-		let connected = Cell::new(true);
-		let message = settle_stop(
-			|| false,
-			|| connected.get(),
-			|| {
-				connected.set(false);
-				anyhow::bail!("Capture Manifest requires one connected Studio client")
-			},
-		)
-		.unwrap();
-
-		assert_eq!(message, "Studio disconnected; latest committed manifest retained");
-
 	}
 
 	#[test]
@@ -254,7 +210,6 @@ mod tests {
 	fn stop_retains_the_latest_capture_during_managed_reload() {
 		let capture_calls = Cell::new(0);
 		let message = settle_stop(
-			|| true,
 			|| true,
 			|| {
 				capture_calls.set(capture_calls.get() + 1);

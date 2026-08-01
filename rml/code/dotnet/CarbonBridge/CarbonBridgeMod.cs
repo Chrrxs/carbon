@@ -246,7 +246,7 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private readonly object _managedHierarchyLock = new();
     private readonly object _manifestIdentityLock = new();
     private readonly ManifestIdentityLedger _manifestIdentities = new();
-    private readonly CaptureDirtyPageTable _captureDirtyPages = new();
+    private CaptureDirtyPageTable _captureDirtyPages = null!;
     private ManifestIdentityRemapSession? _manifestIdentityRemap;
     private readonly CaptureArchivableMaskTracker _captureArchivableMasks = new();
     private readonly object _managedIdentityResolutionLock = new();
@@ -299,8 +299,16 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private static TaskCompletionSource<bool> NewManagedSnapshotReady() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    internal static CaptureDirtyPageTable RenewCaptureDirtyPageTable(
+        CaptureDirtyPageTable? previous)
+    {
+        previous?.Dispose();
+        return new CaptureDirtyPageTable();
+    }
+
     public override int OnLoad()
     {
+        _captureDirtyPages = RenewCaptureDirtyPageTable(_captureDirtyPages);
         _shutdown = new CancellationTokenSource();
         _launchHydratedDefaultsTimer = new Timer(
             OnLaunchHydratedDefaultsTimer,

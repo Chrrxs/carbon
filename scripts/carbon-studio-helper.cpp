@@ -6,7 +6,6 @@
 #endif
 
 #include <windows.h>
-#include <tlhelp32.h>
 #include <winhttp.h>
 #include <io.h>
 #include <fcntl.h>
@@ -653,31 +652,6 @@ static bool paths_equal(const std::wstring& path1, const std::wstring& path2) {
     return _wcsicmp(norm1.c_str(), norm2.c_str()) == 0;
 }
 
-static bool process_has_module(const DWORD pid, const std::wstring& module_path, bool& inspected) {
-    inspected = false;
-    SafeHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
-    if (!snapshot) {
-        std::cerr << "CreateToolhelp32Snapshot failed while verifying the Carbon RML loader: "
-                  << GetLastError() << "\n";
-        return false;
-    }
-
-    MODULEENTRY32W module = { sizeof(module) };
-    if (!Module32FirstW(snapshot.get(), &module)) {
-        std::cerr << "Module32FirstW failed while verifying the Carbon RML loader: "
-                  << GetLastError() << "\n";
-        return false;
-    }
-    inspected = true;
-
-    do {
-        if (paths_equal(module.szExePath, module_path)) {
-            return true;
-        }
-    } while (Module32NextW(snapshot.get(), &module));
-
-    return false;
-}
 
 static int cmd_launch(
     const std::string& studio_b64,

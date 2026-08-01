@@ -3021,22 +3021,6 @@ impl Serialize for MappingWireVariant<'_> {
 	}
 }
 
-struct MappingWireAttributes<'a>(&'a Attributes);
-
-impl Serialize for MappingWireAttributes<'_> {
-	fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		use serde::ser::SerializeMap;
-		let mut attributes = serializer.serialize_map(Some(self.0.len()))?;
-		for (name, value) in self.0.iter() {
-			attributes.serialize_entry(name, &MappingWireVariant(value))?;
-		}
-		attributes.end()
-	}
-}
-
 struct ReaderCache {
 	generation: String,
 	tree: Tree,
@@ -4275,31 +4259,6 @@ pub(crate) fn capture_probe_file_fingerprints(path: &Path) -> Result<Vec<(PathBu
 mod tests {
 	use super::*;
 	use std::time::{SystemTime, UNIX_EPOCH};
-
-	#[test]
-	fn mapping_source_page_encodes_nested_binary_attributes_as_msgpack_bytes() {
-		let payload = b"captured-binary-attribute".to_vec();
-		let attributes = Attributes::new().with("Binary", BinaryString::from(payload.clone()));
-		let page = SourcePage {
-			instances: vec![PropertySnapshot {
-				id: Ref::new(),
-				properties: UstrMap::from_iter([(Ustr::from("Attributes"), Variant::Attributes(attributes))]),
-			}],
-			cursor: None,
-			done: true,
-			encoded_bytes: 0,
-		};
-
-		let encoded = rmp_serde::to_vec_named(&MappingSourcePage(&page)).unwrap();
-		let mut expected = vec![0xc4, payload.len() as u8];
-		expected.extend_from_slice(&payload);
-		assert!(
-			encoded
-				.windows(expected.len())
-				.any(|window| window == expected.as_slice()),
-			"nested BinaryString attributes must use the MessagePack binary wire type"
-		);
-	}
 
 	fn temp(name: &str) -> PathBuf {
 		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();

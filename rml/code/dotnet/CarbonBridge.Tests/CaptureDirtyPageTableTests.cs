@@ -6,6 +6,17 @@ namespace Carbon.RmlBridge.Tests;
 public sealed class CaptureDirtyPageTableTests
 {
     [Fact]
+    public void DataModelReloadRenewsDisposedCapturePageTable()
+    {
+        var first = CarbonBridgeMod.RenewCaptureDirtyPageTable(null);
+        var second = CarbonBridgeMod.RenewCaptureDirtyPageTable(first);
+
+        Assert.Throws<ObjectDisposedException>(first.Reset);
+        second.Reset();
+        second.Dispose();
+    }
+
+    [Fact]
     public void AcknowledgedBaselineReusesCleanPagesAndSerializesOnlyDirtyPage()
     {
         using var table = new CaptureDirtyPageTable();

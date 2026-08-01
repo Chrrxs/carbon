@@ -447,7 +447,7 @@ impl Serve {
 							}
 						}
 						crate::carbon_info!("Project manifest changed; capturing Studio before synchronization reload");
-						if let Err(error) = active_core.capture_before_shutdown() {
+						if let Err(error) = active_core.capture_before_reload() {
 							crate::carbon_error!("Capture Manifest before synchronization reload failed: {error:#}");
 							reload_control.fail_reload(true);
 							return false;
@@ -735,7 +735,7 @@ mod tests {
 		let begin_calls = Cell::new(0);
 		let poll_calls = Cell::new(0);
 		let wait_calls = Cell::new(0);
-		let message = crate::core::wait_for_shutdown_capture(
+		let message = crate::core::wait_for_automatic_capture(
 			|| {
 				begin_calls.set(begin_calls.get() + 1);
 				Ok(crate::core::ManifestCaptureStatus {
