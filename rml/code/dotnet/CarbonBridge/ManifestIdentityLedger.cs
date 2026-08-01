@@ -122,6 +122,11 @@ internal sealed class ManifestIdentityAllocator
 
 internal readonly record struct ManifestIdentityBinding(nuint Handle, string SourceId);
 
+internal sealed record ManifestIdentityServiceAnchor(
+    string SourceId,
+    string ClassName,
+    string Name);
+
 internal sealed record ManifestIdentityRebinding(
     string SourceId,
     string ParentSourceId,
@@ -135,7 +140,8 @@ internal static class ManifestIdentityBootstrapResolver
     public static IReadOnlyList<ManifestIdentityBinding> Resolve(
         CaptureRuntimeHierarchyPayload runtime,
         IEnumerable<ManifestIdentityBinding> markerBindings,
-        IReadOnlyList<ManifestIdentityRebinding> rebindings)
+        IReadOnlyList<ManifestIdentityRebinding> rebindings,
+        IReadOnlyList<ManifestIdentityServiceAnchor>? serviceAnchors = null)
     {
         if (runtime.Nodes.Length == 0)
         {
@@ -175,6 +181,32 @@ internal static class ManifestIdentityBootstrapResolver
                 throw new InvalidDataException("manifest identity bootstrap marker bindings are inconsistent");
             }
             result.Add(binding);
+        }
+
+        foreach (var anchor in serviceAnchors ?? [])
+        {
+            if (handleBySourceId.ContainsKey(anchor.SourceId))
+            {
+                continue;
+            }
+            var candidates = runtime.Nodes
+                .Skip(1)
+                .Where(node =>
+                    node.ParentIndex == 0
+                    && string.Equals(node.ClassName, anchor.ClassName, StringComparison.Ordinal)
+                    && string.Equals(node.Name, anchor.Name, StringComparison.Ordinal)
+                    && !boundHandles.Contains(node.Handle))
+                .ToArray();
+            if (candidates.Length != 1)
+            {
+                throw new InvalidDataException(
+                    $"manifest identity bootstrap service {anchor.ClassName} '{anchor.Name}' " +
+                    $"matched {candidates.Length} unbound instances");
+            }
+            var handle = candidates[0].Handle;
+            handleBySourceId.Add(anchor.SourceId, handle);
+            boundHandles.Add(handle);
+            result.Add(new(handle, anchor.SourceId));
         }
 
         foreach (var rebinding in rebindings)
@@ -362,10 +394,89 @@ internal sealed class ManifestIdentityLedger
         int expectedCount,
         string expectedDigest)
     {
+        Bootstrap(bindings, expectedRootSourceId, expectedCount, expectedDigest, replaceAuthoritative: false);
+    }
+
+    public void ReplaceBootstrap(
+        IEnumerable<ManifestIdentityBinding> bindings,
+        string expectedRootSourceId,
+        int expectedCount,
+        string expectedDigest)
+    {
+        Bootstrap(bindings, expectedRootSourceId, expectedCount, expectedDigest, replaceAuthoritative: true);
+    }
+
+    public bool TryAdoptActiveContract(
+        IReadOnlyList<string> expectedSourceIds,
+        string expectedRootSourceId,
+        int expectedCount,
+        string expectedDigest)
+    {
+        var root = ManifestIdentity.Parse(expectedRootSourceId);
+        var digest = NormalizeDigest(expectedDigest);
+        var expected = new HashSet<ManifestIdentity>();
+        foreach (var sourceId in expectedSourceIds)
+        {
+            if (!expected.Add(ManifestIdentity.Parse(sourceId)))
+            {
+                throw new InvalidDataException(
+                    "manifest identity reload contract repeats a source identity");
+            }
+        }
+        if (expected.Count != expectedCount
+            || !expected.Contains(root)
+            || !string.Equals(Digest(expected), digest, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "manifest identity reload contract identity inventory is inconsistent");
+        }
+        if (!IsAuthoritative)
+        {
+            return false;
+        }
+
+        var retained = _byHandle
+            .Where(pair => expected.Contains(pair.Value))
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
+        if (retained.Count != expected.Count
+            || !retained.Values.ToHashSet().SetEquals(expected))
+        {
+            return false;
+        }
+
+        _byHandle.Clear();
+        foreach (var pair in retained)
+        {
+            _byHandle.Add(pair.Key, pair.Value);
+        }
+        _bootstrapContract = (root, expectedCount, digest);
+        _completedRemap = null;
+        return true;
+    }
+
+    public IReadOnlyList<ManifestIdentityBinding> SnapshotExpectedBindings(
+        IReadOnlyList<string> expectedSourceIds)
+    {
+        var expected = expectedSourceIds
+            .Select(ManifestIdentity.Parse)
+            .ToHashSet();
+        return _byHandle
+            .Where(pair => expected.Contains(pair.Value))
+            .Select(pair => new ManifestIdentityBinding(pair.Key, pair.Value.ToString()))
+            .ToArray();
+    }
+
+    private void Bootstrap(
+        IEnumerable<ManifestIdentityBinding> bindings,
+        string expectedRootSourceId,
+        int expectedCount,
+        string expectedDigest,
+        bool replaceAuthoritative)
+    {
         var root = ManifestIdentity.Parse(expectedRootSourceId);
         var digest = NormalizeDigest(expectedDigest);
         var contract = (root, expectedCount, digest);
-        if (IsAuthoritative)
+        if (IsAuthoritative && !replaceAuthoritative)
         {
             if (_bootstrapContract == contract)
             {
@@ -408,6 +519,7 @@ internal sealed class ManifestIdentityLedger
         }
         _issued.UnionWith(nextIds);
         _bootstrapContract = contract;
+        _completedRemap = null;
         IsAuthoritative = true;
     }
 

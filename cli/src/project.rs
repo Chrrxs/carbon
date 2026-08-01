@@ -4302,7 +4302,7 @@ fn is_script_class(class: &str) -> bool {
 	matches!(class, "Script" | "LocalScript" | "ModuleScript")
 }
 
-fn is_service(class: &str) -> bool {
+pub(crate) fn is_service(class: &str) -> bool {
 	util::get_reflection_database()
 		.classes
 		.get(class)

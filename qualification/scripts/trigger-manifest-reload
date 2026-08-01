@@ -15,7 +15,7 @@ case "$mode" in
     }
     mkdir -p -- "$mapped_dir"
     printf 'return "carbon-managed-reload-module"\n' > "${mapped_dir}/equip_weapon.luau"
-    jq '.name += "-Reloaded" | .tree.ServerStorage.DevUtils = {"$path": "qualification-manifest-reload"}' "$project" > "$temporary"
+    jq '.name += "-Reloaded" | .tree.ServerStorage.CarbonQualificationReload = {"$path": "qualification-manifest-reload"}' "$project" > "$temporary"
     mv -- "$temporary" "$project"
     printf 'manifest reload with project rename and mapped subtree triggered atomically\n'
     ;;

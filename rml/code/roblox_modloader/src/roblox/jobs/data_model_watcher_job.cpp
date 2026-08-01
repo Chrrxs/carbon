@@ -64,12 +64,27 @@ namespace rml::jobs
 			type = *type_res;
 			resolution.data_model = data_model;
 			resolution.type = type;
+			auto [sequence, inserted] = m_data_model_candidate_sequences.try_emplace(data_model, 0);
+			if (inserted)
+				sequence->second = ++m_next_candidate_sequence;
+			resolution.candidate_sequence = sequence->second;
 		}
 		resolution.marker_priority = marker_priority;
 
 		auto& scheduler = rml::task_scheduler();
 		scheduler.run_maintenance();
 		const auto current_data_model = scheduler.get_data_model_by_type(type);
+		const auto current_priority = m_data_model_marker_priorities.find(type);
+		const auto current_marker_priority =
+		    current_priority != m_data_model_marker_priorities.end() ? current_priority->second : 0;
+		const auto window_started_at = m_provisional_window_started_at.find(type);
+		const auto current_sequence = m_current_candidate_sequences.find(type);
+		const bool current_is_provisional =
+		    current_marker_priority == 0 &&
+		    window_started_at != m_provisional_window_started_at.end() &&
+		    now - window_started_at->second <= PROVISIONAL_REPLACEMENT_WINDOW &&
+		    current_sequence != m_current_candidate_sequences.end() &&
+		    resolution.candidate_sequence > current_sequence->second;
 		if (current_data_model == data_model)
 		{
 			m_data_model_last_time_stepped[type] = now;
@@ -88,10 +103,11 @@ namespace rml::jobs
 
 		const auto last_step = m_data_model_last_time_stepped.find(type);
 		const bool current_is_stale = last_step == m_data_model_last_time_stepped.end() || now - last_step->second > STALE_DATA_MODEL_THRESHOLD;
-		const auto current_priority = m_data_model_marker_priorities.find(type);
-		return detail::should_prefer_data_model_candidate(current_is_stale,
+		const bool prefer_candidate = detail::should_prefer_data_model_candidate(current_is_stale,
 		    marker_priority,
-		    current_priority != m_data_model_marker_priorities.end() ? current_priority->second : 0);
+		    current_marker_priority,
+		    current_is_provisional);
+		return prefer_candidate;
 	}
 
 	void DataModelWatcherJob::execute_impl(const JobExecutionContext& context)
@@ -127,6 +143,18 @@ namespace rml::jobs
 
 		m_data_models[data_model_type] = new_data_model;
 		m_data_model_last_time_stepped[data_model_type] = now;
+		if (!old_data_model)
+		{
+			const auto absent_since = m_data_model_absent_since.find(data_model_type);
+			if (m_current_candidate_sequences.find(data_model_type) == m_current_candidate_sequences.end() ||
+			    (absent_since != m_data_model_absent_since.end() &&
+			     now - absent_since->second > PROVISIONAL_ABSENCE_RESET))
+			{
+				m_provisional_window_started_at[data_model_type] = now;
+			}
+			m_data_model_absent_since.erase(data_model_type);
+		}
+		m_current_candidate_sequences[data_model_type] = resolution->second.candidate_sequence;
 		m_data_model_marker_priorities[data_model_type] = resolution->second.marker_priority;
 		on_data_model_changed(old_data_model, new_data_model, data_model_type, job->get_script_context());
 	}
@@ -135,9 +163,14 @@ namespace rml::jobs
 	{
 		m_job_resolutions.clear();
 		m_job_cadence.clear();
+		m_data_model_candidate_sequences.clear();
 		m_data_models.clear();
 		m_data_model_last_time_stepped.clear();
+		m_provisional_window_started_at.clear();
+		m_data_model_absent_since.clear();
+		m_current_candidate_sequences.clear();
 		m_data_model_marker_priorities.clear();
+		m_next_candidate_sequence = 0;
 	}
 
 	std::uint8_t DataModelWatcherJob::studio_marker_priority(const RBX::DataModel* data_model) noexcept
@@ -287,6 +320,7 @@ namespace rml::jobs
 			LOG_INFO("Detected stale DataModel type: {}, cleaning up", static_cast<int>(data_model_type));
 			stale_data_models.emplace_back(data_model_type, tracked_data_model_ptr);
 			m_data_models.erase(data_model_type);
+			m_data_model_absent_since[data_model_type] = now;
 			m_data_model_marker_priorities.erase(data_model_type);
 			it = m_data_model_last_time_stepped.erase(it);
 		}

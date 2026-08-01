@@ -39,6 +39,13 @@ struct AuthorizedRequest {
 	client_id: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManifestIdentityBootstrapRequest {
+	client_id: u32,
+	managed_reload_transition_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestIdentityBootstrapResponse {
@@ -1432,18 +1439,24 @@ pub(crate) async fn attach_managed_hierarchy(
 
 #[post("/privileged/manifest-identities/bootstrap")]
 pub(crate) async fn bootstrap_manifest_identities(
-	request: MsgPack<AuthorizedRequest>,
+	request: MsgPack<ManifestIdentityBootstrapRequest>,
 	core: Data<Arc<Core>>,
 ) -> impl Responder {
 	let client_id = request.client_id;
+	let replace_authoritative =
+		match core.validate_manifest_identity_refresh(request.managed_reload_transition_id.as_deref()) {
+			Ok(replace_authoritative) => replace_authoritative,
+			Err(error) => return HttpResponse::Conflict().body(error.to_string()),
+		};
 	let bridge_id = match bridge_id(&core, client_id) {
 		Ok(bridge_id) => bridge_id,
 		Err(response) => return response,
 	};
-	let contract = match core.manifest_identity_bootstrap() {
+	let mut contract = match core.manifest_identity_bootstrap() {
 		Ok(contract) => contract,
 		Err(error) => return HttpResponse::Conflict().body(error.to_string()),
 	};
+	contract.replace_authoritative = replace_authoritative;
 	let expected = contract.clone();
 	let epoch_core = core.get_ref().clone();
 	let result = web::block(move || {
@@ -1474,7 +1487,10 @@ pub(crate) async fn bootstrap_manifest_identities(
 			Ok(()) => HttpResponse::Ok().msgpack(response),
 			Err(error) => HttpResponse::Conflict().body(error.to_string()),
 		},
-		Ok(Err(error)) => HttpResponse::ServiceUnavailable().body(error.to_string()),
+		Ok(Err(error)) => {
+			crate::carbon_warn!("RML manifest identity bootstrap failed: {error:#}");
+			HttpResponse::ServiceUnavailable().body(error.to_string())
+		}
 		Err(error) => HttpResponse::InternalServerError().body(error.to_string()),
 	}
 }

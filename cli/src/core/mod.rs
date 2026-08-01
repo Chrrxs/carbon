@@ -536,7 +536,18 @@ pub(crate) struct ManifestIdentityBootstrapContract {
 	pub root_source_id: String,
 	pub expected_source_instances: u32,
 	pub expected_digest: String,
+	pub expected_source_ids: Vec<String>,
+	pub service_anchors: Vec<ManifestIdentityServiceAnchorContract>,
 	pub rebindings: Vec<ManifestIdentityRebindingContract>,
+	pub replace_authoritative: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManifestIdentityServiceAnchorContract {
+	pub source_id: String,
+	pub class_name: String,
+	pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -597,6 +608,17 @@ fn manifest_identity_bootstrap_contract(
 		root_source_id: snapshot.id.to_string(),
 		expected_source_instances: u32::try_from(identities.len())?,
 		expected_digest: format!("{:x}", digest.finalize()),
+		expected_source_ids: identities.iter().map(ToString::to_string).collect(),
+		service_anchors: snapshot
+			.children
+			.iter()
+			.filter(|child| included.contains(&child.id) && project::is_service(child.class.as_str()))
+			.map(|child| ManifestIdentityServiceAnchorContract {
+				source_id: child.id.to_string(),
+				class_name: child.class.to_string(),
+				name: child.name.clone(),
+			})
+			.collect(),
 		rebindings: rebindings
 			.iter()
 			.map(|rebinding| ManifestIdentityRebindingContract {
@@ -608,6 +630,7 @@ fn manifest_identity_bootstrap_contract(
 				related_source_id: rebinding.related_source_id.map(|identity| identity.to_string()),
 			})
 			.collect(),
+		replace_authoritative: false,
 	})
 }
 
@@ -968,6 +991,24 @@ impl Core {
 		self.managed_reload_transition.lock().unwrap().is_some()
 	}
 
+	pub(crate) fn validate_manifest_identity_refresh(&self, supplied: Option<&str>) -> Result<bool> {
+		let pending = self.managed_reload_transition();
+		match (pending, supplied) {
+			(None, None) => Ok(false),
+			(Some(_), None) => {
+				anyhow::bail!("synchronization reload identity refresh requires the active transition identity")
+			}
+			(None, Some(_)) => anyhow::bail!("no managed synchronization reload permits identity refresh"),
+			(Some(expected), Some(observed)) => {
+				ensure!(
+					expected == observed,
+					"managed synchronization reload transition identity does not match"
+				);
+				Ok(true)
+			}
+		}
+	}
+
 	fn validate_managed_reload_capture(&self, supplied: Option<&str>, force_full: bool) -> Result<Option<String>> {
 		let pending = self.managed_reload_transition();
 		match (pending, supplied) {
@@ -1064,10 +1105,6 @@ impl Core {
 
 	fn has_valid_manifest_fallback(&self) -> bool {
 		artifact_store::validated_artifact_receipt(&self.manifest_path).is_ok()
-	}
-
-	pub(crate) fn begin_manifest_capture_mode(self: &Arc<Self>, force_full: bool) -> Result<ManifestCaptureStatus> {
-		self.begin_manifest_capture_mode_internal(force_full, false, None)
 	}
 
 	pub(crate) fn begin_manifest_capture_mode_transition(
@@ -3389,14 +3426,21 @@ mod source_watcher_tests {
 						.with_class("ModuleScript")]),
 				snapshot::Snapshot::new()
 					.with_id(studio)
-					.with_name("Studio")
-					.with_class("Folder"),
+					.with_name("Workspace")
+					.with_class("Workspace"),
 			]);
 		let contract =
 			manifest_identity_bootstrap_contract(&snapshot, &HashSet::from([mapped, mapped_child]), &[]).unwrap();
 		assert_eq!(contract.root_source_id, root.to_string());
 		assert_eq!(contract.expected_source_instances, 2);
 		assert_eq!(contract.expected_digest.len(), 64);
+		let mut expected_source_ids = vec![root.to_string(), studio.to_string()];
+		expected_source_ids.sort();
+		assert_eq!(contract.expected_source_ids, expected_source_ids);
+		assert_eq!(contract.service_anchors.len(), 1);
+		assert_eq!(contract.service_anchors[0].source_id, studio.to_string());
+		assert_eq!(contract.service_anchors[0].class_name, "Workspace");
+		assert_eq!(contract.service_anchors[0].name, "Workspace");
 	}
 
 	#[test]

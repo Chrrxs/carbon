@@ -167,18 +167,18 @@ function Core:run(): Promise.Promise
 
 		if managedReloadTransitionId ~= nil then
 			-- The replacement Core describes a new mapping contract. Reconcile that
-			-- contract before capturing so Studio can prove the replacement topology;
-			-- the transition-bound capture is the server's acknowledgement boundary.
-			if privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then
-				local identityBootstrap = self.client:bootstrapManifestIdentities():expect()
-				if identityBootstrap.authoritative ~= true then
-					return reject(Error.new(Error.ManifestIdentityRejected))
-				end
-			end
+			-- contract before refreshing the retained native identity ledger. The
+			-- transition identity authorizes that one replacement, including identities
+			-- introduced by the new mapping contract, and the following full capture is
+			-- the server's acknowledgement boundary.
 			Log.trace("Reconciling replacement filesystem mappings before managed reload acknowledgement..")
 			local report = self:__reconcileMappings()
 			self.tree = self.reconciler.tree
 			Log.debug("Managed reload mapping reconciliation:", report.instances, "instances")
+			local identityBootstrap = self.client:bootstrapManifestIdentities(managedReloadTransitionId):expect()
+			if identityBootstrap.authoritative ~= true then
+				return reject(Error.new(Error.ManifestIdentityRejected))
+			end
 
 			local captureStatus = self.client:requestManifestCapture(nil, true, managedReloadTransitionId):expect()
 			self:__advanceSourceGeneration(captureStatus.sourceGeneration)

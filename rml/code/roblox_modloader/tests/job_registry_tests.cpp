@@ -383,14 +383,18 @@ int main()
 			return 112;
 		if (rml::jobs::detail::should_prefer_data_model_candidate(false, 1, 1) || rml::jobs::detail::should_prefer_data_model_candidate(false, 0, 1))
 			return 113;
-		if (rml::jobs::detail::studio_marker_priority(0, true) != 0)
+		if (!rml::jobs::detail::should_prefer_data_model_candidate(false, 0, 0, true))
 			return 114;
-		if (rml::jobs::detail::studio_marker_priority(1, false) != 1)
+		if (rml::jobs::detail::should_prefer_data_model_candidate(false, 1, 1, true))
 			return 115;
-		if (rml::jobs::detail::studio_marker_priority(1, true) != 2)
+		if (rml::jobs::detail::studio_marker_priority(0, true) != 0)
 			return 116;
-		if (rml::jobs::detail::studio_marker_priority(2, true) != 0)
+		if (rml::jobs::detail::studio_marker_priority(1, false) != 1)
 			return 117;
+		if (rml::jobs::detail::studio_marker_priority(1, true) != 2)
+			return 118;
+		if (rml::jobs::detail::studio_marker_priority(2, true) != 0)
+			return 119;
 	}
 
 	{

@@ -1057,9 +1057,27 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
     private ManifestIdentityBootstrapResponse BootstrapManifestIdentities(
         ManifestIdentityBootstrapRequest request)
     {
+        IReadOnlyList<ManifestIdentityBinding> retainedBindings = [];
         lock (_manifestIdentityLock)
         {
-            if (_manifestIdentities.IsAuthoritative)
+            if (_manifestIdentities.IsAuthoritative && request.ReplaceAuthoritative)
+            {
+                if (_manifestIdentities.TryAdoptActiveContract(
+                    request.ExpectedSourceIds,
+                    request.RootSourceId,
+                    request.ExpectedSourceInstances,
+                    request.ExpectedDigest))
+                {
+                    return new(true, _manifestIdentities.Count, _manifestIdentities.ActiveDigest());
+                }
+                // A replacement mapping can introduce canonical identities that the
+                // retained ledger has never seen. Resolve the transition's fresh
+                // Studio markers below and replace the ledger only after validating
+                // the complete new contract.
+                retainedBindings = _manifestIdentities.SnapshotExpectedBindings(
+                    request.ExpectedSourceIds);
+            }
+            if (_manifestIdentities.IsAuthoritative && !request.ReplaceAuthoritative)
             {
                 _manifestIdentities.Bootstrap(
                     [],
@@ -1081,6 +1099,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         }
         var runtime = ManagedHierarchy.ParseCaptureRuntimePayload(
             InstanceHierarchy.Read(dataModel, editCamera, includeCaptureMetadata: true));
+        var currentHandles = runtime.Nodes.Select(node => node.Handle).ToHashSet();
+        retainedBindings = retainedBindings
+            .Where(binding => currentHandles.Contains(binding.Handle))
+            .ToArray();
         var bindings = new List<ManifestIdentityBinding>(request.ExpectedSourceInstances)
         {
             new(runtime.Nodes[0].Handle, request.RootSourceId),
@@ -1102,10 +1124,22 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             }
             bindings.Add(new(node.Handle, sourceId));
         }
+        if (request.ReplaceAuthoritative)
+        {
+            var expectedSourceIds = request.ExpectedSourceIds.ToHashSet(StringComparer.Ordinal);
+            bindings.RemoveAll(binding => !expectedSourceIds.Contains(binding.SourceId));
+        }
+        var retainedSourceIds = retainedBindings
+            .Select(binding => binding.SourceId)
+            .ToHashSet(StringComparer.Ordinal);
+        var pendingRebindings = request.Rebindings
+            .Where(rebinding => !retainedSourceIds.Contains(rebinding.SourceId))
+            .ToArray();
         var resolvedBindings = ManifestIdentityBootstrapResolver.Resolve(
             runtime,
-            bindings,
-            request.Rebindings);
+            retainedBindings.Concat(bindings).Distinct(),
+            pendingRebindings,
+            request.ServiceAnchors);
 
         // Validate without changing the active ledger or consuming the markers.
         new ManifestIdentityLedger().Bootstrap(
@@ -1115,11 +1149,22 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
             request.ExpectedDigest);
         lock (_manifestIdentityLock)
         {
-            _manifestIdentities.Bootstrap(
-                resolvedBindings,
-                request.RootSourceId,
-                request.ExpectedSourceInstances,
-                request.ExpectedDigest);
+            if (request.ReplaceAuthoritative)
+            {
+                _manifestIdentities.ReplaceBootstrap(
+                    resolvedBindings,
+                    request.RootSourceId,
+                    request.ExpectedSourceInstances,
+                    request.ExpectedDigest);
+            }
+            else
+            {
+                _manifestIdentities.Bootstrap(
+                    resolvedBindings,
+                    request.RootSourceId,
+                    request.ExpectedSourceInstances,
+                    request.ExpectedDigest);
+            }
         }
         return new(true, resolvedBindings.Count, request.ExpectedDigest);
     }
@@ -7192,7 +7237,10 @@ public sealed class CarbonBridgeMod : ModBase, IDataModelAware
         string RootSourceId,
         int ExpectedSourceInstances,
         string ExpectedDigest,
-        IReadOnlyList<ManifestIdentityRebinding> Rebindings);
+        IReadOnlyList<string> ExpectedSourceIds,
+        IReadOnlyList<ManifestIdentityServiceAnchor> ServiceAnchors,
+        IReadOnlyList<ManifestIdentityRebinding> Rebindings,
+        bool ReplaceAuthoritative);
     private sealed record ManifestIdentityBootstrapResponse(
         bool Authoritative,
         int SourceInstances,

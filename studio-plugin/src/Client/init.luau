@@ -255,9 +255,10 @@ function Client:attachManagedHierarchy(): Promise.Promise
 	end)
 end
 
-function Client:bootstrapManifestIdentities(): Promise.Promise
+function Client:bootstrapManifestIdentities(managedReloadTransitionId: string?): Promise.Promise
 	return Http.post(self:getUrl("privileged/manifest-identities/bootstrap"), {
 		clientId = self.clientId,
+		managedReloadTransitionId = managedReloadTransitionId,
 	}):andThen(function(response)
 		return response:decode()
 	end)

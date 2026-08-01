@@ -61,13 +61,28 @@ local transitionReconcile = assert(
 	string.find(core, "self:__reconcileMappings()", transitionStartup, true),
 	"managed reconnect must reconcile the replacement filesystem mappings"
 )
+local transitionBootstrap = assert(
+	string.find(core, "bootstrapManifestIdentities(managedReloadTransitionId)", transitionReconcile, true),
+	"managed reconnect must recover native manifest identity authority when it was lost"
+)
 local transitionCapture = assert(
-	string.find(core, "requestManifestCapture(nil, true, managedReloadTransitionId)", transitionReconcile, true),
+	string.find(core, "requestManifestCapture(nil, true, managedReloadTransitionId)", transitionBootstrap, true),
 	"managed reconnect must prove the candidate contract with a transition-bound capture"
 )
 assert(
-	transitionReconcile < transitionCapture,
-	"managed reload must materialize new mapped identities before candidate-contract capture"
+	transitionReconcile < transitionBootstrap and transitionBootstrap < transitionCapture,
+	"managed reload must materialize mappings, refresh native identity authority, and then capture the candidate"
+)
+assert(
+	(
+		string.find(
+			core,
+			"if privilegedCapabilities.manifestIdentitiesAuthoritative ~= true then",
+			transitionReconcile,
+			true
+		) or math.huge
+	) > transitionCapture,
+	"managed reload must refresh an authoritative ledger because the replacement contract can add identities"
 )
 
 print("PASS: Core startup preserves failures and proves managed reload topology before commit")

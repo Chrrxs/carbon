@@ -345,7 +345,7 @@
           "arguments": {
             "instance_id": "${studio_instance}",
             "target": "edit",
-            "code": "local folder = game:GetService('ServerStorage'):FindFirstChild('DevUtils'); assert(folder and folder:IsA('Folder'), 'managed reload did not create the new mapped subtree'); local module = folder:FindFirstChild('equip_weapon'); assert(module and module:IsA('ModuleScript'), 'managed reload did not create the new mapped module'); return require(module)"
+            "code": "local folder = game:GetService('ServerStorage'):FindFirstChild('CarbonQualificationReload'); assert(folder and folder:IsA('Folder'), 'managed reload did not create the new mapped subtree'); local module = folder:FindFirstChild('equip_weapon'); assert(module and module:IsA('ModuleScript'), 'managed reload did not create the new mapped module'); return require(module)"
           },
           "timeout_seconds": 30,
           "poll_interval_ms": 100,
@@ -378,7 +378,7 @@
           "arguments": {
             "instance_id": "${studio_instance}",
             "target": "edit",
-            "code": "local parent = workspace:FindFirstChild('CarbonManifestScriptParent'); return workspace:GetAttribute('__StudioWorktree_CarbonProject') == '${studio_data_model}' and game:GetService('ServerStorage'):FindFirstChild('DevUtils') == nil and parent ~= nil and parent:GetAttribute('CarbonManifestRevision') == 2"
+            "code": "local parent = workspace:FindFirstChild('CarbonManifestScriptParent'); return workspace:GetAttribute('__StudioWorktree_CarbonProject') == '${studio_data_model}' and game:GetService('ServerStorage'):FindFirstChild('CarbonQualificationReload') == nil and parent ~= nil and parent:GetAttribute('CarbonManifestRevision') == 2"
           },
           "timeout_seconds": 30,
           "poll_interval_ms": 100,

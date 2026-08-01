@@ -20,9 +20,14 @@ namespace rml::jobs::detail
 		return tracked_data_model && (!current_data_model || current_data_model == tracked_data_model);
 	}
 
-	[[nodiscard]] constexpr bool should_prefer_data_model_candidate(const bool current_is_stale, const std::uint8_t candidate_priority, const std::uint8_t current_priority) noexcept
+	[[nodiscard]] constexpr bool should_prefer_data_model_candidate(
+	    const bool current_is_stale,
+	    const std::uint8_t candidate_priority,
+	    const std::uint8_t current_priority,
+	    const bool current_is_provisional = false) noexcept
 	{
-		return current_is_stale || candidate_priority > current_priority;
+		return current_is_stale || candidate_priority > current_priority ||
+		       (current_is_provisional && candidate_priority == 0 && current_priority == 0);
 	}
 
 	class PerJobCadence final

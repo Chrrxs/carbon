@@ -408,6 +408,27 @@ public sealed class ManifestIdentityLedgerTests
     }
 
     [Fact]
+    public void BootstrapBindsANewCanonicalServiceWithoutAStaleTransportMarker()
+    {
+        const string ServerStorage = "00000000000000000000000000000004";
+        var runtime = new CaptureRuntimeHierarchyPayload(
+        [
+            new(1, -1, "DataModel", "Place", ManagedHierarchy.RuntimeArchivable),
+            new(2, 0, "ServerStorage", "ServerStorage", ManagedHierarchy.RuntimePersistent),
+        ],
+        [],
+        []);
+
+        var bindings = ManifestIdentityBootstrapResolver.Resolve(
+            runtime,
+            [new(1, Root)],
+            [],
+            [new(ServerStorage, "ServerStorage", "ServerStorage")]);
+
+        Assert.Contains(new ManifestIdentityBinding(2, ServerStorage), bindings);
+    }
+
+    [Fact]
     public void DeletingEitherOfTwoStructurallyIdenticalInstancesPreservesTheSurvivor()
     {
         var ledger = new ManifestIdentityLedger();
@@ -537,6 +558,81 @@ public sealed class ManifestIdentityLedgerTests
 
         Assert.True(ledger.IsAuthoritative);
         Assert.Equal(2, ledger.Count);
+    }
+
+    [Fact]
+    public void ReplacementBootstrapAtomicallyAdoptsANewAuthoritativeContract()
+    {
+        const string Replacement = "00000000000000000000000000000004";
+        var originalDigest = ManifestIdentityLedger.Digest([Root, Left]);
+        var replacementDigest = ManifestIdentityLedger.Digest([Root, Replacement]);
+        var ledger = new ManifestIdentityLedger();
+        ledger.Bootstrap([new(1, Root), new(2, Left)], Root, 2, originalDigest);
+
+        Assert.Throws<InvalidDataException>(() => ledger.ReplaceBootstrap(
+            [new(1, Root)], Root, 2, replacementDigest));
+        Assert.Equal(originalDigest, ledger.ActiveDigest());
+        Assert.True(ledger.Contains(2));
+
+        ledger.ReplaceBootstrap(
+            [new(1, Root), new(3, Replacement)], Root, 2, replacementDigest);
+
+        Assert.True(ledger.IsAuthoritative);
+        Assert.Equal(replacementDigest, ledger.ActiveDigest());
+        Assert.False(ledger.Contains(2));
+        Assert.True(ledger.Contains(3));
+    }
+
+    [Fact]
+    public void ActiveLedgerAdoptsReloadContractWithoutStaleTransportMarkers()
+    {
+        const string Captured = "00000000000000000000000000000004";
+        const string RuntimeOnly = "00000000000000000000000000000005";
+        const string Missing = "00000000000000000000000000000006";
+        var originalDigest = ManifestIdentityLedger.Digest([Root, Left]);
+        var capturedDigest = ManifestIdentityLedger.Digest([Root, Left, Captured]);
+        var generated = new Queue<string>([Captured, RuntimeOnly]);
+        var ledger = new ManifestIdentityLedger(() => generated.Dequeue());
+        ledger.Bootstrap([new(1, Root), new(2, Left)], Root, 2, originalDigest);
+        Assert.Equal(Captured, ledger.GetOrCreate(3));
+        Assert.Equal(RuntimeOnly, ledger.GetOrCreate(4));
+
+        Assert.False(ledger.TryAdoptActiveContract(
+            [Root, Left, Missing],
+            Root,
+            3,
+            ManifestIdentityLedger.Digest([Root, Left, Missing])));
+        Assert.True(ledger.TryAdoptActiveContract(
+            [Root, Left, Captured],
+            Root,
+            3,
+            capturedDigest));
+        ledger.Bootstrap([], Root, 3, capturedDigest);
+
+        Assert.True(ledger.IsAuthoritative);
+        Assert.Equal(3, ledger.Count);
+        Assert.False(ledger.Contains(4));
+        Assert.Equal(capturedDigest, ledger.ActiveDigest());
+    }
+
+    [Fact]
+    public void ReplacementBootstrapCanCombineRetainedAndNewContractBindings()
+    {
+        const string Replacement = "00000000000000000000000000000004";
+        var originalDigest = ManifestIdentityLedger.Digest([Root, Left]);
+        var replacementDigest = ManifestIdentityLedger.Digest([Root, Left, Replacement]);
+        var ledger = new ManifestIdentityLedger();
+        ledger.Bootstrap([new(1, Root), new(2, Left)], Root, 2, originalDigest);
+
+        var retained = ledger.SnapshotExpectedBindings([Root, Left, Replacement]);
+        var replacement = retained.Append(new ManifestIdentityBinding(3, Replacement));
+        ledger.ReplaceBootstrap(replacement, Root, 3, replacementDigest);
+
+        Assert.True(ledger.IsAuthoritative);
+        Assert.Equal(replacementDigest, ledger.ActiveDigest());
+        Assert.True(ledger.Contains(1));
+        Assert.True(ledger.Contains(2));
+        Assert.True(ledger.Contains(3));
     }
 
     [Fact]
