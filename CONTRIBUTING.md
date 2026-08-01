@@ -83,6 +83,17 @@ Reflection comes from the current Roblox API dump at runtime. Run
 `./scripts/update-reflection --check` to verify that Carbon can build and apply
 the current schema and its version-independent serialization policy.
 
+### Updating the pinned Studio ABI
+
+RML only enables its private native-layout profile for the exact Roblox Studio
+executable recorded in
+`rml/code/roblox_modloader/src/roblox/pinned_internals_profile.cpp`. When Studio
+updates, derive and review the complete replacement profile with the offline ABI
+analyzers, then update the version, file size, SHA-256 digest, offsets, and RVAs
+together. Do not ship a partial profile or restore live-process layout
+discovery. The replacement must pass `./scripts/test-pinned-rml-abi` and the full
+`./scripts/change qualify` Studio run.
+
 ## Pull requests
 
 Keep each pull request focused. Explain the user-visible behavior, call out

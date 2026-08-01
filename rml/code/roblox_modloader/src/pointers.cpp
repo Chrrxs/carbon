@@ -2,6 +2,7 @@
 
 #include "RobloxModLoader/internal/common.hpp"
 #include "RobloxModLoader/memory/all.hpp"
+#include "RobloxModLoader/roblox/pinned_internals_profile.hpp"
 
 namespace rml
 {
@@ -146,24 +147,19 @@ namespace rml
 
 		run_batch(m_roblox_batch, roblox_region, "roblox");
 
-		auto profile = roblox::internals::RobloxInternalsProfile::resolve_bootstrap(
+		auto profile = roblox::internals::load_pinned_internals_profile(
 		    roblox_region,
 		    m_roblox_pointers.get_string_atom);
 		if (!profile)
 		{
-			const auto& error = profile.error();
 			throw std::runtime_error(fmt::format(
-			    "Unsupported Roblox Studio native reflection ABI: capability={}, failure={}, matched_calls={}, "
-			    "decoded_candidates={}",
-			    error.capability,
-			    static_cast<int>(error.failure),
-			    error.matched_calls,
-			    error.decoded_candidates));
+			    "Unsupported Roblox Studio native ABI: {}",
+			    profile.error()));
 		}
 		m_internals_profile =
 		    std::make_unique<const roblox::internals::RobloxInternalsProfile>(std::move(*profile));
 		LOG_INFO(
-		    "Resolved Roblox internals profile: Reflection.Containers property=0x{:X}",
+		    "Loaded pinned Roblox internals profile: Reflection.Containers property=0x{:X}",
 		    m_internals_profile->reflection().descriptor_container_offsets()[0]);
 
 		m_hwnd = GetForegroundWindow();

@@ -11,6 +11,10 @@ file(GLOB_RECURSE MODLOADER_SUBDIRS CONFIGURE_DEPENDS
         "${ROBLOX_MODLOADER_SOURCE_DIR}/**/*.hpp"
 )
 
+list(FILTER MODLOADER_SUBDIRS EXCLUDE REGEX "/roblox/reflection/runtime_layout_resolver[.]cpp$")
+list(FILTER MODLOADER_SUBDIRS EXCLUDE REGEX "/roblox/datamodel_layout_resolver[.]cpp$")
+list(FILTER MODLOADER_SUBDIRS EXCLUDE REGEX "/roblox/internals_profile[.]cpp$")
+
 if (NOT RML_ENABLE_LUAU)
     list(FILTER MODLOADER_SUBDIRS EXCLUDE REGEX "/luau/")
     list(FILTER MODLOADER_SUBDIRS EXCLUDE REGEX "/hooks/script_context/")
@@ -66,6 +70,10 @@ setup_luau_dependencies(roblox_modloader PRIVATE)
 setup_dotnet_hosting(roblox_modloader PRIVATE)
 
 target_link_libraries(roblox_modloader PRIVATE rml_thirdparty)
+
+if (WIN32)
+    target_link_libraries(roblox_modloader PRIVATE bcrypt)
+endif ()
 
 if (UNIX AND NOT APPLE)
     target_link_libraries(roblox_modloader PRIVATE dl)

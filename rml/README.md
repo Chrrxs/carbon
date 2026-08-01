@@ -122,30 +122,25 @@ identity is injected into native and managed artifacts.
 | `ROBLOX_MODLOADER_BUILD_PROXY_DLL`       | Auto-generate the `dwmapi.dll` proxy | ON      |
 | `ROBLOX_MODLOADER_BUILD_EXAMPLES`        | Build the example mods               | ON      |
 
-## Private ABI capability discovery
+## Private ABI compatibility
 
-RML resolves supported Roblox-native internals from the loaded Studio image at
-startup. It does not select offsets by Studio version.
+RML's production loader uses one immutable native-layout profile for the exact
+Roblox Studio build it was qualified against. Before using the profile, RML
+checks the loaded Studio executable's size and SHA-256 digest. A different or
+modified executable aborts initialization instead of applying offsets to an
+unknown ABI. The current profile supports Studio `0.732.0.7321040`.
 
-- Reflection discovery follows the `ClassDescriptor` constructor data flow
-  anchored by `get_string_atom("ClassDescriptor")`. It validates the five
-  descriptor families, base-class link, and functionality flags before enabling
-  direct or inherited property, event, function, yield-function, and callback
-  lookup.
-- DataModel discovery starts from validated `RBX::DataModel` RTTI and PE
-  `RUNTIME_FUNCTION` boundaries. A candidate constructor must establish complete
-  object ownership, the `Instance` subobject, the constructor-supplied type
-  store, and a same-slot enum range check. The evidence must resolve one unique
-  type offset.
-- The immutable profile is created during pointer bootstrap, before task
-  scheduling, hooks, managed bridge startup, readiness, or mutation. Missing,
-  malformed, unsupported, or ambiguous evidence aborts initialization.
+Pattern scanning remains responsible for relocatable function addresses and
+RTTI. The reflection and DataModel layout analyzers remain available to offline
+tests and maintenance tooling, but are not linked into the production DLL and
+never select offsets inside a live Studio process.
 
 Resolved capabilities are the only supported route for descriptor enumeration,
 serialized-property lookup, DataModel type identity, task-context conversion,
-and job-to-DataModel conversion. New private-internals consumers must extend the
-profile with equally validated runtime evidence rather than add overlays,
-pointer arithmetic, signature-only guesses, or version-specific tables.
+and job-to-DataModel conversion. Do not add overlays or ad hoc pointer
+arithmetic. Supporting another Studio release requires regenerating and
+reviewing the complete profile as one atomic change, updating its executable
+identity, and passing full Studio qualification before release.
 
 ## Roadmap
 

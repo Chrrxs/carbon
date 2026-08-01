@@ -16,19 +16,6 @@
 
 namespace rml::roblox::internals
 {
-	RobloxInternalsProfile::RobloxInternalsProfile(
-		ReflectionCapabilities reflection,
-		DataModelCapabilities datamodel,
-		InstanceCapabilities instance,
-		SignalCapabilities signal,
-		JobCapabilities job) noexcept :
-		m_reflection(reflection),
-		m_datamodel(datamodel),
-		m_instance(instance),
-		m_signal(signal),
-		m_job(job)
-	{
-	}
 	std::expected<RobloxInternalsProfile, CompatibilityError> RobloxInternalsProfile::resolve_bootstrap(
 		const memory::module& studio_module,
 		const functions::get_string_atom get_string_atom) noexcept

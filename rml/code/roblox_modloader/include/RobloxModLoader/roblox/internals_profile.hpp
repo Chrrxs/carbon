@@ -358,6 +358,13 @@ namespace rml::roblox::internals
 	class RML_EXPORT RobloxInternalsProfile final
 	{
 	public:
+		[[nodiscard]] static RobloxInternalsProfile from_pinned_profile(
+			ReflectionCapabilities reflection,
+			DataModelCapabilities datamodel,
+			InstanceCapabilities instance,
+			SignalCapabilities signal,
+			JobCapabilities job) noexcept;
+
 		[[nodiscard]] static std::expected<RobloxInternalsProfile, CompatibilityError> resolve_bootstrap(
 			const memory::module& studio_module,
 			functions::get_string_atom get_string_atom) noexcept;
