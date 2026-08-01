@@ -1,5 +1,8 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+#[cfg(windows)]
+use std::path::Path;
+
 const STUDIO_PLUGIN_BUNDLE_ENV: &str = "CARBON_STUDIO_PLUGIN_BUNDLE";
 
 fn resolve_bash() -> PathBuf {

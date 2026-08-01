@@ -6,9 +6,21 @@ REPO="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 BUILD_SCRIPT="${REPO}/cli/build.rs"
 
 failure=0
+build_script_check_root="$(mktemp -d -t carbon-build-script-check-XXXXXXXX)"
+cleanup() {
+	if [[ -d "$build_script_check_root" && "$build_script_check_root" == /tmp/carbon-build-script-check-* ]]; then
+		rm -rf -- "$build_script_check_root"
+	fi
+}
+trap cleanup EXIT INT TERM
 
 if grep -Eq 'println!.*\.git/HEAD' "$BUILD_SCRIPT"; then
 	echo "FAIL: Cargo watches a nonexistent .git/HEAD inside linked worktrees" >&2
+	failure=1
+fi
+
+if ! rustc --edition 2021 --cfg windows -A explicit_builtin_cfgs_in_flags \
+	"$BUILD_SCRIPT" -o "${build_script_check_root}/build-script-check"; then
 	failure=1
 fi
 
