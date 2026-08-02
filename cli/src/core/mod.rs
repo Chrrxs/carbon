@@ -434,6 +434,27 @@ mod manifest_capture_retry_tests {
 	}
 
 	#[test]
+	fn idle_automatic_capture_completes_successfully_when_shutdown_reuses_the_committed_artifact() {
+		let (core, directory, idle_request) = successful_capture_with_idle_monitor();
+		let acknowledgement = acknowledge_studio_probe(Arc::clone(&core), "studio-clean-1");
+		let timeout = fail_capture_after(Arc::clone(&core), idle_request.clone());
+
+		core.capture_before_shutdown().unwrap();
+		let terminal_result = core.manifest_capture_status(&idle_request).unwrap().terminal_result();
+
+		acknowledgement.join().unwrap();
+		timeout.join().unwrap();
+		core.stop_automatic_capture_monitor();
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+
+		assert!(
+			terminal_result.unwrap().is_some(),
+			"the idle automatic capture should have a successful terminal result"
+		);
+	}
+
+	#[test]
 	fn shutdown_does_not_reuse_a_capture_that_predates_a_live_studio_edit() {
 		let (core, directory, idle_request) = successful_capture_with_idle_monitor();
 		let acknowledgement = acknowledge_studio_probe(Arc::clone(&core), "studio-edit-2");
@@ -1172,6 +1193,10 @@ impl Core {
 			return Ok(None);
 		}
 
+		let message = format!(
+			"No newer Studio recovery followed the last successful capture; retained valid manifest {}",
+			self.manifest_path.display()
+		);
 		let idle_request = {
 			let mut capture = self.manifest_capture.lock().unwrap();
 			match capture.as_mut() {
@@ -1183,9 +1208,8 @@ impl Core {
 					if claim_idle_capture_cancel(&operation.phase).is_err() {
 						return Ok(None);
 					}
-					operation.state = "failed".to_owned();
-					operation.message =
-						Some("Idle automatic recovery wait stopped after the last successful capture".to_owned());
+					operation.state = "complete".to_owned();
+					operation.message = Some(message.clone());
 					Some(operation.request_id.clone())
 				}
 				Some(operation)
@@ -1213,10 +1237,6 @@ impl Core {
 			}
 		}
 
-		let message = format!(
-			"No newer Studio recovery followed the last successful capture; retained valid manifest {}",
-			self.manifest_path.display()
-		);
 		crate::carbon_info!("{message}");
 		Ok(Some(message))
 	}
