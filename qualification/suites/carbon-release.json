@@ -146,6 +146,15 @@
           }
         },
         {
+          "name": "focus-managed-studio",
+          "kind": "command",
+          "program": "${carbon}",
+          "args": ["focus", "--port", "${port}", "--color", "never"],
+          "cwd": "${repo}",
+          "timeout_seconds": 30,
+          "stderr_contains": ["Focused Roblox Studio PID"]
+        },
+        {
           "name": "author-studio-change",
           "kind": "mcp",
           "tool": "execute_luau",

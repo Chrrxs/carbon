@@ -474,9 +474,9 @@ $target = [IntPtr]::Zero
 $previous = [CarbonWindow]::GetForegroundWindow()
 [CarbonWindow]::EnumWindows({{
     param($hwnd, $state)
-    [uint32]$pid = 0
-    [CarbonWindow]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
-    if ($pid -eq {process_id} -and [CarbonWindow]::IsWindowVisible($hwnd)) {{ $script:target = $hwnd; return $false }}
+    [uint32]$windowProcessId = 0
+    [CarbonWindow]::GetWindowThreadProcessId($hwnd, [ref]$windowProcessId) | Out-Null
+    if ($windowProcessId -eq {process_id} -and [CarbonWindow]::IsWindowVisible($hwnd)) {{ $script:target = $hwnd; return $false }}
     return $true
 }}, [IntPtr]::Zero) | Out-Null
 if ($target -eq [IntPtr]::Zero) {{ throw 'Roblox Studio window was not found' }}
