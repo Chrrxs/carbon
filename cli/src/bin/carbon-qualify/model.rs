@@ -202,6 +202,25 @@ impl Step {
 				ensure!(!process.trim().is_empty(), "process name must not be empty");
 				ensure!(!expected_exit_codes.is_empty(), "expected exit codes must not be empty");
 			}
+			Action::WaitProcessOutput {
+				process,
+				stdout_contains,
+				stderr_contains,
+				..
+			} => {
+				ensure!(!process.trim().is_empty(), "process name must not be empty");
+				ensure!(
+					!stdout_contains.is_empty() || !stderr_contains.is_empty(),
+					"process output wait requires expected stdout or stderr text"
+				);
+				ensure!(
+					stdout_contains
+						.iter()
+						.chain(stderr_contains)
+						.all(|value| !value.is_empty()),
+					"expected process output text must not be empty"
+				);
+			}
 			Action::TerminateProcess { process } => {
 				ensure!(!process.trim().is_empty(), "process name must not be empty");
 			}
@@ -324,6 +343,15 @@ pub enum Action {
 		timeout_seconds: u64,
 		#[serde(default = "successful_exit_codes")]
 		expected_exit_codes: Vec<i32>,
+	},
+	WaitProcessOutput {
+		process: String,
+		#[serde(default)]
+		stdout_contains: Vec<String>,
+		#[serde(default)]
+		stderr_contains: Vec<String>,
+		#[serde(default = "default_command_timeout")]
+		timeout_seconds: u64,
 	},
 	TerminateProcess {
 		process: String,
@@ -659,6 +687,33 @@ mod tests {
 		assert_eq!(
 			capture["args"],
 			serde_json::json!(["stop", "${studio_instance}", "--color", "never"])
+		);
+		let focus = steps
+			.iter()
+			.find(|step| step["name"] == "focus-managed-studio")
+			.expect("release suite is missing final-instance focus coverage");
+		assert_eq!(
+			focus["args"],
+			serde_json::json!(["focus", "${studio_instance}", "--color", "never"])
+		);
+		let serve = steps
+			.iter()
+			.find(|step| step["name"] == "start-managed-serve")
+			.expect("release suite is missing managed serve coverage");
+		assert_eq!(serve["env"]["CARBON_STUDIO_MCP_URL"], "${mcp_url}");
+		let ready_index = steps
+			.iter()
+			.position(|step| step["name"] == "wait-for-carbon-final-id-readiness")
+			.expect("release suite does not wait for Carbon's final-ID readiness log");
+		let focus_index = steps
+			.iter()
+			.position(|step| step["name"] == "focus-managed-studio")
+			.unwrap();
+		assert!(ready_index < focus_index);
+		assert_eq!(steps[ready_index]["kind"], "wait_process_output");
+		assert_eq!(
+			steps[ready_index]["stderr_contains"],
+			serde_json::json!(["instance ID: ${studio_instance}"])
 		);
 		assert!(steps
 			.iter()

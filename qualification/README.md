@@ -28,7 +28,8 @@ creates the timestamped release tag.
 ## Host setup
 
 Qualification runs on the configured Windows or WSL development host. It
-requires Roblox Studio, robloxstudio-mcp, the Studio plugin toolchain, and Studio
+requires Roblox Studio, a running `robloxstudio-mcp` that advertises lifecycle
+protocol v3 with exact process identity, the Studio plugin toolchain, and Studio
 auto-recovery enabled.
 
 Configure the disposable fixture and MCP checkout once:
@@ -59,8 +60,9 @@ The installed suite proves three release-critical slices:
 1. The exact installed candidate starts and reports its version.
 2. Repeated builds produce identical place bytes without changing the canonical
    data directory.
-3. A managed Studio session imports an explicit binary place through `carbon
-   capture`, authors a live change, then `carbon stop` waits for the
+3. A broker-managed Studio session imports an explicit binary place through
+   `carbon capture`, proves Carbon can focus it through the broker-final MCP
+   instance ID, authors a live change, then `carbon stop` waits for the
    continuously monitored next auto-recovery file and a rebuild retains that
    change.
 
@@ -69,8 +71,10 @@ recovery deadline. No native code is loaded into Studio and no Studio binary is
 modified.
 
 Concurrent worktrees lease separate Carbon ports and run state. Each run gives
-its staged DataModel a unique name, selects that exact instance through MCP, and
-routes all probes by instance ID.
+its staged DataModel a unique name and unique managed launch, then routes focus,
+all MCP probes, and shutdown by the final instance ID returned for that launch.
+The opaque launch ID is retained separately as lifecycle evidence and is never
+used as a Studio tool-routing ID.
 
 Evidence and the passing receipt remain below
 `${XDG_STATE_HOME:-$HOME/.local/state}/carbon/qualification`. Commit without

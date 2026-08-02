@@ -8,6 +8,14 @@ use crate::{carbon_info, carbon_warn, logger::Table, sessions, util};
 
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 + 30);
 
+fn listed_instance_id(registry_id: &str, session: &sessions::Session) -> String {
+	if session.launch_id.as_deref() == Some(registry_id) {
+		"Pending".to_owned()
+	} else {
+		registry_id.to_owned()
+	}
+}
+
 /// Stop Carbon serve instances by address, instance ID, or all running instances.
 #[derive(Parser)]
 pub struct Stop {
@@ -43,11 +51,13 @@ impl Stop {
 			}
 
 			let mut table = Table::new();
-			table.set_header(vec!["ID", "Host", "Port", "PID"]);
+			table.set_header(vec!["Instance ID", "Launch ID", "Host", "Port", "PID"]);
 
 			for (id, session) in sessions {
+				let instance_id = listed_instance_id(&id, &session);
 				table.add_row(vec![
-					id,
+					instance_id,
+					session.launch_id.unwrap_or_else(|| "-".to_owned()),
 					session.host.unwrap_or("None".into()),
 					session.port.map(|p| p.to_string()).unwrap_or("None".into()),
 					session.pid.to_string(),
@@ -147,6 +157,7 @@ impl Stop {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::path::PathBuf;
 
 	#[test]
 	fn stop_accepts_reported_instance_ids() {
@@ -157,5 +168,22 @@ mod tests {
 	#[test]
 	fn stop_request_outlives_the_full_auto_recovery_wait() {
 		assert!(STOP_REQUEST_TIMEOUT > crate::recovery::CAPTURE_TIMEOUT);
+	}
+
+	#[test]
+	fn list_distinguishes_pending_launch_id_from_final_instance_id() {
+		let session = sessions::Session {
+			pid: 10,
+			host: Some("127.0.0.1".to_owned()),
+			port: Some(8000),
+			studio_pid: Some(20),
+			worktree: Some(PathBuf::from("/tmp/carbon-worktree")),
+			studio_executable: None,
+			creation_filetime: None,
+			launch_id: Some("launch-carbon-a".to_owned()),
+		};
+
+		assert_eq!(listed_instance_id("launch-carbon-a", &session), "Pending");
+		assert_eq!(listed_instance_id("anon:mcp-final", &session), "anon:mcp-final");
 	}
 }

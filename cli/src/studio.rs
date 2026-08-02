@@ -1,16 +1,349 @@
 use anyhow::{ensure, Context, Result};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use serde_json::{json, Value};
 use std::{
+	fs,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 	sync::{Arc, Mutex},
+	thread,
+	time::{Duration, Instant},
 };
 
 use crate::studio_plugin;
 
 #[cfg(target_os = "windows")]
 use winsafe::{co::SW, EnumWindows};
+
+const MCP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+const MCP_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const MCP_INSTANCE_TIMEOUT: Duration = Duration::from_secs(120);
+const MCP_PROTOCOL_VERSION: u64 = 3;
+const DEFAULT_MCP_URL: &str = "http://127.0.0.1:58741";
+const MCP_URL_ENV: &str = "CARBON_STUDIO_MCP_URL";
+
+#[derive(Clone)]
+struct McpLifecycle {
+	endpoint: String,
+	auth_token: Option<String>,
+}
+
+impl McpLifecycle {
+	fn new(endpoint: String, auth_token: Option<String>) -> Self {
+		Self { endpoint, auth_token }
+	}
+
+	fn launch(&self, path: &Path, studio_executable: &str) -> Result<ManagedLaunch> {
+		let result = mcp_tool(
+			&self.endpoint,
+			self.auth_token.as_deref(),
+			&mcp_launch_request(path, studio_executable),
+			MCP_LAUNCH_TIMEOUT,
+		)
+		.context("robloxstudio-mcp could not launch managed Roblox Studio")?;
+		let (launch_id, process_id, creation_filetime) = match managed_launch_identity(&result) {
+			Ok(identity) => identity,
+			Err(error) => {
+				let cleanup = result
+					.get("launch_id")
+					.and_then(Value::as_str)
+					.filter(|launch_id| !launch_id.is_empty())
+					.map(|launch_id| {
+						mcp_tool(
+							&self.endpoint,
+							self.auth_token.as_deref(),
+							&json!({"action": "close", "launch_id": launch_id}),
+							MCP_LIFECYCLE_TIMEOUT,
+						)
+					});
+				return match cleanup {
+					Some(Ok(_)) => Err(error.context("invalid managed launch attestation; broker cleanup completed")),
+					Some(Err(cleanup_error)) => Err(error.context(format!(
+						"invalid managed launch attestation and broker cleanup also failed: {cleanup_error:#}"
+					))),
+					None => Err(error.context(
+						"invalid managed launch attestation omitted launch_id; broker retains its ownership-completion lease for cleanup",
+					)),
+				};
+			}
+		};
+		Ok(ManagedLaunch {
+			lifecycle: self.clone(),
+			launch_id,
+			process_id,
+			creation_filetime,
+		})
+	}
+}
+
+fn discover_mcp_lifecycle() -> Result<McpLifecycle> {
+	let base_url = std::env::var(MCP_URL_ENV).unwrap_or_else(|_| DEFAULT_MCP_URL.to_owned());
+	let health_url = mcp_health_url(&base_url)
+		.with_context(|| format!("invalid robloxstudio-mcp URL from {MCP_URL_ENV}: {base_url:?}"))?;
+	let health: Value = reqwest::blocking::Client::builder()
+		.connect_timeout(MCP_PROBE_TIMEOUT)
+		.timeout(MCP_PROBE_TIMEOUT)
+		.build()?
+		.get(&health_url)
+		.header("Accept", "application/json")
+		.send()
+		.with_context(|| {
+			format!(
+				"managed Carbon serve requires robloxstudio-mcp lifecycle protocol {MCP_PROTOCOL_VERSION}, but {health_url} was unavailable"
+			)
+		})?
+		.error_for_status()
+		.context("robloxstudio-mcp health request failed")?
+		.json()
+		.context("robloxstudio-mcp health returned invalid JSON")?;
+	let endpoint = mcp_lifecycle_endpoint(&base_url, &health).with_context(|| {
+		format!(
+			"robloxstudio-mcp at {base_url} does not advertise lifecycle protocol {MCP_PROTOCOL_VERSION} with exact process identity"
+		)
+	})?;
+	Ok(McpLifecycle::new(endpoint, load_mcp_auth_token()))
+}
+
+fn mcp_health_url(base_url: &str) -> Result<String> {
+	let mut url = reqwest::Url::parse(base_url.trim())?;
+	ensure!(url.scheme() == "http", "Studio lifecycle MCP URL must use http");
+	ensure!(
+		matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")),
+		"Studio lifecycle MCP URL must use a loopback host"
+	);
+	ensure!(
+		url.username().is_empty() && url.password().is_none(),
+		"Studio lifecycle MCP URL must not contain credentials"
+	);
+	url.set_query(None);
+	url.set_fragment(None);
+	url.set_path("/health");
+	Ok(url.into())
+}
+
+fn mcp_lifecycle_endpoint(base_url: &str, health: &Value) -> Option<String> {
+	if health.get("status").and_then(Value::as_str) != Some("ok")
+		|| health.get("service").and_then(Value::as_str) != Some("robloxstudio-mcp")
+		|| health.get("serverName").and_then(Value::as_str) != Some("robloxstudio-mcp")
+	{
+		return None;
+	}
+	let capability = health.pointer("/capabilities/studioLifecycle")?;
+	if capability.get("protocolVersion").and_then(Value::as_u64) != Some(MCP_PROTOCOL_VERSION)
+		|| capability.get("endpoint").and_then(Value::as_str) != Some("/mcp/manage_instance")
+		|| capability
+			.pointer("/processIdentity/supported")
+			.and_then(Value::as_bool)
+			!= Some(true)
+	{
+		return None;
+	}
+	let mut url = reqwest::Url::parse(base_url.trim()).ok()?;
+	if url.scheme() != "http"
+		|| !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+		|| !url.username().is_empty()
+		|| url.password().is_some()
+	{
+		return None;
+	}
+	url.set_query(None);
+	url.set_fragment(None);
+	url.set_path("/mcp/manage_instance");
+	Some(url.into())
+}
+
+fn load_mcp_auth_token() -> Option<String> {
+	if std::env::var("ROBLOX_STUDIO_NO_AUTH")
+		.is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+	{
+		return None;
+	}
+	if let Ok(token) = std::env::var("ROBLOX_STUDIO_AUTH_TOKEN") {
+		let token = token.trim().to_owned();
+		if !token.is_empty() {
+			return Some(token);
+		}
+	}
+	let home = std::env::var_os("HOME")
+		.or_else(|| std::env::var_os("USERPROFILE"))
+		.map(PathBuf::from)
+		.map(|path| path.join(".robloxstudio-mcp").join("auth-token"));
+	home.and_then(|path| fs::read_to_string(path).ok())
+		.map(|token| token.trim().to_owned())
+		.filter(|token| !token.is_empty())
+}
+
+#[derive(Clone)]
+struct ManagedLaunch {
+	lifecycle: McpLifecycle,
+	launch_id: String,
+	process_id: u32,
+	creation_filetime: u64,
+}
+
+impl ManagedLaunch {
+	fn request(&self, action: &str) -> Result<Value> {
+		mcp_tool(
+			&self.lifecycle.endpoint,
+			self.lifecycle.auth_token.as_deref(),
+			&json!({"action": action, "launch_id": self.launch_id}),
+			MCP_LIFECYCLE_TIMEOUT,
+		)
+		.with_context(|| format!("robloxstudio-mcp could not {action} Studio launch {}", self.launch_id))
+	}
+
+	fn has_exact_identity(&self, result: &Value) -> bool {
+		result.get("launch_id").and_then(Value::as_str) == Some(self.launch_id.as_str())
+			&& result.get("managed").and_then(Value::as_bool) == Some(true)
+			&& result.get("source").and_then(Value::as_str) == Some("local_file")
+			&& result.get("pid").and_then(Value::as_u64) == Some(u64::from(self.process_id))
+			&& result
+				.get("process_started_at_file_time")
+				.and_then(Value::as_str)
+				.and_then(|value| value.parse::<u64>().ok())
+				== Some(self.creation_filetime)
+			&& result.get("process_running").and_then(Value::as_bool) == Some(true)
+	}
+
+	fn authorize(&self) -> Result<()> {
+		let result = self.request("authorize")?;
+		ensure!(
+			self.has_exact_identity(&result)
+				&& matches!(
+					result.get("state").and_then(Value::as_str),
+					Some("launching" | "connected")
+				) && result.get("process_authorized").and_then(Value::as_bool) == Some(true),
+			"robloxstudio-mcp did not authorize the exact Studio process for launch {}",
+			self.launch_id
+		);
+		Ok(())
+	}
+
+	fn complete(&self) -> Result<()> {
+		let result = self.request("complete")?;
+		ensure!(
+			self.has_exact_identity(&result)
+				&& matches!(
+					result.get("state").and_then(Value::as_str),
+					Some("launching" | "connected")
+				) && result.get("process_authorized").and_then(Value::as_bool) == Some(true)
+				&& result.get("process_ownership_released").and_then(Value::as_bool) == Some(true),
+			"robloxstudio-mcp did not release ownership of the exact Studio process for launch {}",
+			self.launch_id
+		);
+		Ok(())
+	}
+
+	fn connected_instance_id(&self) -> Result<String> {
+		let deadline = Instant::now() + MCP_INSTANCE_TIMEOUT;
+		loop {
+			let request_error = match self.request("status") {
+				Ok(result) => {
+					if let Some(instance_id) = self.connected_instance_id_from_status(&result)? {
+						return Ok(instance_id);
+					}
+					None
+				}
+				Err(error) => {
+					log::debug!("waiting for Studio launch {} association: {error:#}", self.launch_id);
+					Some(error)
+				}
+			};
+			if Instant::now() >= deadline {
+				let message = format!(
+					"robloxstudio-mcp Studio launch {} did not report a final instance_id within {} seconds",
+					self.launch_id,
+					MCP_INSTANCE_TIMEOUT.as_secs()
+				);
+				return match request_error {
+					Some(error) => Err(error).context(message),
+					None => anyhow::bail!(message),
+				};
+			}
+			thread::sleep(Duration::from_millis(100));
+		}
+	}
+
+	fn connected_instance_id_from_status(&self, result: &Value) -> Result<Option<String>> {
+		let state = result.get("state").and_then(Value::as_str).unwrap_or("unknown");
+		ensure!(
+			!matches!(state, "failed" | "exited"),
+			"robloxstudio-mcp Studio launch {} entered state {state} before association",
+			self.launch_id
+		);
+		ensure!(
+			result.get("launch_id").and_then(Value::as_str) == Some(self.launch_id.as_str())
+				&& result.get("managed").and_then(Value::as_bool) == Some(true)
+				&& result.get("pid").and_then(Value::as_u64) == Some(u64::from(self.process_id))
+				&& result.get("process_running").and_then(Value::as_bool) == Some(true),
+			"robloxstudio-mcp did not report the exact running Studio process for launch {}",
+			self.launch_id
+		);
+		if state != "connected" {
+			return Ok(None);
+		}
+		Ok(Some(
+			result
+				.get("instance_id")
+				.and_then(Value::as_str)
+				.filter(|value| !value.is_empty())
+				.map(str::to_owned)
+				.context("robloxstudio-mcp connected Studio status did not include instance_id")?,
+		))
+	}
+
+	fn close(&self) -> Result<()> {
+		let result = self.request("close")?;
+		ensure!(
+			result.get("launch_id").and_then(Value::as_str) == Some(self.launch_id.as_str())
+				&& matches!(
+					result.get("close_status").and_then(Value::as_str),
+					Some("closed" | "already_closed")
+				) && result.get("process_running").and_then(Value::as_bool) == Some(false),
+			"robloxstudio-mcp did not confirm exact closure of Studio launch {}",
+			self.launch_id
+		);
+		Ok(())
+	}
+}
+
+fn authorize_managed_launch(launch: &ManagedLaunch) -> Result<()> {
+	if let Err(error) = launch.authorize() {
+		return match launch.close() {
+			Ok(()) => Err(error.context("managed Studio launch authorization failed; broker cleanup completed")),
+			Err(cleanup_error) => Err(error.context(format!(
+				"managed Studio launch authorization failed and broker cleanup also failed: {cleanup_error:#}"
+			))),
+		};
+	}
+	Ok(())
+}
+
+fn complete_managed_launch(launch: &ManagedLaunch) -> Result<()> {
+	if let Err(error) = launch.complete() {
+		return match launch.close() {
+			Ok(()) => Err(error.context("managed Studio ownership completion failed; broker cleanup completed")),
+			Err(cleanup_error) => Err(error.context(format!(
+				"managed Studio ownership completion failed and broker cleanup also failed: {cleanup_error:#}"
+			))),
+		};
+	}
+	Ok(())
+}
+
+fn associate_managed_launch(launch: &ManagedLaunch) -> Result<String> {
+	match launch.connected_instance_id() {
+		Ok(instance_id) => Ok(instance_id),
+		Err(error) => match launch.close() {
+			Ok(()) => Err(error.context("managed Studio association failed; broker cleanup completed")),
+			Err(cleanup_error) => Err(error.context(format!(
+				"managed Studio association failed and broker cleanup also failed: {cleanup_error:#}"
+			))),
+		},
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocusMetadata {
@@ -28,40 +361,73 @@ pub struct StudioInfo {
 
 #[derive(Clone)]
 pub struct ManagedStudio {
-	process_id: u32,
-	data_model_name: String,
+	launch: ManagedLaunch,
 	studio_executable: String,
-	creation_filetime: u64,
 	startup_guard: Arc<Mutex<Option<studio_plugin::Installation>>>,
 }
 
 impl ManagedStudio {
 	pub fn process_id(&self) -> u32 {
-		self.process_id
+		self.launch.process_id
+	}
+
+	pub fn launch_id(&self) -> &str {
+		&self.launch.launch_id
 	}
 
 	pub fn owner(&self) -> &'static str {
-		"Carbon"
+		"robloxstudio-mcp"
 	}
 
 	pub fn focus_metadata(&self) -> Option<FocusMetadata> {
 		Some(FocusMetadata {
 			studio_executable: self.studio_executable.clone(),
-			creation_filetime: self.creation_filetime,
+			creation_filetime: self.launch.creation_filetime,
 		})
 	}
 
-	pub fn finish_startup(&self) {
-		self.startup_guard.lock().unwrap().take();
+	fn finish_startup(&self) -> Result<()> {
+		let mut startup_guard = self.startup_guard.lock().unwrap();
+		if startup_guard.is_none() {
+			return Ok(());
+		}
+		complete_managed_launch(&self.launch)?;
+		startup_guard.take();
+		Ok(())
 	}
 
-	pub fn wait_for_instance_id(&self) -> Result<Option<String>> {
-		let _ = &self.data_model_name;
-		Ok(None)
+	pub fn establish_instance_id(&self) -> Result<String> {
+		let established = (|| {
+			self.finish_startup()?;
+			associate_managed_launch(&self.launch)
+		})();
+		match established {
+			Ok(instance_id) => Ok(instance_id),
+			Err(error) => match self.stop() {
+				Ok(()) => Err(error),
+				Err(cleanup_error) => Err(error.context(format!(
+					"managed Studio startup cleanup also failed for launch {}: {cleanup_error:#}",
+					self.launch_id()
+				))),
+			},
+		}
 	}
 
 	pub fn stop(&self) -> Result<()> {
-		terminate_process(self.process_id, &self.studio_executable, self.creation_filetime)
+		match self.launch.close() {
+			Ok(()) => Ok(()),
+			Err(broker_error) => terminate_process(
+				self.process_id(),
+				&self.studio_executable,
+				self.launch.creation_filetime,
+			)
+			.with_context(|| {
+				format!(
+					"robloxstudio-mcp could not close Studio launch {} ({broker_error:#}); exact-process fallback also failed",
+					self.launch_id()
+				)
+			}),
+		}
 	}
 }
 
@@ -77,6 +443,87 @@ fn ensure_plugin() -> Result<studio_plugin::Installation> {
 		}
 	}
 	Ok(installation)
+}
+
+fn mcp_launch_request(path: &Path, studio_executable: &str) -> Value {
+	json!({
+		"action": "launch",
+		"source": "local_file",
+		"local_place_file": path,
+		"studio_executable": studio_executable,
+		"require_process_identity": true,
+		"wait_for_connection": false,
+	})
+}
+
+fn managed_launch_identity(result: &Value) -> Result<(String, u32, u64)> {
+	let launch_id = result
+		.get("launch_id")
+		.and_then(Value::as_str)
+		.filter(|value| !value.is_empty())
+		.context("robloxstudio-mcp launch response did not include launch_id")?
+		.to_owned();
+	let process_id = result
+		.get("pid")
+		.and_then(Value::as_u64)
+		.filter(|value| *value > 0)
+		.and_then(|value| u32::try_from(value).ok())
+		.context("robloxstudio-mcp launch response did not include a valid native Studio PID")?;
+	let creation_filetime = result
+		.get("process_started_at_file_time")
+		.and_then(Value::as_str)
+		.and_then(|value| value.parse::<u64>().ok())
+		.filter(|value| *value > 0)
+		.context("robloxstudio-mcp launch response did not include the native Studio process creation time")?;
+	ensure!(
+		result.get("managed").and_then(Value::as_bool) == Some(true)
+			&& result.get("source").and_then(Value::as_str) == Some("local_file")
+			&& result.get("state").and_then(Value::as_str) == Some("launching")
+			&& result.get("process_running").and_then(Value::as_bool) == Some(true)
+			&& result.get("process_authorized").and_then(Value::as_bool) == Some(false),
+		"robloxstudio-mcp did not return a suspended managed local-file launch awaiting Carbon authorization"
+	);
+	Ok((launch_id, process_id, creation_filetime))
+}
+
+fn mcp_tool(endpoint: &str, auth_token: Option<&str>, payload: &Value, timeout: Duration) -> Result<Value> {
+	let client = reqwest::blocking::Client::builder()
+		.connect_timeout(timeout)
+		.timeout(timeout)
+		.build()?;
+	let mut request = client.post(endpoint).header("Accept", "application/json").json(payload);
+	if let Some(token) = auth_token {
+		request = request.header("X-MCP-Auth", token);
+	}
+	let response = request
+		.send()
+		.with_context(|| format!("robloxstudio-mcp lifecycle request to {endpoint} failed"))?;
+	let status = response.status();
+	let body = response
+		.bytes()
+		.context("failed to read robloxstudio-mcp lifecycle response")?;
+	ensure!(
+		status.is_success(),
+		"robloxstudio-mcp lifecycle request returned HTTP {status}"
+	);
+	let envelope: Value =
+		serde_json::from_slice(&body).context("robloxstudio-mcp lifecycle response was invalid JSON")?;
+	let result = envelope
+		.get("content")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+		.filter_map(|item| item.get("text").and_then(Value::as_str))
+		.find_map(|text| serde_json::from_str::<Value>(text).ok())
+		.context("robloxstudio-mcp lifecycle response contained no JSON result")?;
+	ensure!(
+		envelope.get("isError").and_then(Value::as_bool) != Some(true)
+			&& result.get("error").is_none_or(Value::is_null)
+			&& result.get("success").and_then(Value::as_bool) != Some(false),
+		"robloxstudio-mcp rejected the lifecycle request"
+	);
+	Ok(result)
 }
 
 fn parse_version(raw: &str) -> Result<(String, [u32; 4])> {
@@ -259,6 +706,17 @@ fn windows_path(path: &Path, description: &str) -> Result<String> {
 	Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+fn broker_studio_executable(studio: &StudioInfo) -> Result<String> {
+	#[cfg(target_os = "linux")]
+	{
+		windows_path(&studio.executable, "Roblox Studio executable")
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		Ok(studio.executable.to_string_lossy().into_owned())
+	}
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn launch_process(path: Option<&Path>, studio: &StudioInfo) -> Result<(u32, String, u64)> {
 	#[cfg(target_os = "linux")]
@@ -334,17 +792,13 @@ pub fn launch(path: Option<PathBuf>) -> Result<Option<u32>> {
 pub fn launch_managed(path: PathBuf, _studio_dir: &Path) -> Result<ManagedStudio> {
 	let installation = ensure_plugin()?;
 	let studio = get_studio_info()?;
-	let data_model_name = path
-		.file_name()
-		.context("managed Studio place path has no file name")?
-		.to_string_lossy()
-		.into_owned();
-	let (process_id, studio_executable, creation_filetime) = launch_process(Some(&path), &studio)?;
+	let studio_executable = broker_studio_executable(&studio)?;
+	let lifecycle = discover_mcp_lifecycle()?;
+	let launch = lifecycle.launch(&path, &studio_executable)?;
+	authorize_managed_launch(&launch)?;
 	Ok(ManagedStudio {
-		process_id,
-		data_model_name,
+		launch,
 		studio_executable,
-		creation_filetime,
 		startup_guard: Arc::new(Mutex::new(Some(installation))),
 	})
 }
@@ -429,6 +883,78 @@ pub fn wait_for_exit(process_id: u32) -> Result<()> {
 	Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn wsl_focus_script(process_id: u32, validation: &str, restore_previous: bool) -> String {
+	let restore = if restore_previous {
+		"if ($previous -ne [IntPtr]::Zero) { [CarbonWindow]::ShowWindow($previous, 9) | Out-Null; [CarbonWindow]::SetForegroundWindow($previous) | Out-Null }"
+	} else {
+		""
+	};
+	format!(
+		r#"
+{validation}
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class CarbonWindow {{
+    public delegate bool EnumProc(IntPtr hwnd, IntPtr param);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc proc, IntPtr param);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+}}
+'@
+$target = [IntPtr]::Zero
+$previous = [CarbonWindow]::GetForegroundWindow()
+[CarbonWindow]::EnumWindows({{
+    param($hwnd, $state)
+    [uint32]$windowProcessId = 0
+    [CarbonWindow]::GetWindowThreadProcessId($hwnd, [ref]$windowProcessId) | Out-Null
+    if ($windowProcessId -eq {process_id} -and [CarbonWindow]::IsWindowVisible($hwnd)) {{ $script:target = $hwnd; return $false }}
+    return $true
+}}, [IntPtr]::Zero) | Out-Null
+if ($target -eq [IntPtr]::Zero) {{ throw 'Roblox Studio window was not found' }}
+[CarbonWindow]::ShowWindow($target, 9) | Out-Null
+[CarbonWindow]::SetForegroundWindow($target) | Out-Null
+if ([CarbonWindow]::GetForegroundWindow() -ne $target) {{
+    $currentThread = [CarbonWindow]::GetCurrentThreadId()
+    [uint32]$targetProcessId = 0
+    $targetThread = [CarbonWindow]::GetWindowThreadProcessId($target, [ref]$targetProcessId)
+    $foreground = [CarbonWindow]::GetForegroundWindow()
+    [uint32]$foregroundProcessId = 0
+    $foregroundThread = if ($foreground -ne [IntPtr]::Zero) {{ [CarbonWindow]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId) }} else {{ 0 }}
+    $attachedForeground = $false
+    $attachedTarget = $false
+    try {{
+        if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {{
+            $attachedForeground = [CarbonWindow]::AttachThreadInput($currentThread, $foregroundThread, $true)
+        }}
+        if ($targetThread -ne 0 -and $targetThread -ne $currentThread -and $targetThread -ne $foregroundThread) {{
+            $attachedTarget = [CarbonWindow]::AttachThreadInput($currentThread, $targetThread, $true)
+        }}
+        [CarbonWindow]::BringWindowToTop($target) | Out-Null
+        [CarbonWindow]::SetForegroundWindow($target) | Out-Null
+        [CarbonWindow]::SetFocus($target) | Out-Null
+    }} finally {{
+        if ($attachedTarget) {{ [CarbonWindow]::AttachThreadInput($currentThread, $targetThread, $false) | Out-Null }}
+        if ($attachedForeground) {{ [CarbonWindow]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }}
+    }}
+}}
+for ($attempt = 0; $attempt -lt 20 -and [CarbonWindow]::GetForegroundWindow() -ne $target; $attempt++) {{
+    Start-Sleep -Milliseconds 10
+}}
+if ([CarbonWindow]::GetForegroundWindow() -ne $target) {{ throw 'Roblox Studio rejected foreground activation' }}
+{restore}
+"#
+	)
+}
+
 pub fn focus_process(
 	process_id: u32,
 	creation_filetime: Option<u64>,
@@ -449,42 +975,7 @@ pub fn focus_process(
 	#[cfg(target_os = "linux")]
 	{
 		let validation = validate_process_script(process_id, studio_executable, creation_filetime);
-		let restore = if restore_previous {
-			"if ($previous -ne [IntPtr]::Zero) { [CarbonWindow]::ShowWindow($previous, 9) | Out-Null; [CarbonWindow]::SetForegroundWindow($previous) | Out-Null }"
-		} else {
-			""
-		};
-		let script = format!(
-			r#"
-{validation}
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class CarbonWindow {{
-    public delegate bool EnumProc(IntPtr hwnd, IntPtr param);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc proc, IntPtr param);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command);
-}}
-'@
-$target = [IntPtr]::Zero
-$previous = [CarbonWindow]::GetForegroundWindow()
-[CarbonWindow]::EnumWindows({{
-    param($hwnd, $state)
-    [uint32]$windowProcessId = 0
-    [CarbonWindow]::GetWindowThreadProcessId($hwnd, [ref]$windowProcessId) | Out-Null
-    if ($windowProcessId -eq {process_id} -and [CarbonWindow]::IsWindowVisible($hwnd)) {{ $script:target = $hwnd; return $false }}
-    return $true
-}}, [IntPtr]::Zero) | Out-Null
-if ($target -eq [IntPtr]::Zero) {{ throw 'Roblox Studio window was not found' }}
-[CarbonWindow]::ShowWindow($target, 9) | Out-Null
-if (-not [CarbonWindow]::SetForegroundWindow($target)) {{ throw 'Roblox Studio rejected foreground activation' }}
-{restore}
-"#
-		);
+		let script = wsl_focus_script(process_id, &validation, restore_previous);
 		let output = powershell_command()?
 			.args(["-NoProfile", "-NonInteractive", "-Command", &script])
 			.output()?;
@@ -617,5 +1108,474 @@ pub(crate) fn powershell_command() -> Result<Command> {
 	#[cfg(target_os = "windows")]
 	{
 		Ok(Command::new("powershell.exe"))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use serde_json::json;
+	use std::{
+		io::{Read, Write},
+		net::{TcpListener, TcpStream},
+		sync::{Arc, Mutex as StdMutex},
+		thread,
+	};
+
+	fn read_json_request(stream: &mut TcpStream) -> Value {
+		let mut bytes = Vec::new();
+		let mut buffer = [0_u8; 4096];
+		loop {
+			let read = stream.read(&mut buffer).unwrap();
+			bytes.extend_from_slice(&buffer[..read]);
+			let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+				continue;
+			};
+			let headers = String::from_utf8_lossy(&bytes[..header_end]);
+			let content_length = headers
+				.lines()
+				.find_map(|line| {
+					line.to_ascii_lowercase()
+						.strip_prefix("content-length: ")
+						.map(str::to_owned)
+				})
+				.unwrap()
+				.parse::<usize>()
+				.unwrap();
+			let body_start = header_end + 4;
+			if bytes.len() >= body_start + content_length {
+				return serde_json::from_slice(&bytes[body_start..body_start + content_length]).unwrap();
+			}
+		}
+	}
+
+	fn write_json_result(mut stream: TcpStream, result: Value) {
+		let body = serde_json::to_vec(&json!({
+			"content": [{"type": "text", "text": result.to_string()}],
+		}))
+		.unwrap();
+		write!(
+			stream,
+			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+			body.len()
+		)
+		.unwrap();
+		stream.write_all(&body).unwrap();
+	}
+
+	fn write_json_error(mut stream: TcpStream, status: &str) {
+		let body = br#"{"error":"synthetic lifecycle failure"}"#;
+		write!(
+			stream,
+			"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+			body.len()
+		)
+		.unwrap();
+		stream.write_all(body).unwrap();
+	}
+
+	#[test]
+	fn managed_launch_requires_broker_process_identity_before_connection() {
+		let request = mcp_launch_request(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe");
+
+		assert_eq!(
+			request,
+			json!({
+				"action": "launch",
+				"source": "local_file",
+				"local_place_file": "/tmp/carbon-managed.rbxl",
+				"studio_executable": r"C:\Roblox\RobloxStudioBeta.exe",
+				"require_process_identity": true,
+				"wait_for_connection": false,
+			})
+		);
+	}
+
+	#[test]
+	fn managed_launch_accepts_only_an_exact_suspended_broker_identity() {
+		let response = json!({
+			"launch_id": "launch-carbon-a",
+			"managed": true,
+			"source": "local_file",
+			"state": "launching",
+			"pid": 47312,
+			"process_started_at_file_time": "133700123456",
+			"process_running": true,
+			"process_authorized": false,
+		});
+
+		assert_eq!(
+			managed_launch_identity(&response).unwrap(),
+			("launch-carbon-a".to_owned(), 47_312, 133_700_123_456)
+		);
+
+		let mut already_authorized = response.clone();
+		already_authorized["process_authorized"] = json!(true);
+		assert!(managed_launch_identity(&already_authorized).is_err());
+
+		let mut no_creation_identity = response;
+		no_creation_identity
+			.as_object_mut()
+			.unwrap()
+			.remove("process_started_at_file_time");
+		assert!(managed_launch_identity(&no_creation_identity).is_err());
+	}
+
+	#[test]
+	fn managed_lifecycle_returns_only_the_final_broker_instance_id() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let endpoint = format!("http://{}/mcp/manage_instance", listener.local_addr().unwrap());
+		let observed = Arc::new(StdMutex::new(Vec::new()));
+		let server_observed = Arc::clone(&observed);
+		let server = thread::spawn(move || {
+			let responses = [
+				json!({
+					"launch_id": "launch-carbon-a", "managed": true, "source": "local_file",
+					"state": "launching", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": true, "process_authorized": false,
+				}),
+				json!({
+					"launch_id": "launch-carbon-a", "managed": true, "source": "local_file",
+					"state": "launching", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": true, "process_authorized": true,
+				}),
+				json!({
+					"launch_id": "launch-carbon-a", "managed": true, "source": "local_file",
+					"state": "launching", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": true, "process_authorized": true,
+					"process_ownership_released": true,
+				}),
+				json!({
+					"launch_id": "launch-carbon-a", "managed": true,
+					"state": "launching", "pid": 47312,
+					"process_running": true,
+				}),
+				json!({
+					"launch_id": "launch-carbon-a", "instance_id": "anon:mcp-final",
+					"managed": true, "state": "connected", "pid": 47312,
+					"process_running": true, "roles": ["edit"],
+				}),
+			];
+			for response in responses {
+				let (mut stream, _) = listener.accept().unwrap();
+				server_observed.lock().unwrap().push(read_json_request(&mut stream));
+				write_json_result(stream, response);
+			}
+		});
+
+		let lifecycle = McpLifecycle::new(endpoint, None);
+		let launch = lifecycle
+			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.unwrap();
+		launch.authorize().unwrap();
+		launch.complete().unwrap();
+		assert_eq!(launch.connected_instance_id().unwrap(), "anon:mcp-final");
+		server.join().unwrap();
+
+		let actions = observed
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|request| request["action"].as_str().unwrap().to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(actions, ["launch", "authorize", "complete", "status", "status"]);
+	}
+
+	#[test]
+	fn managed_lifecycle_discovery_requires_protocol_v3_process_identity() {
+		let mut health = json!({
+			"status": "ok",
+			"service": "robloxstudio-mcp",
+			"serverName": "robloxstudio-mcp",
+			"capabilities": {
+				"studioLifecycle": {
+					"protocolVersion": 3,
+					"endpoint": "/mcp/manage_instance",
+					"processIdentity": {"supported": true},
+				}
+			}
+		});
+
+		assert_eq!(
+			mcp_lifecycle_endpoint("http://127.0.0.1:58741", &health).as_deref(),
+			Some("http://127.0.0.1:58741/mcp/manage_instance")
+		);
+
+		health["capabilities"]["studioLifecycle"]["processIdentity"]["supported"] = json!(false);
+		assert!(mcp_lifecycle_endpoint("http://127.0.0.1:58741", &health).is_none());
+		health["capabilities"]["studioLifecycle"]["processIdentity"]["supported"] = json!(true);
+		health["capabilities"]["studioLifecycle"]["protocolVersion"] = json!(2);
+		assert!(mcp_lifecycle_endpoint("http://127.0.0.1:58741", &health).is_none());
+	}
+
+	#[test]
+	fn managed_authorization_failure_closes_the_exact_broker_launch() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let endpoint = format!("http://{}/mcp/manage_instance", listener.local_addr().unwrap());
+		let observed = Arc::new(StdMutex::new(Vec::new()));
+		let server_observed = Arc::clone(&observed);
+		let server = thread::spawn(move || {
+			let (mut launch_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut launch_stream));
+			write_json_result(
+				launch_stream,
+				json!({
+					"launch_id": "launch-cleanup", "managed": true, "source": "local_file",
+					"state": "launching", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": true, "process_authorized": false,
+				}),
+			);
+
+			let (mut authorize_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut authorize_stream));
+			write_json_error(authorize_stream, "500 Internal Server Error");
+
+			let (mut close_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut close_stream));
+			write_json_result(
+				close_stream,
+				json!({
+					"launch_id": "launch-cleanup", "managed": true, "source": "local_file",
+					"state": "failed", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": false, "close_status": "closed",
+				}),
+			);
+		});
+
+		let lifecycle = McpLifecycle::new(endpoint, None);
+		let launch = lifecycle
+			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.unwrap();
+		let error = authorize_managed_launch(&launch).unwrap_err();
+		assert!(format!("{error:#}").contains("authorization failed"));
+		server.join().unwrap();
+
+		let actions = observed
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|request| request["action"].as_str().unwrap().to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(actions, ["launch", "authorize", "close"]);
+	}
+
+	#[test]
+	fn managed_completion_failure_closes_the_exact_broker_launch() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let endpoint = format!("http://{}/mcp/manage_instance", listener.local_addr().unwrap());
+		let observed = Arc::new(StdMutex::new(Vec::new()));
+		let server_observed = Arc::clone(&observed);
+		let server = thread::spawn(move || {
+			let (mut launch_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut launch_stream));
+			write_json_result(
+				launch_stream,
+				json!({
+					"launch_id": "launch-completion-cleanup", "managed": true, "source": "local_file",
+					"state": "launching", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": true, "process_authorized": false,
+				}),
+			);
+
+			let (mut complete_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut complete_stream));
+			write_json_error(complete_stream, "500 Internal Server Error");
+
+			let (mut close_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut close_stream));
+			write_json_result(
+				close_stream,
+				json!({
+					"launch_id": "launch-completion-cleanup", "managed": true, "source": "local_file",
+					"state": "failed", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": false, "close_status": "already_closed",
+				}),
+			);
+		});
+
+		let lifecycle = McpLifecycle::new(endpoint, None);
+		let launch = lifecycle
+			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.unwrap();
+		let error = complete_managed_launch(&launch).unwrap_err();
+		assert!(format!("{error:#}").contains("ownership completion failed"));
+		server.join().unwrap();
+
+		let actions = observed
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|request| request["action"].as_str().unwrap().to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(actions, ["launch", "complete", "close"]);
+	}
+
+	#[test]
+	fn managed_association_failure_closes_the_exact_broker_launch() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let endpoint = format!("http://{}/mcp/manage_instance", listener.local_addr().unwrap());
+		let observed = Arc::new(StdMutex::new(Vec::new()));
+		let server_observed = Arc::clone(&observed);
+		let server = thread::spawn(move || {
+			let (mut launch_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut launch_stream));
+			write_json_result(
+				launch_stream,
+				json!({
+					"launch_id": "launch-association-cleanup", "managed": true, "source": "local_file",
+					"state": "launching", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": true, "process_authorized": false,
+				}),
+			);
+
+			let (mut status_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut status_stream));
+			write_json_result(
+				status_stream,
+				json!({
+					"launch_id": "launch-association-cleanup", "managed": true,
+					"state": "failed", "pid": 47312, "process_running": false,
+					"failure_reason": "ambiguous association",
+				}),
+			);
+
+			let (mut close_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut close_stream));
+			write_json_result(
+				close_stream,
+				json!({
+					"launch_id": "launch-association-cleanup", "managed": true, "source": "local_file",
+					"state": "failed", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": false, "close_status": "already_closed",
+				}),
+			);
+		});
+
+		let lifecycle = McpLifecycle::new(endpoint, None);
+		let launch = lifecycle
+			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.unwrap();
+		let error = associate_managed_launch(&launch).unwrap_err();
+		assert!(format!("{error:#}").contains("association failed"));
+		server.join().unwrap();
+
+		let actions = observed
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|request| request["action"].as_str().unwrap().to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(actions, ["launch", "status", "close"]);
+	}
+
+	#[test]
+	fn invalid_launch_attestation_closes_by_launch_id() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let endpoint = format!("http://{}/mcp/manage_instance", listener.local_addr().unwrap());
+		let observed = Arc::new(StdMutex::new(Vec::new()));
+		let server_observed = Arc::clone(&observed);
+		let server = thread::spawn(move || {
+			let (mut launch_stream, _) = listener.accept().unwrap();
+			server_observed
+				.lock()
+				.unwrap()
+				.push(read_json_request(&mut launch_stream));
+			write_json_result(
+				launch_stream,
+				json!({
+					"launch_id": "launch-invalid-attestation", "managed": true, "source": "local_file",
+					"state": "launching", "pid": 47312,
+					"process_started_at_file_time": "133700123456",
+					"process_running": true, "process_authorized": true,
+				}),
+			);
+
+			listener.set_nonblocking(true).unwrap();
+			let deadline = Instant::now() + Duration::from_millis(500);
+			while Instant::now() < deadline {
+				match listener.accept() {
+					Ok((mut close_stream, _)) => {
+						server_observed
+							.lock()
+							.unwrap()
+							.push(read_json_request(&mut close_stream));
+						write_json_result(
+							close_stream,
+							json!({
+								"launch_id": "launch-invalid-attestation", "managed": true,
+								"state": "failed", "pid": 47312,
+								"process_running": false, "close_status": "closed",
+							}),
+						);
+						return;
+					}
+					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+						thread::sleep(Duration::from_millis(10));
+					}
+					Err(error) => panic!("unexpected fake broker accept error: {error}"),
+				}
+			}
+		});
+
+		let lifecycle = McpLifecycle::new(endpoint, None);
+		assert!(lifecycle
+			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.is_err());
+		server.join().unwrap();
+
+		let actions = observed
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|request| request["action"].as_str().unwrap().to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(actions, ["launch", "close"]);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn wsl_focus_verifies_foreground_state_and_uses_thread_input_fallback() {
+		let script = wsl_focus_script(47_312, "# exact process validation", false);
+
+		assert!(script.contains("GetForegroundWindow() -ne $target"));
+		assert!(script.contains("AttachThreadInput"));
+		assert!(script.contains("BringWindowToTop"));
+		assert!(script.contains("SetFocus"));
 	}
 }

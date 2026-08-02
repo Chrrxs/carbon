@@ -78,6 +78,8 @@ See [Usage and project format](USAGE.md) for the full mapping and capture rules.
 - Windows 10 or 11 on an x86_64 machine
 - Roblox Studio on Windows
 - Carbon CLI on native Windows or WSL2
+- `robloxstudio-mcp` running on loopback with Studio lifecycle protocol v3 and
+  exact process identity enabled
 - [Rokit](https://github.com/rojo-rbx/rokit) in the CLI environment
 - Roblox Studio auto-recovery enabled
 
@@ -87,9 +89,14 @@ See [Usage and project format](USAGE.md) for the full mapping and capture rules.
 rokit add Chrrxs/carbon
 ```
 
+Install and start
+[`robloxstudio-mcp`](https://github.com/Chrrxs/robloxstudio-mcp) through its
+normal MCP client integration before running managed `carbon serve`.
+
 The executable includes its matching Studio plugin. Carbon installs or updates
-it when `serve` or `studio` starts. Carbon does not inject code into Studio or
-modify Studio binaries.
+it when `serve` or `studio` starts. Managed `serve` launches are owned by
+`robloxstudio-mcp`. Carbon does not inject code into Studio or modify Studio
+binaries.
 
 ## Start
 

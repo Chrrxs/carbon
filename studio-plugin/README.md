@@ -53,7 +53,10 @@ Automatic capture verifies the exact project, worktree, and Studio session. Offl
 
 Manifest-owned `Ref` properties may target any mapped instance. Capture restores filesystem-authoritative mapped roots before committing the Studio-owned complement, so Studio drift beneath a mapping never writes back to source. `carbon stop` and the first Ctrl+C in the serve terminal both wait for the next auto-recovery or a manual save over the temporary served `.rbxl`, whichever arrives first.
 
-Studio auto-recovery must be enabled. Carbon launches Studio normally and does not inject native code or modify Studio binaries.
+Studio auto-recovery must be enabled. For managed `serve`, Carbon installs the
+matching plugin before authorizing an exact-process `robloxstudio-mcp` launch;
+the broker remains lifecycle owner through final instance association and
+shutdown. Carbon does not inject native code or modify Studio binaries.
 
 ## Links
 

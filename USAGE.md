@@ -73,13 +73,33 @@ the same worktree, select it by instance ID or port instead. Serve sessions
 started by an older Carbon version must be restarted once so their Studio
 process and worktree identity are registered.
 
-The connected message prints the instance ID for the managed Studio session.
-Pass that ID to `carbon stop`; `stop` also accepts `--port` for explicit
-endpoint selection. `carbon capture` instead takes a project and a saved
-`.rbxl` and never contacts the serve endpoint. During startup, `serve` reports
-managed-place building, Studio launch, and connection waiting separately.
-Carbon launches Studio as an ordinary process and keeps its process identity so
-focus and stop operations target only that managed session.
+Managed `serve` requires a loopback `robloxstudio-mcp` that advertises lifecycle
+protocol v3 with exact process identity. The default MCP URL is
+`http://127.0.0.1:58741`; set `CARBON_STUDIO_MCP_URL` to another loopback URL.
+Carbon uses the broker's `ROBLOX_STUDIO_AUTH_TOKEN`, explicit no-auth setting,
+or default `~/.robloxstudio-mcp/auth-token` file.
+
+Startup reports two different identifiers. The **launch ID** is the broker's
+opaque ownership handle and is usable for startup status and cleanup before a
+plugin connects. It is not a Studio tool-routing ID. `serve` reports ready only
+after the broker associates that launch with its final **instance ID**. The
+connected message prints both and the instance ID can be passed directly to
+Roblox Studio MCP tools, `carbon focus`, or `carbon stop`. `carbon stop --list`
+shows `Pending` in the Instance ID column until association completes and keeps
+the Launch ID in its own column.
+
+`carbon capture` instead takes a project and a saved `.rbxl` and never contacts
+the serve endpoint. Carbon never starts a second, independently owned Studio if
+broker discovery, authorization, ownership completion, or association fails.
+The broker retains the exact native PID and process-creation identity for close;
+Carbon keeps the same identity only as an emergency close fallback if the
+broker becomes unreachable.
+
+This is a managed-serve compatibility change: `CARBON_STUDIO_LIFECYCLE` no
+longer selects a direct `serve` launch. The standalone `carbon studio` command
+remains an unmanaged convenience launch. Restart serve sessions created by an
+older Carbon so their registry entries gain a distinct launch ID; legacy
+entries remain readable and show `-` in the Launch ID column.
 
 Project-file changes reload automatically in the existing `serve` process.
 Carbon first captures authored Studio state, then reconnects the plugin to the
@@ -131,8 +151,9 @@ including scripts outside mappings and mapped-owned references to Studio-owned
 objects. Studio-owned references may target stable mapped identities.
 
 `carbon stop` races the next eligible auto-recovery against a manual save over
-the temporary `carbon-serve-*.rbxl` launch place, then ends the served session
-and its managed Studio process as soon as either verified file arrives.
+the temporary `carbon-serve-*.rbxl` launch place, then asks
+`robloxstudio-mcp manage_instance` to close the exact launch as soon as either
+verified file arrives.
 Pressing Ctrl+C in the `carbon serve` terminal follows the same default
 shutdown path. A second Ctrl+C forces cleanup.
 
@@ -166,9 +187,10 @@ stages the result but leaves the final Git operation to the user.
 
 ## Embedded Studio component
 
-Release executables embed their matching Studio plugin. Before launching
-Studio, Carbon verifies those bytes and replaces a missing or outdated plugin.
-No native mod-loader, DLL injection, or Studio binary manipulation is used.
+Release executables embed their matching Studio plugin. Before authorizing a
+managed broker launch, Carbon verifies those bytes and replaces a missing or
+outdated plugin. No native mod-loader, DLL injection, or Studio binary
+manipulation is used.
 
 The full installed-stack qualification and release contract is documented in
 [`qualification/README.md`](qualification/README.md).

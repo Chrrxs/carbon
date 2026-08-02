@@ -40,6 +40,12 @@ pub enum RuntimeAction {
 		process: String,
 		timeout: Duration,
 	},
+	WaitProcessOutput {
+		process: String,
+		stdout_contains: Vec<String>,
+		stderr_contains: Vec<String>,
+		timeout: Duration,
+	},
 	TerminateProcess {
 		process: String,
 	},
@@ -63,6 +69,12 @@ pub enum Observation {
 	},
 	Spawned {
 		process: String,
+		artifacts: Vec<String>,
+	},
+	ProcessOutput {
+		process: String,
+		stdout: String,
+		stderr: String,
 		artifacts: Vec<String>,
 	},
 	Mcp {
@@ -214,6 +226,52 @@ impl RealRuntime {
 		}
 	}
 
+	fn wait_process_output(
+		&mut self,
+		process: &str,
+		stdout_contains: &[String],
+		stderr_contains: &[String],
+		timeout: Duration,
+	) -> Result<Observation> {
+		let deadline = Instant::now() + timeout;
+		loop {
+			let (stdout_path, stderr_path, status) = {
+				let background = self
+					.processes
+					.get_mut(process)
+					.with_context(|| format!("background process {process:?} is not registered"))?;
+				(
+					background.stdout_path.clone(),
+					background.stderr_path.clone(),
+					background.child.try_wait()?,
+				)
+			};
+			let stdout = read_text(&stdout_path)?;
+			let stderr = read_text(&stderr_path)?;
+			if stdout_contains.iter().all(|expected| stdout.contains(expected))
+				&& stderr_contains.iter().all(|expected| stderr.contains(expected))
+			{
+				return Ok(Observation::ProcessOutput {
+					process: process.to_owned(),
+					stdout,
+					stderr,
+					artifacts: vec![display_path(&stdout_path), display_path(&stderr_path)],
+				});
+			}
+			if let Some(status) = status {
+				self.processes.remove(process);
+				anyhow::bail!(
+					"background process {process:?} exited with {} before emitting the expected output",
+					status.code().unwrap_or(-1)
+				);
+			}
+			if Instant::now() >= deadline {
+				anyhow::bail!("background process {process:?} did not emit the expected output before timeout");
+			}
+			thread::sleep(Duration::from_millis(20));
+		}
+	}
+
 	fn terminate_process(&mut self, process: &str) -> Result<Observation> {
 		let Some(mut background) = self.processes.remove(process) else {
 			return Ok(Observation::Terminated {
@@ -247,6 +305,12 @@ impl RuntimeAdapter for RealRuntime {
 			RuntimeAction::Command(request) => self.command(request),
 			RuntimeAction::Spawn(request) => self.spawn(request),
 			RuntimeAction::WaitProcess { process, timeout } => self.wait_process(&process, timeout),
+			RuntimeAction::WaitProcessOutput {
+				process,
+				stdout_contains,
+				stderr_contains,
+				timeout,
+			} => self.wait_process_output(&process, &stdout_contains, &stderr_contains, timeout),
 			RuntimeAction::TerminateProcess { process } => self.terminate_process(&process),
 			RuntimeAction::Mcp {
 				tool,
@@ -465,22 +529,22 @@ fn normalize_mcp_url(raw: &str) -> Result<String> {
 }
 
 fn load_auth_token() -> Option<String> {
-	for name in ["ROBLOX_STUDIO_AUTH_TOKEN", "ROBLOX_STUDIO_MCP_AUTH_TOKEN"] {
-		if let Ok(token) = std::env::var(name) {
-			let token = token.trim().to_owned();
-			if !token.is_empty() {
-				return Some(token);
-			}
+	if std::env::var("ROBLOX_STUDIO_NO_AUTH")
+		.is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+	{
+		return None;
+	}
+	if let Ok(token) = std::env::var("ROBLOX_STUDIO_AUTH_TOKEN") {
+		let token = token.trim().to_owned();
+		if !token.is_empty() {
+			return Some(token);
 		}
 	}
-	let explicit = std::env::var_os("ROBLOX_STUDIO_MCP_AUTH_TOKEN_FILE").map(PathBuf::from);
 	let home = std::env::var_os("HOME")
 		.or_else(|| std::env::var_os("USERPROFILE"))
 		.map(PathBuf::from)
 		.map(|path| path.join(".robloxstudio-mcp").join("auth-token"));
-	explicit
-		.or(home)
-		.and_then(|path| fs::read_to_string(path).ok())
+	home.and_then(|path| fs::read_to_string(path).ok())
 		.map(|token| token.trim().to_owned())
 		.filter(|token| !token.is_empty())
 }
@@ -555,6 +619,46 @@ mod tests {
 		let evidence = root.join("failed-mcp-mcp.json");
 		assert!(error.contains("500 Internal Server Error"));
 		assert_eq!(fs::read(&evidence).unwrap(), br#"{"error":"synthetic MCP failure"}"#);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn process_output_wait_observes_a_running_background_process() {
+		let root = temporary_directory("process-output");
+		let mut runtime = RealRuntime::new(root.clone(), "http://127.0.0.1:1").unwrap();
+		runtime
+			.execute(RuntimeAction::Spawn(SpawnRequest {
+				process: "serve".to_owned(),
+				program: "sh".to_owned(),
+				args: vec![
+					"-c".to_owned(),
+					"printf 'instance ID: anon:mcp-final\\n' >&2; sleep 30".to_owned(),
+				],
+				cwd: None,
+				env: BTreeMap::new(),
+				artifact_stem: "serve".to_owned(),
+			}))
+			.unwrap();
+
+		let observation = runtime
+			.execute(RuntimeAction::WaitProcessOutput {
+				process: "serve".to_owned(),
+				stdout_contains: Vec::new(),
+				stderr_contains: vec!["instance ID: anon:mcp-final".to_owned()],
+				timeout: Duration::from_secs(2),
+			})
+			.unwrap();
+
+		let Observation::ProcessOutput { stderr, .. } = observation else {
+			panic!("expected process output observation");
+		};
+		assert!(stderr.contains("instance ID: anon:mcp-final"));
+		runtime
+			.execute(RuntimeAction::TerminateProcess {
+				process: "serve".to_owned(),
+			})
+			.unwrap();
 		fs::remove_dir_all(root).unwrap();
 	}
 }

@@ -25,6 +25,8 @@ pub struct Session {
 	pub studio_executable: Option<String>,
 	#[serde(default)]
 	pub creation_filetime: Option<u64>,
+	#[serde(default)]
+	pub launch_id: Option<String>,
 }
 
 impl Session {
@@ -352,6 +354,32 @@ mod tests {
 	}
 
 	#[test]
+	fn final_instance_registration_retains_its_distinct_launch_id() {
+		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let directory = std::env::temp_dir().join(format!("carbon-launch-instance-identity-{unique}"));
+		fs::create_dir_all(&directory).unwrap();
+		let session = Session {
+			pid: 10,
+			host: Some("127.0.0.1".to_owned()),
+			port: Some(8000),
+			studio_pid: Some(20),
+			worktree: Some(PathBuf::from("/tmp/managed-worktree")),
+			studio_executable: None,
+			creation_filetime: None,
+			launch_id: Some("launch-carbon-a".to_owned()),
+		};
+		register_in(&directory, session.launch_id.clone(), session.clone()).unwrap();
+
+		replace_id_in(&directory, &session, "anon:mcp-final".to_owned()).unwrap();
+
+		let sessions = get_sessions_in(&directory).unwrap();
+		let registered = sessions.active_sessions.get("anon:mcp-final").unwrap();
+		assert_eq!(registered.launch_id.as_deref(), Some("launch-carbon-a"));
+		assert!(!sessions.active_sessions.contains_key("launch-carbon-a"));
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
 	fn merge_stress_regression_mcp_instance_id_replaces_direct_session_selector() {
 		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
 		let directory = std::env::temp_dir().join(format!("carbon-direct-session-id-{unique}"));
@@ -364,6 +392,7 @@ mod tests {
 			worktree: Some(PathBuf::from("/tmp/direct-worktree")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		assert_eq!(register_in(&directory, None, session.clone()).unwrap(), "0");
 
@@ -379,7 +408,7 @@ mod tests {
 	}
 
 	#[test]
-	fn subscribed_route_refresh_replaces_the_stop_session_selector() {
+	fn provisional_route_refresh_does_not_choose_the_managed_session_selector() {
 		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
 		let directory = std::env::temp_dir().join(format!("carbon-refreshed-session-id-{unique}"));
 		fs::create_dir_all(&directory).unwrap();
@@ -391,14 +420,10 @@ mod tests {
 			worktree: Some(PathBuf::from("/tmp/refreshed-worktree")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: Some("launch-carbon".to_owned()),
 		};
-		register_in(&directory, Some("anon:early-carbon".to_owned()), session.clone()).unwrap();
+		register_in(&directory, session.launch_id.clone(), session.clone()).unwrap();
 		let queue = Queue::new();
-		let refreshed_directory = directory.clone();
-		let refreshed_session = session.clone();
-		queue.on_studio_route_refresh(move |route| {
-			replace_id_in(&refreshed_directory, &refreshed_session, route.instance_id.clone()).unwrap();
-		});
 		queue
 			.subscribe(
 				101,
@@ -419,13 +444,70 @@ mod tests {
 				}),
 			)
 			.unwrap();
+		let before_broker_completion = get_sessions_in(&directory).unwrap();
+		assert!(before_broker_completion.active_sessions.contains_key("launch-carbon"));
+		assert!(!before_broker_completion
+			.active_sessions
+			.contains_key("anon:early-carbon"));
+		assert!(!before_broker_completion
+			.active_sessions
+			.contains_key("anon:mcp-reported"));
+
+		replace_id_in(&directory, &session, "anon:mcp-reported".to_owned()).unwrap();
 
 		let sessions = get_sessions_in(&directory).unwrap();
 		assert_eq!(
 			find_session(&sessions, Some("anon:mcp-reported"), None, None),
 			Some(session)
 		);
-		assert!(find_session(&sessions, Some("anon:early-carbon"), None, None).is_none());
+		assert!(find_session(&sessions, Some("launch-carbon"), None, None).is_none());
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn concurrent_worktrees_rekey_only_to_their_own_final_instance_ids() {
+		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let directory = std::env::temp_dir().join(format!("carbon-concurrent-final-routing-{unique}"));
+		fs::create_dir_all(&directory).unwrap();
+		let session = |index: u16| Session {
+			pid: 10 + u32::from(index),
+			host: Some("127.0.0.1".to_owned()),
+			port: Some(8000 + index),
+			studio_pid: Some(20 + u32::from(index)),
+			worktree: Some(PathBuf::from(format!("/tmp/carbon-worktree-{index}"))),
+			studio_executable: None,
+			creation_filetime: None,
+			launch_id: Some(format!("launch-{index}")),
+		};
+		let first = session(1);
+		let second = session(2);
+		register_in(&directory, first.launch_id.clone(), first.clone()).unwrap();
+		register_in(&directory, second.launch_id.clone(), second.clone()).unwrap();
+
+		replace_id_in(&directory, &second, "anon:final-second".to_owned()).unwrap();
+		replace_id_in(&directory, &first, "anon:final-first".to_owned()).unwrap();
+
+		let sessions = get_sessions_in(&directory).unwrap();
+		assert_eq!(
+			sessions
+				.active_sessions
+				.get("anon:final-first")
+				.unwrap()
+				.worktree
+				.as_deref(),
+			Some(Path::new("/tmp/carbon-worktree-1"))
+		);
+		assert_eq!(
+			sessions
+				.active_sessions
+				.get("anon:final-second")
+				.unwrap()
+				.worktree
+				.as_deref(),
+			Some(Path::new("/tmp/carbon-worktree-2"))
+		);
+		assert!(!sessions.active_sessions.contains_key("launch-1"));
+		assert!(!sessions.active_sessions.contains_key("launch-2"));
 		fs::remove_dir_all(directory).unwrap();
 	}
 
@@ -453,6 +535,7 @@ mod tests {
 							worktree: None,
 							studio_executable: None,
 							creation_filetime: None,
+							launch_id: None,
 						},
 					)
 					.unwrap()
@@ -480,6 +563,7 @@ mod tests {
 			worktree: Some(PathBuf::from("/tmp/first")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		let second = Session {
 			pid: 2,
@@ -489,6 +573,7 @@ mod tests {
 			worktree: Some(PathBuf::from("/tmp/second")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		let sessions = Sessions {
 			last_session: "first".to_owned(),
@@ -515,6 +600,7 @@ mod tests {
 			worktree: Some(PathBuf::from("/tmp/old")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		register_in(&directory, Some("0".to_owned()), old.clone()).unwrap();
 		let snapshot = HashMap::from([("0".to_owned(), old)]);
@@ -526,6 +612,7 @@ mod tests {
 			worktree: Some(PathBuf::from("/tmp/replacement")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		register_in(&directory, Some("0".to_owned()), replacement.clone()).unwrap();
 
@@ -553,6 +640,7 @@ port = 8000
 		assert_eq!(session.worktree, None);
 		assert_eq!(session.studio_executable, None);
 		assert_eq!(session.creation_filetime, None);
+		assert_eq!(session.launch_id, None);
 	}
 
 	#[test]
@@ -565,6 +653,7 @@ port = 8000
 			worktree: Some(PathBuf::from("/tmp/carbon-persistence")),
 			studio_executable: Some("C:\\Roblox\\RobloxStudioBeta.exe".to_owned()),
 			creation_filetime: Some(133700123456),
+			launch_id: Some("launch-persistence".to_owned()),
 		};
 		let serialized = toml::to_string(&session).unwrap();
 		let deserialized: Session = toml::from_str(&serialized).unwrap();
@@ -581,6 +670,7 @@ port = 8000
 			worktree: Some(PathBuf::from("/tmp/carbon-first")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		let second = Session {
 			pid: 2,
@@ -590,6 +680,7 @@ port = 8000
 			worktree: Some(PathBuf::from("/tmp/carbon-second")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		let sessions = Sessions {
 			last_session: "first".to_owned(),
@@ -615,6 +706,7 @@ port = 8000
 			worktree: Some(PathBuf::from("/tmp/carbon-duplicate")),
 			studio_executable: None,
 			creation_filetime: None,
+			launch_id: None,
 		};
 		let sessions = Sessions {
 			last_session: "first".to_owned(),

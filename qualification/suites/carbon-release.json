@@ -112,7 +112,7 @@
     },
     {
       "name": "managed-studio-auto-recovery-capture",
-      "description": "Launches Studio normally, authors an edit, waits for a new auto-recovery save, commits it, and rebuilds the captured project.",
+      "description": "Launches Studio through robloxstudio-mcp, routes Carbon focus and MCP edits by the final managed instance ID, waits for a new auto-recovery save, closes through the managed lifecycle, and rebuilds the captured project.",
       "tags": ["runtime", "lifecycle", "capture", "crash_safety", "determinism"],
       "steps": [
         {
@@ -123,7 +123,8 @@
           "args": ["serve", "${project}", "--port", "${port}", "--yes", "--color", "never"],
           "cwd": "${repo}",
           "env": {
-            "CARBON_QUALIFICATION_STUDIO_NAME": "${studio_data_model}"
+            "CARBON_QUALIFICATION_STUDIO_NAME": "${studio_data_model}",
+            "CARBON_STUDIO_MCP_URL": "${mcp_url}"
           }
         },
         {
@@ -146,10 +147,17 @@
           }
         },
         {
+          "name": "wait-for-carbon-final-id-readiness",
+          "kind": "wait_process_output",
+          "process": "carbon-serve",
+          "stderr_contains": ["instance ID: ${studio_instance}"],
+          "timeout_seconds": 120
+        },
+        {
           "name": "focus-managed-studio",
           "kind": "command",
           "program": "${carbon}",
-          "args": ["focus", "--port", "${port}", "--color", "never"],
+          "args": ["focus", "${studio_instance}", "--color", "never"],
           "cwd": "${repo}",
           "timeout_seconds": 30,
           "stderr_contains": ["Focused Roblox Studio PID"]

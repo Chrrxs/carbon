@@ -382,6 +382,47 @@ impl<'a, R: RuntimeAdapter> QualificationRunner<'a, R> {
 					artifacts,
 				))
 			}
+			Action::WaitProcessOutput {
+				process,
+				stdout_contains,
+				stderr_contains,
+				timeout_seconds,
+			} => {
+				let process = variables.resolve_string(process)?;
+				let stdout_contains = resolve_strings(variables, stdout_contains)?;
+				let stderr_contains = resolve_strings(variables, stderr_contains)?;
+				let observation = self.runtime.execute(RuntimeAction::WaitProcessOutput {
+					process: process.clone(),
+					stdout_contains: stdout_contains.clone(),
+					stderr_contains: stderr_contains.clone(),
+					timeout: Duration::from_secs(*timeout_seconds),
+				})?;
+				let Observation::ProcessOutput {
+					process,
+					stdout,
+					stderr,
+					artifacts,
+				} = observation
+				else {
+					bail!("runtime returned the wrong observation while waiting for process output");
+				};
+				for expected in &stdout_contains {
+					ensure!(
+						stdout.contains(expected),
+						"background process stdout did not contain {expected:?}"
+					);
+				}
+				for expected in &stderr_contains {
+					ensure!(
+						stderr.contains(expected),
+						"background process stderr did not contain {expected:?}"
+					);
+				}
+				Ok((
+					format!("background process {process:?} emitted the expected output"),
+					artifacts,
+				))
+			}
 			Action::TerminateProcess { process } => {
 				let process = variables.resolve_string(process)?;
 				match self.runtime.execute(RuntimeAction::TerminateProcess {
@@ -778,6 +819,7 @@ fn action_kind(action: &Action) -> &'static str {
 		Action::Command { .. } => "command",
 		Action::Spawn { .. } => "spawn",
 		Action::WaitProcess { .. } => "wait_process",
+		Action::WaitProcessOutput { .. } => "wait_process_output",
 		Action::TerminateProcess { .. } => "terminate_process",
 		Action::Mcp { .. } => "mcp",
 		Action::Sleep { .. } => "sleep",
@@ -933,6 +975,40 @@ mod tests {
 			panic!("expected MCP action");
 		};
 		assert_eq!(arguments["instance_id"], "studio-1");
+	}
+
+	#[test]
+	fn process_output_wait_blocks_until_carbon_reports_its_final_instance_id() {
+		let suite = suite_with_steps(
+			json!([{
+				"name": "ready",
+				"kind": "wait_process_output",
+				"process": "carbon-serve",
+				"stderr_contains": ["instance ID: anon:mcp-final"],
+				"timeout_seconds": 120
+			}]),
+			json!([]),
+		);
+		let mut runtime = ScriptedRuntime::new(vec![Ok(Observation::ProcessOutput {
+			process: "carbon-serve".to_owned(),
+			stdout: String::new(),
+			stderr: "INFO: Studio connected, instance ID: anon:mcp-final".to_owned(),
+			artifacts: vec!["serve-stderr.txt".to_owned()],
+		})]);
+
+		let report = run_with(&mut runtime, &suite);
+
+		assert_eq!(report.outcome, Outcome::Pass);
+		let RuntimeAction::WaitProcessOutput {
+			process,
+			stderr_contains,
+			..
+		} = &runtime.actions[0]
+		else {
+			panic!("expected a process-output wait action");
+		};
+		assert_eq!(process, "carbon-serve");
+		assert_eq!(stderr_contains, &["instance ID: anon:mcp-final"]);
 	}
 
 	#[test]

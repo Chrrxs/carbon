@@ -34,6 +34,7 @@ mod unsubscribe;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeControl {
+	Abort,
 	Shutdown,
 	Reload,
 }
@@ -302,7 +303,7 @@ impl Server {
 		});
 
 		self.run_with_listener_control(listener, control_receiver, move |control| match control {
-			ServeControl::Shutdown | ServeControl::Reload => {
+			ServeControl::Abort | ServeControl::Shutdown | ServeControl::Reload => {
 				if let Ok(mut lock) = shutdown.lock() {
 					if let Some(f) = lock.take() {
 						f();
@@ -566,7 +567,7 @@ mod tests {
 						callback_sender.acknowledge_reload();
 						true
 					}
-					ServeControl::Shutdown => true,
+					ServeControl::Abort | ServeControl::Shutdown => true,
 				}
 			})
 		});
