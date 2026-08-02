@@ -1856,6 +1856,59 @@ fn merge_value<T: Clone + PartialEq>(base: &T, current: &T, incoming: &T) -> (T,
 	(current.clone(), true)
 }
 
+fn merge_attribute_property(
+	base: &Option<SemanticProperty>,
+	current: &Option<SemanticProperty>,
+	incoming: &Option<SemanticProperty>,
+) -> Option<(Option<SemanticProperty>, bool)> {
+	fn attributes(value: &Option<SemanticProperty>) -> Option<&Attributes> {
+		match value {
+			Some(SemanticProperty {
+				value: Variant::Attributes(attributes),
+				external: None,
+			}) => Some(attributes),
+			Some(_) => None,
+			None => Some(empty_attributes()),
+		}
+	}
+
+	fn empty_attributes() -> &'static Attributes {
+		static EMPTY: std::sync::OnceLock<Attributes> = std::sync::OnceLock::new();
+		EMPTY.get_or_init(Attributes::new)
+	}
+
+	let base_attributes = attributes(base)?;
+	let current_attributes = attributes(current)?;
+	let incoming_attributes = attributes(incoming)?;
+	let mut keys = HashSet::new();
+	keys.extend(base_attributes.iter().map(|(key, _)| key.clone()));
+	keys.extend(current_attributes.iter().map(|(key, _)| key.clone()));
+	keys.extend(incoming_attributes.iter().map(|(key, _)| key.clone()));
+	let mut keys = keys.into_iter().collect::<Vec<_>>();
+	keys.sort_unstable();
+	let mut merged = Attributes::new();
+	for key in keys {
+		let base_value = base_attributes.get(key.as_str()).cloned();
+		let current_value = current_attributes.get(key.as_str()).cloned();
+		let incoming_value = incoming_attributes.get(key.as_str()).cloned();
+		let (value, conflicted) = merge_value(&base_value, &current_value, &incoming_value);
+		if conflicted {
+			return Some((current.clone(), true));
+		}
+		if let Some(value) = value {
+			merged.insert(key, value);
+		}
+	}
+	let present = base.is_some() || current.is_some() || incoming.is_some();
+	Some((
+		present.then_some(SemanticProperty {
+			value: Variant::Attributes(merged),
+			external: None,
+		}),
+		false,
+	))
+}
+
 fn push_conflict(
 	conflicts: &mut Vec<ArtifactConflict>,
 	identity: Ref,
@@ -1894,7 +1947,17 @@ fn merge_node(
 		let base_value = base.properties.get(&name).cloned();
 		let current_value = current.properties.get(&name).cloned();
 		let incoming_value = incoming.properties.get(&name).cloned();
-		let (value, conflicted) = merge_value(&base_value, &current_value, &incoming_value);
+		let capture_local = matches!(name.as_str(), "UniqueId" | "HistoryId")
+			|| (base.class.as_str() == "Workspace" && name.as_str() == "CurrentCamera")
+			|| (base.class.as_str() == "AnimationConstraint" && name.as_str() == "Transform");
+		let (value, conflicted) = if capture_local {
+			(base_value.clone(), false)
+		} else if name.as_str() == "Attributes" {
+			merge_attribute_property(&base_value, &current_value, &incoming_value)
+				.unwrap_or_else(|| merge_value(&base_value, &current_value, &incoming_value))
+		} else {
+			merge_value(&base_value, &current_value, &incoming_value)
+		};
 		if conflicted {
 			push_conflict(
 				conflicts,
@@ -4283,6 +4346,217 @@ mod tests {
 		assert_eq!(
 			properties[&Ustr::from("NameTag")],
 			Variant::BinaryString(BinaryString::from(b"other".as_slice()))
+		);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn semantic_merge_combines_disjoint_attribute_keys() {
+		let directory = temp("merge-disjoint-attributes");
+		let root = Ref::new();
+		let workspace = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let properties = |attributes| UstrMap::from_iter([(Ustr::from("Attributes"), Variant::Attributes(attributes))]);
+		write(&base, fixture(root, workspace, properties(Attributes::new())));
+		write(
+			&current,
+			fixture(
+				root,
+				workspace,
+				properties(Attributes::new().with("CarbonQualificationQ3", "q3")),
+			),
+		);
+		write(
+			&incoming,
+			fixture(
+				root,
+				workspace,
+				properties(Attributes::new().with("CarbonQualificationQ4", "q4")),
+			),
+		);
+
+		assert!(matches!(
+			merge_artifacts(&base, &current, &incoming).unwrap(),
+			MergeOutcome::Merged(_)
+		));
+		let merged = load_tree(&current).unwrap();
+		let Variant::Attributes(attributes) =
+			&merged.tree.get_instance(workspace).unwrap().properties[&Ustr::from("Attributes")]
+		else {
+			panic!("merged Workspace.Attributes is not an attribute map")
+		};
+		assert_eq!(
+			attributes.get("CarbonQualificationQ3"),
+			Some(&Variant::BinaryString(BinaryString::from(b"q3".as_slice())))
+		);
+		assert_eq!(
+			attributes.get("CarbonQualificationQ4"),
+			Some(&Variant::BinaryString(BinaryString::from(b"q4".as_slice())))
+		);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn semantic_merge_reports_a_divergent_attribute_key() {
+		let directory = temp("merge-divergent-attribute");
+		let root = Ref::new();
+		let workspace = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let snapshot = |value| {
+			fixture(
+				root,
+				workspace,
+				UstrMap::from_iter([(
+					Ustr::from("Attributes"),
+					Variant::Attributes(Attributes::new().with("CarbonQualificationShared", value)),
+				)]),
+			)
+		};
+		write(&base, snapshot("base"));
+		write(&current, snapshot("current"));
+		write(&incoming, snapshot("incoming"));
+
+		let MergeOutcome::Conflicted(conflicts) = merge_artifacts(&base, &current, &incoming).unwrap() else {
+			panic!("divergent attribute key unexpectedly merged")
+		};
+		assert_eq!(conflicts.len(), 1);
+		assert_eq!(conflicts[0].field, "property.Attributes");
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn semantic_merge_ignores_capture_local_identity_properties() {
+		let directory = temp("merge-capture-identities");
+		let root = Ref::new();
+		let child = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let properties = |offset| {
+			UstrMap::from_iter([
+				(
+					Ustr::from("UniqueId"),
+					Variant::UniqueId(rbx_dom_weak::types::UniqueId::new(offset, 2, 3)),
+				),
+				(
+					Ustr::from("HistoryId"),
+					Variant::UniqueId(rbx_dom_weak::types::UniqueId::new(offset + 1, 5, 6)),
+				),
+			])
+		};
+		write(&base, fixture(root, child, properties(1)));
+		write(&current, fixture(root, child, properties(10)));
+		write(&incoming, fixture(root, child, properties(20)));
+
+		assert!(matches!(
+			merge_artifacts(&base, &current, &incoming).unwrap(),
+			MergeOutcome::Merged(_)
+		));
+		let merged = load_tree(&current).unwrap();
+		let properties = &merged.tree.get_instance(child).unwrap().properties;
+		assert_eq!(
+			properties[&Ustr::from("UniqueId")],
+			Variant::UniqueId(rbx_dom_weak::types::UniqueId::new(1, 2, 3))
+		);
+		assert_eq!(
+			properties[&Ustr::from("HistoryId")],
+			Variant::UniqueId(rbx_dom_weak::types::UniqueId::new(2, 5, 6))
+		);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn semantic_merge_ignores_studio_current_camera_changes() {
+		let directory = temp("merge-current-camera");
+		let root = Ref::new();
+		let workspace = Ref::new();
+		let first_camera = Ref::new();
+		let second_camera = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let snapshot = |camera| {
+			Snapshot::new()
+				.with_id(root)
+				.with_name("Game")
+				.with_class("DataModel")
+				.with_children(vec![Snapshot::new()
+					.with_id(workspace)
+					.with_name("Workspace")
+					.with_class("Workspace")
+					.with_properties(UstrMap::from_iter([(
+						Ustr::from("CurrentCamera"),
+						Variant::Ref(camera),
+					)]))
+					.with_children(vec![
+						Snapshot::new()
+							.with_id(first_camera)
+							.with_name("First")
+							.with_class("Camera"),
+						Snapshot::new()
+							.with_id(second_camera)
+							.with_name("Second")
+							.with_class("Camera"),
+					])])
+		};
+		write(&base, snapshot(Ref::none()));
+		write(&current, snapshot(first_camera));
+		write(&incoming, snapshot(second_camera));
+
+		assert!(matches!(
+			merge_artifacts(&base, &current, &incoming).unwrap(),
+			MergeOutcome::Merged(_)
+		));
+		let merged = load_tree(&current).unwrap();
+		assert_eq!(
+			merged.tree.get_instance(workspace).unwrap().properties[&Ustr::from("CurrentCamera")],
+			Variant::Ref(Ref::none())
+		);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn semantic_merge_ignores_animation_transform_drift() {
+		use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+
+		let directory = temp("merge-animation-transform");
+		let root = Ref::new();
+		let constraint = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let transform = |position| CFrame::new(position, Matrix3::identity());
+		let snapshot = |value| {
+			Snapshot::new()
+				.with_id(root)
+				.with_name("Game")
+				.with_class("DataModel")
+				.with_children(vec![Snapshot::new()
+					.with_id(constraint)
+					.with_name("Constraint")
+					.with_class("AnimationConstraint")
+					.with_properties(UstrMap::from_iter([(
+						Ustr::from("Transform"),
+						Variant::CFrame(value),
+					)]))])
+		};
+		let canonical = transform(Vector3::new(1.0, 2.0, 3.0));
+		write(&base, snapshot(canonical));
+		write(&current, snapshot(transform(Vector3::new(4.0, 5.0, 6.0))));
+		write(&incoming, snapshot(transform(Vector3::new(7.0, 8.0, 9.0))));
+
+		assert!(matches!(
+			merge_artifacts(&base, &current, &incoming).unwrap(),
+			MergeOutcome::Merged(_)
+		));
+		let merged = load_tree(&current).unwrap();
+		assert_eq!(
+			merged.tree.get_instance(constraint).unwrap().properties[&Ustr::from("Transform")],
+			Variant::CFrame(canonical)
 		);
 		fs::remove_dir_all(directory).unwrap();
 	}

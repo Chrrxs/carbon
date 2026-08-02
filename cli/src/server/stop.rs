@@ -2,7 +2,10 @@ use actix_web::{post, web::Data, HttpResponse, Responder};
 use anyhow::Result;
 use log::{error, info, trace};
 use std::{
-	sync::{atomic::Ordering, Arc},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		Arc,
+	},
 	time::Duration,
 };
 
@@ -28,6 +31,13 @@ where
 	}
 }
 
+fn commit_stop_request(stop_requested: &AtomicBool, capture: Result<String>) -> Result<String> {
+	if capture.is_ok() {
+		stop_requested.store(true, Ordering::Release);
+	}
+	capture
+}
+
 #[post("/stop")]
 async fn main(
 	core: Data<Arc<Core>>,
@@ -38,8 +48,6 @@ async fn main(
 	let Some(stop_handle) = stop_handle.get().cloned() else {
 		return HttpResponse::InternalServerError().body("Carbon server stop handle is unavailable");
 	};
-	stop_requested.store(true, Ordering::Release);
-
 	info!("Carbon stop requested; capturing the connected Studio place before shutdown");
 	let shutdown_core = Arc::clone(core.get_ref());
 	let capture = actix_web::rt::task::spawn_blocking(move || {
@@ -50,29 +58,30 @@ async fn main(
 	})
 	.await;
 
-	actix_web::rt::spawn(async move {
-		// Let the response reach `carbon stop` before ending the HTTP workers.
-		actix_web::rt::time::sleep(Duration::from_millis(50)).await;
-		stop_handle.stop(false).await;
-	});
-
 	match capture {
-		Ok(Ok(message)) => {
-			info!("Automatic Capture Manifest completed before Carbon stop: {message}");
-			HttpResponse::Ok().body(format!(
-				"Capture Manifest completed: {message}. Carbon stopped successfully"
-			))
-		}
-		Ok(Err(capture_error)) => {
-			error!("automatic Capture Manifest before Carbon stop failed: {capture_error:#}");
-			HttpResponse::InternalServerError().body(format!(
-				"Automatic Capture Manifest before Carbon stop failed: {capture_error:#}. Carbon stopped without a successful final capture"
-			))
-		}
+		Ok(capture) => match commit_stop_request(stop_requested.get_ref(), capture) {
+			Ok(message) => {
+				actix_web::rt::spawn(async move {
+					// Let the response reach `carbon stop` before ending the HTTP workers.
+					actix_web::rt::time::sleep(Duration::from_millis(50)).await;
+					stop_handle.stop(false).await;
+				});
+				info!("Automatic Capture Manifest completed before Carbon stop: {message}");
+				HttpResponse::Ok().body(format!(
+					"Capture Manifest completed: {message}. Carbon stopped successfully"
+				))
+			}
+			Err(capture_error) => {
+				error!("automatic Capture Manifest before Carbon stop failed: {capture_error:#}");
+				HttpResponse::InternalServerError().body(format!(
+					"Automatic Capture Manifest before Carbon stop failed: {capture_error:#}. Carbon and Studio remain running so the uncaptured place is not discarded"
+				))
+			}
+		},
 		Err(join_error) => {
 			error!("automatic Capture Manifest worker before Carbon stop failed: {join_error}");
 			HttpResponse::InternalServerError().body(format!(
-				"Automatic Capture Manifest worker before Carbon stop failed: {join_error}. Carbon stopped without a successful final capture"
+				"Automatic Capture Manifest worker before Carbon stop failed: {join_error}. Carbon and Studio remain running so the uncaptured place is not discarded"
 			))
 		}
 	}
@@ -112,6 +121,24 @@ mod tests {
 
 		assert_eq!(error.to_string(), "capture failed");
 		assert_eq!(capture_calls.get(), 1);
+	}
+
+	#[test]
+	fn capture_failure_does_not_commit_the_stop_request() {
+		let stop_requested = AtomicBool::new(false);
+		let result = commit_stop_request(&stop_requested, Err(anyhow::anyhow!("capture failed")));
+
+		assert!(result.is_err());
+		assert!(!stop_requested.load(Ordering::Acquire));
+	}
+
+	#[test]
+	fn capture_success_commits_the_stop_request() {
+		let stop_requested = AtomicBool::new(false);
+		let message = commit_stop_request(&stop_requested, Ok("capture committed".to_owned())).unwrap();
+
+		assert_eq!(message, "capture committed");
+		assert!(stop_requested.load(Ordering::Acquire));
 	}
 
 	#[test]

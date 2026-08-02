@@ -161,7 +161,7 @@
           "name": "stop-after-next-auto-recovery",
           "kind": "command",
           "program": "${carbon}",
-          "args": ["stop", "--port", "${port}", "--color", "never"],
+          "args": ["stop", "${studio_instance}", "--color", "never"],
           "cwd": "${repo}",
           "timeout_seconds": 390,
           "stderr_contains": ["auto-recovery"]

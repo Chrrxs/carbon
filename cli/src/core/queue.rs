@@ -1,9 +1,9 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Context, Result};
 use colored::Colorize;
 use crossbeam_channel::{Receiver, Sender};
 use std::{
 	collections::HashMap,
-	sync::{Mutex, RwLock},
+	sync::{Arc, Mutex, RwLock},
 };
 
 use crate::{
@@ -49,9 +49,11 @@ pub struct Queue {
 	listeners: RwLock<Vec<Listener>>,
 	unsynced_changes: RwLock<usize>,
 	first_subscribe: Mutex<Option<FirstSubscribe>>,
+	studio_route_refresh: RwLock<Option<StudioRouteRefresh>>,
 }
 
 type FirstSubscribe = Box<dyn FnOnce(&str, Option<&StudioRoute>) + Send + 'static>;
+type StudioRouteRefresh = Arc<dyn Fn(&StudioRoute) + Send + Sync + 'static>;
 
 impl Queue {
 	const CHANNEL_CAPACITY: usize = 64;
@@ -62,6 +64,7 @@ impl Queue {
 			listeners: RwLock::new(Vec::new()),
 			unsynced_changes: RwLock::new(0),
 			first_subscribe: Mutex::new(None),
+			studio_route_refresh: RwLock::new(None),
 		}
 	}
 
@@ -70,6 +73,13 @@ impl Queue {
 		F: FnOnce(&str, Option<&StudioRoute>) + Send + 'static,
 	{
 		*self.first_subscribe.lock().unwrap() = Some(Box::new(callback));
+	}
+
+	pub fn on_studio_route_refresh<F>(&self, callback: F)
+	where
+		F: Fn(&StudioRoute) + Send + Sync + 'static,
+	{
+		*self.studio_route_refresh.write().unwrap() = Some(Arc::new(callback));
 	}
 
 	pub fn push<M>(&self, message: M, id: Option<u32>) -> Result<()>
@@ -138,7 +148,33 @@ impl Queue {
 
 	pub fn subscribe(&self, id: u32, name: &str, studio_route: Option<StudioRoute>) -> Result<()> {
 		if self.is_subscribed(id) {
-			bail!("Already subscribed")
+			let refreshed = {
+				let mut listeners = write!(self.listeners);
+				let listener = listeners
+					.iter_mut()
+					.find(|listener| listener.id == id)
+					.context("Studio listener disconnected during route refresh")?;
+				ensure!(listener.name == name, "Studio route refresh changed the place name");
+				let previous = listener
+					.studio_route
+					.as_ref()
+					.context("legacy Studio clients cannot refresh their route")?;
+				let refreshed = studio_route.context("Studio route refresh omitted its identity")?;
+				ensure!(
+					previous.studio_session_id == refreshed.studio_session_id,
+					"Studio route refresh changed the Studio session"
+				);
+				if previous == &refreshed {
+					return Ok(());
+				}
+				listener.studio_route = Some(refreshed.clone());
+				refreshed
+			};
+			let callback = self.studio_route_refresh.read().unwrap().clone();
+			if let Some(callback) = callback {
+				callback(&refreshed);
+			}
+			return Ok(());
 		}
 		if !read!(self.listeners).is_empty() {
 			bail!("another Studio client is already connected")

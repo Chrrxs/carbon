@@ -28,6 +28,7 @@ mod read;
 mod reflection;
 mod snapshot;
 mod stop;
+mod studio_change;
 mod subscribe;
 mod unsubscribe;
 
@@ -160,6 +161,7 @@ pub enum Message {
 	ExecuteCode(ExecuteCode),
 	Disconnect(Disconnect),
 	ManagedReload(ManagedReload),
+	StudioChangeProbe(StudioChangeProbe),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +193,12 @@ pub struct ManagedReload {
 	pub source_generation: String,
 	pub worktree_id: String,
 	pub session_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioChangeProbe {
+	pub request_id: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -381,6 +389,7 @@ impl Server {
 				.service(read::main)
 				.service(exec::main)
 				.service(stop::main)
+				.service(studio_change::acknowledge)
 				.service(home::main)
 				.default_service(web::to(Self::default_redirect))
 		})
@@ -456,6 +465,16 @@ mod tests {
 		assert_eq!(msg_json["ManagedReload"]["sourceGeneration"], "gen-234");
 		assert_eq!(msg_json["ManagedReload"]["worktreeId"], "wt-456");
 		assert_eq!(msg_json["ManagedReload"]["sessionToken"], "tok-789");
+	}
+
+	#[test]
+	fn studio_change_probe_serialization_is_camel_case() {
+		let message = Message::StudioChangeProbe(StudioChangeProbe {
+			request_id: "probe-123".into(),
+		});
+		let json = serde_json::to_value(&message).unwrap();
+
+		assert_eq!(json["StudioChangeProbe"]["requestId"], "probe-123");
 	}
 
 	#[test]

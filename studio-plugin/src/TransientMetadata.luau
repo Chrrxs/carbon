@@ -4,6 +4,7 @@ local WORKSPACE_ATTRIBUTE_NAMES = {
 	__StudioWorktree_CarbonEndpoint = true,
 	__StudioWorktree_CarbonProject = true,
 	__StudioWorktree_CarbonGeneration = true,
+	__StudioWorktree_StudioChangeGeneration = true,
 	__StudioWorktree_Identity = true,
 	__StudioWorktree_Session = true,
 }

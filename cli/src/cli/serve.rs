@@ -398,8 +398,16 @@ impl Serve {
 			subscribed_studio.finish_startup();
 			let _ = ready_sender.try_send(route.map(|route| route.instance_id.clone()));
 		});
-
 		let result = loop {
+			let refreshed_session = session.clone();
+			core.queue().on_studio_route_refresh(move |route| {
+				if let Err(error) = sessions::replace_id(&refreshed_session, route.instance_id.clone()) {
+					crate::carbon_error!(
+						"failed to refresh the registered Studio instance ID {}: {error:#}",
+						route.instance_id
+					);
+				}
+			});
 			let prepared = Arc::new(Mutex::new(None));
 			let prepared_result = Arc::clone(&prepared);
 			let active_core = Arc::clone(&core);

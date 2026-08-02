@@ -339,6 +339,7 @@ fn generate_id(sessions: &Sessions) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::core::queue::{Queue, StudioRoute};
 	use std::{
 		sync::{Arc, Barrier},
 		time::{SystemTime, UNIX_EPOCH},
@@ -374,6 +375,57 @@ mod tests {
 			Some(session)
 		);
 		assert!(find_session(&sessions, Some("0"), None, None).is_none());
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn subscribed_route_refresh_replaces_the_stop_session_selector() {
+		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let directory = std::env::temp_dir().join(format!("carbon-refreshed-session-id-{unique}"));
+		fs::create_dir_all(&directory).unwrap();
+		let session = Session {
+			pid: 10,
+			host: Some("127.0.0.1".to_owned()),
+			port: Some(8000),
+			studio_pid: Some(20),
+			worktree: Some(PathBuf::from("/tmp/refreshed-worktree")),
+			studio_executable: None,
+			creation_filetime: None,
+		};
+		register_in(&directory, Some("anon:early-carbon".to_owned()), session.clone()).unwrap();
+		let queue = Queue::new();
+		let refreshed_directory = directory.clone();
+		let refreshed_session = session.clone();
+		queue.on_studio_route_refresh(move |route| {
+			replace_id_in(&refreshed_directory, &refreshed_session, route.instance_id.clone()).unwrap();
+		});
+		queue
+			.subscribe(
+				101,
+				"unpublished-place",
+				Some(StudioRoute {
+					studio_session_id: "studio-session".to_owned(),
+					instance_id: "anon:early-carbon".to_owned(),
+				}),
+			)
+			.unwrap();
+		queue
+			.subscribe(
+				101,
+				"unpublished-place",
+				Some(StudioRoute {
+					studio_session_id: "studio-session".to_owned(),
+					instance_id: "anon:mcp-reported".to_owned(),
+				}),
+			)
+			.unwrap();
+
+		let sessions = get_sessions_in(&directory).unwrap();
+		assert_eq!(
+			find_session(&sessions, Some("anon:mcp-reported"), None, None),
+			Some(session)
+		);
+		assert!(find_session(&sessions, Some("anon:early-carbon"), None, None).is_none());
 		fs::remove_dir_all(directory).unwrap();
 	}
 

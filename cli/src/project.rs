@@ -4026,6 +4026,7 @@ const RECOVERY_TRANSIENT_ATTRIBUTES: &[&str] = &[
 	"__StudioWorktree_CarbonEndpoint",
 	"__StudioWorktree_CarbonProject",
 	"__StudioWorktree_CarbonGeneration",
+	"__StudioWorktree_StudioChangeGeneration",
 	"__StudioWorktree_Identity",
 	"__StudioWorktree_Session",
 	"__MCPPlaceId",
@@ -4036,6 +4037,7 @@ struct RecoveryRoute {
 	project: Option<String>,
 	worktree_id: Option<String>,
 	session_token: Option<String>,
+	studio_change_generation: Option<String>,
 }
 
 fn recovery_attribute_string(attributes: &Attributes, name: &str) -> Option<String> {
@@ -4060,7 +4062,7 @@ fn normalize_recovery_identities_for_scope(
 	expected_project: &str,
 	expected_session: Option<(&str, &str)>,
 	expected_root: Ref,
-) -> Result<()> {
+) -> Result<Option<String>> {
 	fn collect(
 		snapshot: &mut Snapshot,
 		is_root: bool,
@@ -4076,6 +4078,8 @@ fn normalize_recovery_identities_for_scope(
 				route.project = recovery_attribute_string(&attributes, "__StudioWorktree_CarbonProject");
 				route.worktree_id = recovery_attribute_string(&attributes, "__StudioWorktree_Identity");
 				route.session_token = recovery_attribute_string(&attributes, "__StudioWorktree_Session");
+				route.studio_change_generation =
+					recovery_attribute_string(&attributes, "__StudioWorktree_StudioChangeGeneration");
 			}
 			if let Some(value) = recovery_attribute_string(&attributes, artifact_store::MANIFEST_IDENTITY_ATTRIBUTE) {
 				manifest_id = Some(
@@ -4196,20 +4200,257 @@ fn normalize_recovery_identities_for_scope(
 		&mut HashSet::new(),
 		&mut remap,
 	)?;
-	remap_values(snapshot, &remap)
+	remap_values(snapshot, &remap)?;
+	Ok(route.studio_change_generation)
 }
 
 fn normalize_recovery_identities(
 	snapshot: &mut Snapshot,
 	expected: &artifact_store::WorktreeContract,
 	expected_root: Ref,
-) -> Result<()> {
+) -> Result<Option<String>> {
 	normalize_recovery_identities_for_scope(
 		snapshot,
 		&expected.project,
 		Some((&expected.worktree_id, &expected.session_token)),
 		expected_root,
 	)
+}
+
+fn sanitize_recovery_runtime_state(snapshot: &mut Snapshot, canonical: &Snapshot) {
+	fn is_editor_only_root(child: &Snapshot) -> bool {
+		let filtered_selection = (child.class.as_str().is_empty() || child.class.as_str() == "Instance")
+			&& child.name == "FilteredSelection";
+		let editor_service = child.name == child.class.as_str()
+			&& matches!(
+				child.class.as_str(),
+				"CoreGui"
+					| "MemStorageService"
+					| "PluginConnectionService"
+					| "PluginGuiService"
+					| "UserInputService"
+					| "VisualizationModeService"
+			);
+		filtered_selection || editor_service
+	}
+
+	fn is_runtime_root_candidate(child: &Snapshot) -> bool {
+		is_service(child.class.as_str())
+	}
+
+	fn is_default_runtime_shell(child: &Snapshot) -> bool {
+		child.children.is_empty()
+			&& child.properties.iter().all(|(name, value)| {
+				matches!(name.as_str(), "UniqueId" | "HistoryId")
+					|| is_reflection_default(child.class.as_str(), name.as_str(), value)
+					|| matches!(value, Variant::Ref(target) if target.is_none())
+			})
+	}
+
+	fn is_runtime_child(child: &Snapshot, parent_class: &str) -> bool {
+		let archivable_false = matches!(
+			child.properties.get(&Ustr::from("Archivable")),
+			Some(Variant::Bool(false))
+		);
+		if matches!(parent_class, "CoreGui" | "PluginGuiService") {
+			return true;
+		}
+		if parent_class == "StylingService"
+			&& matches!(
+				child.name.as_str(),
+				"StudioDesign-4"
+					| "AvatarSettings"
+					| "Explorer" | "ExplorerDark"
+					| "ExplorerLight"
+					| "AssetImporter"
+					| "KnowledgeTutorials"
+					| "ManageCollaborators"
+			) {
+			return true;
+		}
+		if parent_class == "GuiService"
+			&& ((child.class.as_str() == "ScreenshotHud" && child.name == "ScreenshotHud")
+				|| (child.class.as_str() == "LocalizationTable"
+					&& child.name == "FoundationLocalization"
+					&& archivable_false))
+		{
+			return true;
+		}
+		if parent_class == "Terrain"
+			&& archivable_false
+			&& ((child.class.as_str() == "Folder" && child.name == "DO_NOT_REMOVE_ForgeSharedPartCache")
+				|| (child.class.as_str() == "Part" && child.name == "DO_NOT_REMOVE_ForgeTextureCache"))
+		{
+			return true;
+		}
+		parent_class == "ControllerService"
+			&& archivable_false
+			&& child.class.as_str() == "HumanoidController"
+			&& child.name == "Instance"
+	}
+
+	fn remove_descendant(snapshot: &mut Snapshot, id: Ref) {
+		snapshot.children.retain(|child| child.id != id);
+		for child in &mut snapshot.children {
+			remove_descendant(child, id);
+		}
+	}
+
+	fn index<'a>(snapshot: &'a Snapshot, nodes: &mut HashMap<Ref, &'a Snapshot>) {
+		nodes.insert(snapshot.id, snapshot);
+		for child in &snapshot.children {
+			index(child, nodes);
+		}
+	}
+
+	fn collect_ids(snapshot: &Snapshot, ids: &mut HashSet<Ref>) {
+		ids.insert(snapshot.id);
+		for child in &snapshot.children {
+			collect_ids(child, ids);
+		}
+	}
+
+	fn remap_references(snapshot: &mut Snapshot, remap: &HashMap<Ref, Ref>) {
+		for value in snapshot.properties.values_mut() {
+			match value {
+				Variant::Ref(target) => {
+					if let Some(replacement) = remap.get(target) {
+						*target = *replacement;
+					}
+				}
+				Variant::Content(content) => {
+					if let ContentType::Object(target) = content.value() {
+						if let Some(replacement) = remap.get(target) {
+							*content = Content::from_referent(*replacement);
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+		for child in &mut snapshot.children {
+			remap_references(child, remap);
+		}
+	}
+
+	fn restore_property(snapshot: &mut Snapshot, canonical: Option<&Snapshot>, property: &str) {
+		let property = Ustr::from(property);
+		match canonical.and_then(|canonical| canonical.properties.get(&property)) {
+			Some(value) => {
+				snapshot.properties.insert(property, value.clone());
+			}
+			None => {
+				snapshot.properties.remove(&property);
+			}
+		}
+	}
+
+	fn same_structural_slot(left: &Snapshot, right: &Snapshot) -> bool {
+		left.name == right.name && left.raw_name == right.raw_name && left.class == right.class
+	}
+
+	fn unique_structural_child<'a>(
+		observed_parent: &Snapshot,
+		canonical_parent: &'a Snapshot,
+		observed: &Snapshot,
+	) -> Option<&'a Snapshot> {
+		if observed_parent
+			.children
+			.iter()
+			.filter(|sibling| same_structural_slot(sibling, observed))
+			.count() != 1
+		{
+			return None;
+		}
+		let mut candidates = canonical_parent
+			.children
+			.iter()
+			.filter(|candidate| same_structural_slot(candidate, observed));
+		let candidate = candidates.next()?;
+		candidates.next().is_none().then_some(candidate)
+	}
+
+	fn sanitize<'a>(
+		snapshot: &mut Snapshot,
+		canonical: &HashMap<Ref, &'a Snapshot>,
+		canonical_hint: Option<&'a Snapshot>,
+		used_ids: &mut HashSet<Ref>,
+		identity_remap: &mut HashMap<Ref, Ref>,
+	) {
+		let mut identity_canonical = canonical.get(&snapshot.id).copied();
+		let canonical_node = identity_canonical.or(canonical_hint);
+		if identity_canonical.is_none()
+			&& snapshot.class.as_str() == "AnimationConstraint"
+			&& canonical_node.is_some_and(|node| !used_ids.contains(&node.id))
+		{
+			let previous = snapshot.id;
+			let canonical_id = canonical_node.expect("checked canonical node").id;
+			used_ids.remove(&previous);
+			used_ids.insert(canonical_id);
+			identity_remap.insert(previous, canonical_id);
+			snapshot.id = canonical_id;
+			identity_canonical = canonical_node;
+		}
+		restore_property(snapshot, identity_canonical, "UniqueId");
+		restore_property(snapshot, identity_canonical, "HistoryId");
+		if snapshot.class.as_str() == "AnimationConstraint" && canonical_node.is_some() {
+			restore_property(snapshot, canonical_node, "Transform");
+		}
+		if let Some(canonical_node) = canonical_node {
+			for (name, value) in &canonical_node.properties {
+				if is_reflection_default(canonical_node.class.as_str(), name.as_str(), value) {
+					snapshot.properties.entry(*name).or_insert_with(|| value.clone());
+				}
+			}
+		}
+		snapshot.properties.retain(|name, value| {
+			canonical_node.is_some_and(|canonical| canonical.properties.contains_key(name))
+				|| !is_reflection_default(snapshot.class.as_str(), name.as_str(), value)
+		});
+		if snapshot.class.as_str() == "Workspace" {
+			if let Some(Variant::Ref(camera)) = snapshot.properties.remove(&Ustr::from("CurrentCamera")) {
+				if camera.is_some() {
+					remove_descendant(snapshot, camera);
+				}
+			}
+		}
+		let parent_class = snapshot.class.to_string();
+		snapshot
+			.children
+			.retain(|child| !is_runtime_child(child, &parent_class));
+		let child_hints = snapshot
+			.children
+			.iter()
+			.map(|child| canonical_node.and_then(|parent| unique_structural_child(snapshot, parent, child)))
+			.collect::<Vec<_>>();
+		for (child, hint) in snapshot.children.iter_mut().zip(child_hints) {
+			sanitize(child, canonical, hint, used_ids, identity_remap);
+		}
+	}
+
+	let mut canonical_nodes = HashMap::new();
+	index(canonical, &mut canonical_nodes);
+	let mut used_ids = HashSet::new();
+	collect_ids(snapshot, &mut used_ids);
+	let mut identity_remap = HashMap::new();
+	sanitize(
+		snapshot,
+		&canonical_nodes,
+		Some(canonical),
+		&mut used_ids,
+		&mut identity_remap,
+	);
+	remap_references(snapshot, &identity_remap);
+	if snapshot.class.as_str() == "DataModel" {
+		snapshot.children.retain(|child| {
+			if is_editor_only_root(child) {
+				return false;
+			}
+			!(is_runtime_root_candidate(child)
+				&& !canonical_nodes.contains_key(&child.id)
+				&& is_default_runtime_shell(child))
+		});
+	}
 }
 
 fn restore_recovery_mapped_roots(recovery: &mut Snapshot, canonical: &Snapshot, mapped_roots: &[Ref]) -> Result<()> {
@@ -4271,17 +4512,22 @@ fn restore_recovery_mapped_roots(recovery: &mut Snapshot, canonical: &Snapshot, 
 		let parent = *canonical_parents
 			.get(&root)
 			.with_context(|| format!("canonical mapped root {root} has no parent"))?;
+		let canonical_root = canonical_nodes
+			.get(&root)
+			.with_context(|| format!("canonical mapped root {root} is missing"))?;
 		let parent = find_mut(recovery, parent)
 			.with_context(|| format!("auto-recovery place omitted the route for mapped root {root}"))?;
-		parent.children.push(
-			canonical_nodes
-				.get(&root)
-				.with_context(|| format!("canonical mapped root {root} is missing"))?
-				.to_owned()
-				.clone(),
-		);
+		parent.children.retain(|child| {
+			child.id != root && !(child.name == canonical_root.name && child.class == canonical_root.class)
+		});
+		parent.children.push((*canonical_root).clone());
 	}
 	Ok(())
+}
+
+pub(crate) struct DecodedCapturedPlace {
+	pub(crate) tree: Tree,
+	pub(crate) studio_change_generation: Option<String>,
 }
 
 pub(crate) fn decode_captured_place(
@@ -4289,7 +4535,7 @@ pub(crate) fn decode_captured_place(
 	expected: &artifact_store::WorktreeContract,
 	canonical: &Snapshot,
 	mapped_roots: &[Ref],
-) -> Result<Tree> {
+) -> Result<DecodedCapturedPlace> {
 	ensure!(
 		input
 			.extension()
@@ -4306,11 +4552,15 @@ pub(crate) fn decode_captured_place(
 		snapshot.class.as_str() == "DataModel",
 		"Studio auto-recovery is not a place"
 	);
-	normalize_recovery_identities(&mut snapshot, expected, canonical.id)?;
+	let studio_change_generation = normalize_recovery_identities(&mut snapshot, expected, canonical.id)?;
+	sanitize_recovery_runtime_state(&mut snapshot, canonical);
 	restore_recovery_mapped_roots(&mut snapshot, canonical, mapped_roots)?;
 	validate_unique_snapshot_ids(&snapshot)?;
 	validate_snapshot_references(&snapshot)?;
-	Ok(Tree::new(snapshot))
+	Ok(DecodedCapturedPlace {
+		tree: Tree::new(snapshot),
+		studio_change_generation,
+	})
 }
 
 fn decode_project_captured_place(
@@ -4335,7 +4585,8 @@ fn decode_project_captured_place(
 		snapshot.class.as_str() == "DataModel",
 		"manual capture input is not a place"
 	);
-	normalize_recovery_identities_for_scope(&mut snapshot, project_name, None, canonical.id)?;
+	let _ = normalize_recovery_identities_for_scope(&mut snapshot, project_name, None, canonical.id)?;
+	sanitize_recovery_runtime_state(&mut snapshot, canonical);
 	restore_recovery_mapped_roots(&mut snapshot, canonical, mapped_roots)?;
 	validate_unique_snapshot_ids(&snapshot)?;
 	validate_snapshot_references(&snapshot)?;
@@ -4514,6 +4765,541 @@ mod recovery_capture_tests {
 	}
 
 	#[test]
+	fn offline_recovery_capture_discards_studio_runtime_noise() {
+		let root = std::env::temp_dir().join(format!("carbon-offline-recovery-noise-{}", Uuid::new_v4()));
+		fs::create_dir_all(&root).unwrap();
+		let project_path = root.join("game.carbon.json");
+		let saved_place = root.join("saved.rbxl");
+		let rebuilt_place = root.join("rebuilt.rbxl");
+		initialize(&project_path, "OfflineRecoveryNoise".to_owned()).unwrap();
+		let contract = artifact_store::WorktreeContract {
+			endpoint: "http://127.0.0.1:8000".to_owned(),
+			project: "OfflineRecoveryNoise".to_owned(),
+			worktree_id: "offline-worktree".to_owned(),
+			session_token: "offline-session".to_owned(),
+			identity_exclusions: HashSet::new(),
+		};
+		compile(&project_path, &saved_place, Some(&contract)).unwrap();
+
+		let mut place = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&saved_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = place
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.name == "Workspace")
+			})
+			.unwrap();
+		place
+			.get_by_ref_mut(workspace)
+			.unwrap()
+			.properties
+			.insert(Ustr::from("Gravity"), Variant::Float32(123.0));
+		let edit_camera = place.insert(
+			workspace,
+			rbx_dom_weak::InstanceBuilder::new("Camera").with_name("Studio edit camera"),
+		);
+		place
+			.get_by_ref_mut(workspace)
+			.unwrap()
+			.properties
+			.insert(Ustr::from("CurrentCamera"), Variant::Ref(edit_camera));
+		place.insert(
+			place.root_ref(),
+			rbx_dom_weak::InstanceBuilder::new("Instance")
+				.with_name("FilteredSelection")
+				.with_property("Archivable", false),
+		);
+		place.insert(
+			place.root_ref(),
+			rbx_dom_weak::InstanceBuilder::new("CoreGui")
+				.with_child(rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Studio-owned child")),
+		);
+		place.insert(
+			place.root_ref(),
+			rbx_dom_weak::InstanceBuilder::new("Stats")
+				.with_child(rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Authored stats child")),
+		);
+		let runtime_service_classes = [
+			"AssetService",
+			"CSGDictionaryService",
+			"Chat",
+			"CollectionService",
+			"ContextActionService",
+			"CookiesService",
+			"Debris",
+			"GamePassService",
+			"GuidRegistryService",
+			"HttpService",
+			"LocalizationService",
+			"LodDataService",
+			"LuaWebService",
+			"MaterialService",
+			"NonReplicatedCSGDictionaryService",
+			"Packages",
+			"PermissionsService",
+			"PhysicsService",
+			"PlayerEmulatorService",
+			"Players",
+			"ProcessInstancePhysicsService",
+			"ReplicatedFirst",
+			"ScriptService",
+			"Selection",
+			"SerializationService",
+			"ServiceVisibilityService",
+			"SoundService",
+			"StarterGui",
+			"StarterPack",
+			"StudioData",
+			"TeleportService",
+			"TimerService",
+			"TouchInputService",
+			"TweenService",
+			"VRService",
+			"VideoCaptureService",
+			"VideoService",
+		];
+		let baseline_service_counts = runtime_service_classes
+			.iter()
+			.map(|class| {
+				(
+					*class,
+					place
+						.root()
+						.children()
+						.iter()
+						.filter(|child| {
+							place
+								.get_by_ref(**child)
+								.is_some_and(|instance| instance.class.as_str() == *class)
+						})
+						.count(),
+				)
+			})
+			.collect::<Vec<_>>();
+		for class in runtime_service_classes {
+			place.insert(place.root_ref(), rbx_dom_weak::InstanceBuilder::new(class));
+		}
+		place.insert(
+			place.root_ref(),
+			rbx_dom_weak::InstanceBuilder::new("TeleportService").with_name("Teleport Service"),
+		);
+		let gui_service = place
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.class.as_str() == "GuiService")
+			})
+			.unwrap_or_else(|| place.insert(place.root_ref(), rbx_dom_weak::InstanceBuilder::new("GuiService")));
+		place.insert(
+			gui_service,
+			rbx_dom_weak::InstanceBuilder::new("ScreenshotHud").with_name("ScreenshotHud"),
+		);
+		let roots = place.root().children().to_vec();
+		rbx_binary::to_writer_with_database(
+			File::create(&saved_place).unwrap(),
+			&place,
+			&roots,
+			util::get_reflection_database(),
+		)
+		.unwrap();
+
+		capture_saved_place(&project_path, &saved_place, &|| false).unwrap();
+		compile(&project_path, &rebuilt_place, None).unwrap();
+		let rebuilt = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&rebuilt_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		assert!(rebuilt.root().children().iter().all(|child| rebuilt
+			.get_by_ref(*child)
+			.is_none_or(|instance| instance.name != "FilteredSelection" && instance.class.as_str() != "CoreGui")));
+		for (class, baseline_count) in baseline_service_counts {
+			let captured_count = rebuilt
+				.root()
+				.children()
+				.iter()
+				.filter(|child| {
+					rebuilt
+						.get_by_ref(**child)
+						.is_some_and(|instance| instance.class.as_str() == class)
+				})
+				.count();
+			assert_eq!(
+				captured_count, baseline_count,
+				"runtime service shell survived: {class}"
+			);
+		}
+		let authored_stats = rebuilt
+			.root()
+			.children()
+			.iter()
+			.filter_map(|child| rebuilt.get_by_ref(*child))
+			.find(|instance| instance.class.as_str() == "Stats")
+			.expect("authored runtime-name collision was discarded");
+		assert!(authored_stats.children().iter().any(|child| rebuilt
+			.get_by_ref(*child)
+			.is_some_and(|instance| instance.name == "Authored stats child")));
+		let workspace = rebuilt
+			.root()
+			.children()
+			.iter()
+			.filter_map(|child| rebuilt.get_by_ref(*child))
+			.find(|instance| instance.name == "Workspace")
+			.unwrap();
+		assert_eq!(
+			workspace.properties.get(&Ustr::from("Gravity")),
+			Some(&Variant::Float32(123.0))
+		);
+		assert!(workspace
+			.properties
+			.get(&Ustr::from("CurrentCamera"))
+			.is_none_or(|value| value == &Variant::Ref(Ref::none())));
+		assert!(workspace.children().iter().all(|child| rebuilt
+			.get_by_ref(*child)
+			.is_none_or(|instance| instance.class.as_str() != "Camera")));
+		assert!(rebuilt.root().children().iter().all(|child| {
+			rebuilt.get_by_ref(*child).is_none_or(|instance| {
+				instance.class.as_str() != "GuiService"
+					|| instance.children().iter().all(|child| {
+						rebuilt
+							.get_by_ref(*child)
+							.is_none_or(|child| child.class.as_str() != "ScreenshotHud")
+					})
+			})
+		}));
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn offline_recovery_capture_preserves_canonical_animation_transform() {
+		use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+
+		let root = std::env::temp_dir().join(format!("carbon-offline-transform-noise-{}", Uuid::new_v4()));
+		fs::create_dir_all(&root).unwrap();
+		let project_path = root.join("game.carbon.json");
+		let first_capture = root.join("first.rbxl");
+		let second_capture = root.join("second.rbxl");
+		let rebuilt_place = root.join("rebuilt.rbxl");
+		initialize(&project_path, "OfflineTransformNoise".to_owned()).unwrap();
+		let contract = artifact_store::WorktreeContract {
+			endpoint: "http://127.0.0.1:8000".to_owned(),
+			project: "OfflineTransformNoise".to_owned(),
+			worktree_id: "offline-worktree".to_owned(),
+			session_token: "offline-session".to_owned(),
+			identity_exclusions: HashSet::new(),
+		};
+		let canonical_transform = CFrame::new(Vector3::new(1.0, 2.0, 3.0), Matrix3::identity());
+		let runtime_transform = CFrame::new(Vector3::new(4.0, 5.0, 6.0), Matrix3::identity());
+
+		compile(&project_path, &first_capture, Some(&contract)).unwrap();
+		let mut place = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&first_capture).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = place
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.name == "Workspace")
+			})
+			.unwrap();
+		place.insert(
+			workspace,
+			rbx_dom_weak::InstanceBuilder::new("AnimationConstraint")
+				.with_name("Authored constraint")
+				.with_property("Transform", canonical_transform),
+		);
+		let roots = place.root().children().to_vec();
+		rbx_binary::to_writer_with_database(
+			File::create(&first_capture).unwrap(),
+			&place,
+			&roots,
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		capture_saved_place(&project_path, &first_capture, &|| false).unwrap();
+
+		compile(&project_path, &second_capture, Some(&contract)).unwrap();
+		let mut place = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&second_capture).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = place
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.name == "Workspace")
+			})
+			.unwrap();
+		let constraint = place
+			.get_by_ref(workspace)
+			.unwrap()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.name == "Authored constraint")
+			})
+			.unwrap();
+		let attributes_name = Ustr::from("Attributes");
+		let mut constraint_attributes = decode_recovery_attributes(
+			place
+				.get_by_ref_mut(constraint)
+				.unwrap()
+				.properties
+				.remove(&attributes_name)
+				.expect("managed constraint has no Carbon identity"),
+		)
+		.unwrap();
+		constraint_attributes.remove(artifact_store::MANIFEST_IDENTITY_ATTRIBUTE);
+		if !constraint_attributes.is_empty() {
+			place
+				.get_by_ref_mut(constraint)
+				.unwrap()
+				.properties
+				.insert(attributes_name, Variant::Attributes(constraint_attributes));
+		}
+		place
+			.get_by_ref_mut(constraint)
+			.unwrap()
+			.properties
+			.insert(Ustr::from("Transform"), Variant::CFrame(runtime_transform));
+		place
+			.get_by_ref_mut(workspace)
+			.unwrap()
+			.properties
+			.insert(Ustr::from("Gravity"), Variant::Float32(123.0));
+		let roots = place.root().children().to_vec();
+		rbx_binary::to_writer_with_database(
+			File::create(&second_capture).unwrap(),
+			&place,
+			&roots,
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		capture_saved_place(&project_path, &second_capture, &|| false).unwrap();
+		let artifact_path = data_artifact(&project_path).unwrap();
+		let first_artifact = fs::read(&artifact_path).unwrap();
+		capture_saved_place(&project_path, &second_capture, &|| false).unwrap();
+		assert_eq!(
+			fs::read(&artifact_path).unwrap(),
+			first_artifact,
+			"re-importing identical recovery input rewrote state.carbon"
+		);
+		capture_saved_place(&project_path, &second_capture, &|| false).unwrap();
+		assert_eq!(
+			fs::read(&artifact_path).unwrap(),
+			first_artifact,
+			"identical recovery input did not remain at a state.carbon fixed point"
+		);
+
+		compile(&project_path, &rebuilt_place, None).unwrap();
+		let rebuilt = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&rebuilt_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = rebuilt
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				rebuilt
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.name == "Workspace")
+			})
+			.unwrap();
+		let constraint = rebuilt
+			.get_by_ref(workspace)
+			.unwrap()
+			.children()
+			.iter()
+			.filter_map(|child| rebuilt.get_by_ref(*child))
+			.find(|instance| instance.name == "Authored constraint")
+			.unwrap();
+		assert_eq!(
+			constraint.properties.get(&Ustr::from("Transform")),
+			Some(&Variant::CFrame(canonical_transform))
+		);
+		assert_eq!(
+			rebuilt
+				.get_by_ref(workspace)
+				.unwrap()
+				.properties
+				.get(&Ustr::from("Gravity")),
+			Some(&Variant::Float32(123.0))
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn offline_recovery_capture_keeps_artifact_properties_sparse() {
+		let root = std::env::temp_dir().join(format!("carbon-offline-recovery-sparse-{}", Uuid::new_v4()));
+		fs::create_dir_all(&root).unwrap();
+		let project_path = root.join("game.carbon.json");
+		let source_place = root.join("OfflineRecoverySparse.rbxl");
+		let saved_place = root.join("saved.rbxl");
+		let rebuilt_place = root.join("rebuilt.rbxl");
+		let source = WeakDom::new(
+			rbx_dom_weak::InstanceBuilder::new("DataModel")
+				.with_name("OfflineRecoverySparse")
+				.with_child(
+					rbx_dom_weak::InstanceBuilder::new("Workspace").with_child(
+						rbx_dom_weak::InstanceBuilder::new("Model")
+							.with_name("Canonical explicit default")
+							.with_property("NeedsPivotMigration", false),
+					),
+				)
+				.with_child(rbx_dom_weak::InstanceBuilder::new("ServerStorage")),
+		);
+		let roots = source.root().children().to_vec();
+		rbx_binary::to_writer_with_database(
+			File::create(&source_place).unwrap(),
+			&source,
+			&roots,
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		extract_binary(&source_place, &project_path).unwrap();
+		let artifact_path = data_artifact(&project_path).unwrap();
+		let baseline_properties = artifact_store::inspect(&artifact_path).unwrap().properties;
+		let contract = artifact_store::WorktreeContract {
+			endpoint: "http://127.0.0.1:8000".to_owned(),
+			project: "OfflineRecoverySparse".to_owned(),
+			worktree_id: "offline-worktree".to_owned(),
+			session_token: "offline-session".to_owned(),
+			identity_exclusions: HashSet::new(),
+		};
+		compile(&project_path, &saved_place, Some(&contract)).unwrap();
+
+		let mut place = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&saved_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = place
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.class.as_str() == "Workspace")
+			})
+			.unwrap();
+		let explicit_default = place
+			.get_by_ref(workspace)
+			.unwrap()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.name == "Canonical explicit default")
+			})
+			.unwrap();
+		assert_eq!(
+			place
+				.get_by_ref_mut(explicit_default)
+				.unwrap()
+				.properties
+				.remove(&Ustr::from("NeedsPivotMigration")),
+			Some(Variant::Bool(false))
+		);
+		let server_storage = place
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| {
+				place
+					.get_by_ref(*child)
+					.is_some_and(|instance| instance.class.as_str() == "ServerStorage")
+			})
+			.unwrap();
+		for (owner, class, name, value) in [
+			(workspace, "Workspace", "Archivable", Variant::Bool(true)),
+			(workspace, "Workspace", "StreamingEnabled", Variant::Bool(false)),
+			(server_storage, "ServerStorage", "Archivable", Variant::Bool(true)),
+		] {
+			assert!(is_reflection_default(class, name, &value));
+			place
+				.get_by_ref_mut(owner)
+				.unwrap()
+				.properties
+				.insert(Ustr::from(name), value);
+		}
+		place
+			.get_by_ref_mut(workspace)
+			.unwrap()
+			.properties
+			.insert(Ustr::from("Gravity"), Variant::Float32(123.0));
+		let roots = place.root().children().to_vec();
+		rbx_binary::to_writer_with_database(
+			File::create(&saved_place).unwrap(),
+			&place,
+			&roots,
+			util::get_reflection_database(),
+		)
+		.unwrap();
+
+		capture_saved_place(&project_path, &saved_place, &|| false).unwrap();
+		let captured_properties = artifact_store::inspect(&artifact_path).unwrap().properties;
+		assert_eq!(captured_properties, baseline_properties + 1);
+		compile(&project_path, &rebuilt_place, None).unwrap();
+		let rebuilt = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&rebuilt_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let workspace = rebuilt
+			.root()
+			.children()
+			.iter()
+			.filter_map(|child| rebuilt.get_by_ref(*child))
+			.find(|instance| instance.class.as_str() == "Workspace")
+			.unwrap();
+		let explicit_default = workspace
+			.children()
+			.iter()
+			.filter_map(|child| rebuilt.get_by_ref(*child))
+			.find(|instance| instance.name == "Canonical explicit default")
+			.unwrap();
+		assert_eq!(
+			explicit_default.properties.get(&Ustr::from("NeedsPivotMigration")),
+			Some(&Variant::Bool(false))
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
 	fn recovery_restores_mapped_roots_and_preserves_studio_edits() {
 		let root = Ref::new();
 		let workspace_id = Ref::new();
@@ -4549,6 +5335,10 @@ mod recovery_capture_tests {
 						("__StudioWorktree_CarbonProject", "Game".to_owned()),
 						("__StudioWorktree_Identity", "worktree".to_owned()),
 						("__StudioWorktree_Session", "session".to_owned()),
+						(
+							"__StudioWorktree_StudioChangeGeneration",
+							"studio-generation-7".to_owned(),
+						),
 						(artifact_store::MANIFEST_IDENTITY_ATTRIBUTE, workspace_id.to_string()),
 					]),
 				)]))
@@ -4557,10 +5347,6 @@ mod recovery_capture_tests {
 						.with_id(Ref::new())
 						.with_name("Mapped")
 						.with_class("Folder")
-						.with_properties(UstrMap::from_iter([(
-							Ustr::from("Attributes"),
-							attributes([(artifact_store::MANIFEST_IDENTITY_ATTRIBUTE, mapped_id.to_string())]),
-						)]))
 						.with_children(vec![Snapshot::new()
 							.with_id(Ref::new())
 							.with_name("Studio drift")
@@ -4578,11 +5364,25 @@ mod recovery_capture_tests {
 			identity_exclusions: HashSet::new(),
 		};
 
-		normalize_recovery_identities(&mut recovery, &expected, root).unwrap();
+		let studio_change_generation = normalize_recovery_identities(&mut recovery, &expected, root).unwrap();
 		restore_recovery_mapped_roots(&mut recovery, &canonical, &[mapped_id]).unwrap();
 
+		assert_eq!(studio_change_generation.as_deref(), Some("studio-generation-7"));
 		assert_eq!(recovery.id, root);
 		let workspace = recovery.children.iter().find(|node| node.id == workspace_id).unwrap();
+		assert!(
+			!workspace.properties.contains_key(&Ustr::from("Attributes")),
+			"the Studio change generation must not enter canonical state"
+		);
+		assert_eq!(
+			workspace
+				.children
+				.iter()
+				.filter(|node| node.name == "Mapped" && node.class.as_str() == "Folder")
+				.count(),
+			1,
+			"identity-free Studio copy of a mapped root survived alongside the canonical root"
+		);
 		let mapped = workspace.children.iter().find(|node| node.id == mapped_id).unwrap();
 		assert_eq!(mapped.children[0].id, mapped_child_id);
 		assert!(workspace.children.iter().any(|node| node.name == "Authored in Studio"));

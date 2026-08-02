@@ -1,4 +1,7 @@
 local Carbon = script:FindFirstAncestor("Carbon")
+local RuntimeServices = require(Carbon.RuntimeServices)
+local ChangeHistoryService = RuntimeServices.get("ChangeHistoryService") :: ChangeHistoryService
+local HttpService = RuntimeServices.get("HttpService") :: HttpService
 
 local Promise = require(Carbon.Packages.Promise)
 
@@ -9,6 +12,7 @@ local Executor = require(Carbon.Executor)
 local Log = require(Carbon.Log)
 local TransientMetadata = require(Carbon.TransientMetadata)
 local Types = require(Carbon.Types)
+local StudioChangeTracker = require(Carbon.StudioChangeTracker)
 local manifest = require(Carbon.manifest)
 
 local BoundedRetry = require(script.BoundedRetry)
@@ -37,6 +41,7 @@ function Core.new(host: string?, port: number?, expectedWorktree: Types.Project?
 	self.executor = Executor.new()
 	self.reconciler = reconciler or MappingReconciler.new()
 	self.tree = self.reconciler.tree
+	self.studioChangeTracker = nil
 
 	local managedWorkspace = expectedWorktree ~= nil and expectedWorktree.worktreeId ~= nil
 	local serverStorage = game:FindFirstChildOfClass("ServerStorage")
@@ -46,6 +51,14 @@ function Core.new(host: string?, port: number?, expectedWorktree: Types.Project?
 		serverStorage,
 		if managedWorkspace and serverStorage then serverStorage:GetAttributes() else nil
 	)
+	if managedWorkspace then
+		self.studioChangeTracker = StudioChangeTracker.new(
+			ChangeHistoryService,
+			HttpService,
+			workspace,
+			TransientMetadata.setTransportAttribute
+		)
+	end
 
 	self.__prompt = function(_message: string, _changes: Types.Changes?, _tree: any): boolean
 		return true
@@ -125,6 +138,9 @@ function Core:run(): Promise.Promise
 		self.client:subscribe():expect()
 		local serverStorage = game:FindFirstChildOfClass("ServerStorage")
 		TransientMetadata.claimMcpPlaceIdTransport(serverStorage, self.client.instanceId)
+		if self.studioChangeTracker ~= nil then
+			self.studioChangeTracker:start()
+		end
 
 		-- Carbon operates entirely through Studio's ordinary plugin surface. Capture
 		-- waits for Studio's next auto-recovery file on the server side.
@@ -181,6 +197,9 @@ function Core:stop()
 	end
 	Log.trace("Stopping Carbon core..")
 	self.status = Core.Status.Disconnecting
+	if self.studioChangeTracker ~= nil then
+		self.studioChangeTracker:stop()
+	end
 	if self.client.isSubscribed then
 		task.spawn(function()
 			self.client:unsubscribe():catch(function(err)
@@ -375,6 +394,18 @@ function Core:__startSyncLoop()
 				else
 					return reject(Error.new(Error.UnknownEvent, kind, data))
 				end
+			elseif kind == "StudioChangeProbe" then
+				if
+					type(data) ~= "table"
+					or type(data.requestId) ~= "string"
+					or data.requestId == ""
+					or self.studioChangeTracker == nil
+				then
+					return reject(Error.new(Error.UnknownEvent, kind, data))
+				end
+				self.client
+					:acknowledgeStudioChangeGeneration(data.requestId, self.studioChangeTracker:current())
+					:expect()
 			elseif kind == "ExecuteCode" then
 				self.executor:execute(data.code)
 			elseif kind == "Disconnect" then

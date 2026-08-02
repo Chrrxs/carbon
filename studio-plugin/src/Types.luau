@@ -105,7 +105,14 @@ export type ManifestCaptureStatus = {
 
 -- Messages
 
-export type Message = SyncChanges | SyncDetails | RestartRequired | ExecuteCode | Disconnect | ManagedReload
+export type Message =
+	SyncChanges
+	| SyncDetails
+	| RestartRequired
+	| ExecuteCode
+	| Disconnect
+	| ManagedReload
+	| StudioChangeProbe
 export type MessageKind =
 	"SyncChanges"
 	| "SyncDetails"
@@ -113,6 +120,7 @@ export type MessageKind =
 	| "ExecuteCode"
 	| "Disconnect"
 	| "ManagedReload"
+	| "StudioChangeProbe"
 
 export type SyncChanges = {
 	SyncChanges: {
@@ -149,6 +157,12 @@ export type ManagedReloadData = {
 
 export type ManagedReload = {
 	ManagedReload: ManagedReloadData,
+}
+
+export type StudioChangeProbe = {
+	StudioChangeProbe: {
+		requestId: string,
+	},
 }
 
 return nil

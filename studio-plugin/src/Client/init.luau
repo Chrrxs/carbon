@@ -33,6 +33,7 @@ function Client.new(host: string, port: number)
 	local self = setmetatable({}, Client)
 
 	self.isSubscribed = false
+	self.routeIdentityConnection = nil
 	self.clientId = generateId()
 	self.studioSessionId = HttpService:GenerateGUID(false)
 	self.instanceId = computeInstanceId()
@@ -85,8 +86,8 @@ function Client:stopEnginePump()
 	end
 end
 
-function Client:refreshStudioRoute()
-	self.instanceId = computeInstanceId()
+function Client:refreshStudioRoute(instanceId: string?)
+	self.instanceId = instanceId or computeInstanceId()
 	local marker = CoreGui:FindFirstChild(STUDIO_ROUTE_MARKER)
 	if marker and (not marker:IsA("StringValue") or marker.Archivable) then
 		marker:Destroy()
@@ -100,6 +101,42 @@ function Client:refreshStudioRoute()
 		marker.Parent = CoreGui
 	else
 		(marker :: StringValue).Value = `{self.studioSessionId}\n{self.instanceId}`
+	end
+end
+
+function Client:publishStudioRoute(): Promise.Promise
+	return Http.post(self:getUrl("subscribe"), {
+		clientId = self.clientId,
+		name = self.placeName,
+		studioSessionId = self.studioSessionId,
+		instanceId = self.instanceId,
+	})
+end
+
+function Client:observeStudioRoute()
+	if self.routeIdentityConnection ~= nil then
+		self.routeIdentityConnection:Disconnect()
+	end
+	local serverStorage = game:FindFirstChildOfClass("ServerStorage")
+	self.routeIdentityConnection = InstanceIdentity.observeChanges(
+		game.PlaceId,
+		serverStorage,
+		self.instanceId,
+		function(instanceId)
+			self:refreshStudioRoute(instanceId)
+			if self.isSubscribed then
+				self:publishStudioRoute():catch(function(err)
+					Log.warn("Failed to refresh the Studio route:", err)
+				end)
+			end
+		end
+	)
+end
+
+function Client:stopObservingStudioRoute()
+	if self.routeIdentityConnection ~= nil then
+		self.routeIdentityConnection:Disconnect()
+		self.routeIdentityConnection = nil
 	end
 end
 
@@ -132,16 +169,10 @@ function Client:subscribe(): Promise.Promise
 	self:refreshStudioRoute()
 	self:startEnginePump()
 
-	local url = self:getUrl("subscribe")
-
-	return Http.post(url, {
-		clientId = self.clientId,
-		name = self.placeName,
-		studioSessionId = self.studioSessionId,
-		instanceId = self.instanceId,
-	})
+	return self:publishStudioRoute()
 		:andThen(function()
 			self.isSubscribed = true
+			self:observeStudioRoute()
 		end)
 		:catch(function(err)
 			self:stopEnginePump()
@@ -163,9 +194,11 @@ function Client:unsubscribe(): Promise.Promise
 	})
 		:andThen(function()
 			self.isSubscribed = false
+			self:stopObservingStudioRoute()
 			self:stopEnginePump()
 		end)
 		:catch(function(err)
+			self:stopObservingStudioRoute()
 			self:stopEnginePump()
 			if err == Error.Unknown then
 				return Promise.reject(Error.new(Error.NotSubscribed, self.clientId))
@@ -235,6 +268,14 @@ function Client:reportWarnings(warnings: { string }): Promise.Promise
 	return Http.post(self:getUrl("diagnostics/warnings"), {
 		clientId = self.clientId,
 		warnings = warnings,
+	})
+end
+
+function Client:acknowledgeStudioChangeGeneration(requestId: string, changeGeneration: string): Promise.Promise
+	return Http.post(self:getUrl("studio/change-generation"), {
+		clientId = self.clientId,
+		requestId = requestId,
+		changeGeneration = changeGeneration,
 	})
 end
 

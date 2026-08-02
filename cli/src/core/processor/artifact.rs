@@ -449,7 +449,7 @@ mod tests {
 
 	#[test]
 	fn capture_claim_occurs_only_after_generation_and_attestation_succeed() {
-		let phase = AtomicU8::new(crate::core::CAPTURE_COLLECTING);
+		let phase = AtomicU8::new(crate::core::CAPTURE_RECOVERED);
 		let attestation_called = AtomicBool::new(false);
 		let error = validate_and_claim_capture(&phase, "expected", "stale", || {
 			attestation_called.store(true, Ordering::Release);
@@ -458,12 +458,12 @@ mod tests {
 		.unwrap_err();
 		assert!(error.to_string().contains("served source changed"));
 		assert!(!attestation_called.load(Ordering::Acquire));
-		assert_eq!(phase.load(Ordering::Acquire), crate::core::CAPTURE_COLLECTING);
+		assert_eq!(phase.load(Ordering::Acquire), crate::core::CAPTURE_RECOVERED);
 
 		let error = validate_and_claim_capture(&phase, "expected", "expected", || anyhow::bail!("attestation changed"))
 			.unwrap_err();
 		assert!(error.to_string().contains("attestation changed"));
-		assert_eq!(phase.load(Ordering::Acquire), crate::core::CAPTURE_COLLECTING);
+		assert_eq!(phase.load(Ordering::Acquire), crate::core::CAPTURE_RECOVERED);
 
 		validate_and_claim_capture(&phase, "expected", "expected", || Ok(())).unwrap();
 		assert_eq!(phase.load(Ordering::Acquire), crate::core::CAPTURE_COMMITTING);

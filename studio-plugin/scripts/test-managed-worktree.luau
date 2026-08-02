@@ -27,6 +27,7 @@ local workspaceAttributes = {
 	__StudioWorktree_CarbonEndpoint = "http://127.0.0.1:41000",
 	__StudioWorktree_CarbonProject = "Project",
 	__StudioWorktree_CarbonGeneration = "source-generation",
+	__StudioWorktree_StudioChangeGeneration = "studio-generation",
 	__StudioWorktree_Identity = "worktree",
 	__StudioWorktree_Session = "token",
 }
@@ -67,6 +68,7 @@ local attributes = TransientMetadata.stripAttributes(workspaceInstance, {
 	__StudioWorktree_CarbonEndpoint = "http://127.0.0.1:41000",
 	__StudioWorktree_CarbonProject = "Project",
 	__StudioWorktree_CarbonGeneration = "source-generation",
+	__StudioWorktree_StudioChangeGeneration = "studio-generation",
 	__StudioWorktree_Identity = "worktree",
 	__StudioWorktree_Session = "token",
 })
@@ -81,6 +83,7 @@ assert(
 	"every colliding authored Workspace value must survive the managed session"
 )
 assert(attributes.__StudioWorktree_CarbonGeneration == nil, "unowned managed metadata must be stripped")
+assert(attributes.__StudioWorktree_StudioChangeGeneration == nil, "Studio change proof must remain transient")
 
 workspaceAttributes.__StudioWorktree_CarbonEndpoint = "user-authored-endpoint"
 assert(
@@ -98,6 +101,12 @@ assert(
 )
 TransientMetadata.setTransportAttribute(workspaceInstance, "__StudioWorktree_CarbonGeneration", "next-generation")
 assert(lastTransportEcho == false, "Carbon's own marker advance must not echo into authored source")
+TransientMetadata.setTransportAttribute(
+	workspaceInstance,
+	"__StudioWorktree_StudioChangeGeneration",
+	"next-studio-generation"
+)
+assert(lastTransportEcho == false, "Studio change proof must not echo into authored source")
 deferAttributeCallbacks = true
 TransientMetadata.setTransportAttribute(workspaceInstance, "__StudioWorktree_CarbonGeneration", "deferred-generation")
 deferAttributeCallbacks = false

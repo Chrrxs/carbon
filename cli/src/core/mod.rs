@@ -58,6 +58,9 @@ pub struct Core {
 	project_snapshot: Option<Arc<RwLock<snapshot::Snapshot>>>,
 	project_state_lock: Option<Arc<Mutex<()>>>,
 	manifest_capture: Mutex<Option<ManifestCaptureOperation>>,
+	last_successful_capture_generation: Mutex<Option<String>>,
+	studio_change_state: Mutex<StudioChangeState>,
+	studio_change_condvar: Condvar,
 	ephemeral_paths: Mutex<Vec<PathBuf>>,
 	served_place_path: Mutex<Option<PathBuf>>,
 	restart_required: Arc<AtomicBool>,
@@ -65,6 +68,17 @@ pub struct Core {
 	automatic_capture_enabled: AtomicBool,
 	shutdown_capture_requested: AtomicBool,
 	shutdown_coordinator: ShutdownCoordinator,
+}
+
+#[derive(Default)]
+struct StudioChangeState {
+	last_captured_generation: Option<String>,
+	pending_probe: Option<PendingStudioChangeProbe>,
+}
+
+struct PendingStudioChangeProbe {
+	request_id: String,
+	acknowledged_generation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -168,9 +182,18 @@ impl ShutdownCoordinator {
 			}
 		}
 	}
+
+	fn reset_error(&self) {
+		let mut guard = self.state.lock().unwrap();
+		if matches!(*guard, ShutdownCoordinatorState::Done(ShutdownResult::Error(_))) {
+			*guard = ShutdownCoordinatorState::Unstarted;
+			self.condvar.notify_all();
+		}
+	}
 }
 
 const AUTOMATIC_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STUDIO_CHANGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROJECT_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROJECT_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -283,6 +306,150 @@ mod manifest_capture_retry_tests {
 		assert!(joinable_automatic_manifest_capture_status(&operation(false)).is_none());
 	}
 
+	fn successful_capture_with_idle_monitor() -> (Arc<Core>, PathBuf, String) {
+		let directory = std::env::temp_dir().join(format!("carbon-shutdown-idle-capture-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&directory).unwrap();
+		let project_path = directory.join("game.carbon.json");
+		let recovery_path = directory.join("served.rbxl");
+		project::initialize(&project_path, "ShutdownIdleCapture".to_owned()).unwrap();
+		let materialized = project::materialize(&project_path).unwrap();
+		let contract = artifact_store::WorktreeContract {
+			endpoint: String::new(),
+			project: "ShutdownIdleCapture".to_owned(),
+			worktree_id: "shutdown-worktree".to_owned(),
+			session_token: "shutdown-session".to_owned(),
+			identity_exclusions: materialized.identity_exclusions.clone(),
+		};
+		let first_source = crate::recovery::RecoverySource::served_place(recovery_path.clone()).unwrap();
+		let first_started_at = SystemTime::now();
+		artifact_store::compile_worktree(&materialized.manifest_path, &recovery_path, &contract).unwrap();
+		let core = Arc::new(
+			Core::new_project_with_worktree(
+				&project_path,
+				&materialized,
+				(
+					"ShutdownIdleCapture".to_owned(),
+					"shutdown-worktree".to_owned(),
+					"shutdown-session".to_owned(),
+				),
+			)
+			.unwrap(),
+		);
+		core.queue()
+			.subscribe(
+				7,
+				"ShutdownIdleCapture",
+				Some(queue::StudioRoute {
+					studio_session_id: "studio-session".to_owned(),
+					instance_id: "anon:shutdown".to_owned(),
+				}),
+			)
+			.unwrap();
+
+		let completed = core
+			.begin_manifest_capture_internal(
+				ManifestCaptureSource {
+					sources: vec![first_source],
+					started_at: first_started_at,
+				},
+				false,
+				None,
+			)
+			.unwrap();
+		wait_for_automatic_capture(
+			|| Ok(completed),
+			|request_id| core.manifest_capture_status(request_id),
+			|| thread::sleep(Duration::from_millis(10)),
+		)
+		.unwrap();
+		*core.studio_change_state.lock().unwrap() = StudioChangeState {
+			last_captured_generation: Some("studio-clean-1".to_owned()),
+			pending_probe: None,
+		};
+
+		let idle_source = crate::recovery::RecoverySource::served_place(recovery_path).unwrap();
+		let idle = core
+			.begin_manifest_capture_internal(
+				ManifestCaptureSource {
+					sources: vec![idle_source],
+					started_at: SystemTime::now(),
+				},
+				false,
+				None,
+			)
+			.unwrap();
+		assert_eq!(idle.state, "running");
+		assert_eq!(
+			core.manifest_capture
+				.lock()
+				.unwrap()
+				.as_ref()
+				.unwrap()
+				.phase
+				.load(Ordering::Acquire),
+			CAPTURE_COLLECTING
+		);
+		(core, directory, idle.request_id)
+	}
+
+	fn fail_capture_after(core: Arc<Core>, request_id: String) -> thread::JoinHandle<()> {
+		thread::spawn(move || {
+			thread::sleep(Duration::from_millis(150));
+			core.fail_manifest_capture(
+				&request_id,
+				"timed out after 360 seconds waiting for Roblox Studio".to_owned(),
+			);
+		})
+	}
+
+	fn acknowledge_studio_probe(core: Arc<Core>, generation: &'static str) -> thread::JoinHandle<()> {
+		thread::spawn(move || loop {
+			let Some(message) = core.queue().get_timeout(7).unwrap() else {
+				continue;
+			};
+			if let crate::server::Message::StudioChangeProbe(probe) = message {
+				core.acknowledge_studio_change_generation(7, &probe.request_id, generation.to_owned())
+					.unwrap();
+				return;
+			}
+		})
+	}
+
+	#[test]
+	fn shutdown_reuses_the_last_successful_capture_when_the_monitor_is_idle() {
+		let (core, directory, idle_request) = successful_capture_with_idle_monitor();
+		let acknowledgement = acknowledge_studio_probe(Arc::clone(&core), "studio-clean-1");
+		let timeout_core = Arc::clone(&core);
+		let timeout = fail_capture_after(timeout_core, idle_request);
+		let started = Instant::now();
+		let message = core.capture_before_shutdown().unwrap();
+		assert!(started.elapsed() < Duration::from_secs(1));
+		assert!(message.contains("retained valid manifest"), "{message}");
+		acknowledgement.join().unwrap();
+		timeout.join().unwrap();
+		core.stop_automatic_capture_monitor();
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn shutdown_does_not_reuse_a_capture_that_predates_a_live_studio_edit() {
+		let (core, directory, idle_request) = successful_capture_with_idle_monitor();
+		let acknowledgement = acknowledge_studio_probe(Arc::clone(&core), "studio-edit-2");
+		let timeout = fail_capture_after(Arc::clone(&core), idle_request);
+
+		let error = core.capture_before_shutdown().unwrap_err();
+		assert!(
+			format!("{error:#}").contains("timed out after 360 seconds waiting for Roblox Studio"),
+			"{error:#}"
+		);
+		acknowledgement.join().unwrap();
+		timeout.join().unwrap();
+		core.stop_automatic_capture_monitor();
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
 	#[test]
 	fn reload_capture_does_not_reuse_a_terminal_shutdown_result() {
 		let directory = std::env::temp_dir().join(format!("carbon-reload-capture-{}", uuid::Uuid::new_v4()));
@@ -304,6 +471,75 @@ mod manifest_capture_retry_tests {
 
 		let error = core.capture_before_reload().unwrap_err();
 		assert!(format!("{error:#}").contains("active served project"), "{error:#}");
+		std::fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn automatic_capture_canonical_includes_studio_owned_descendants() {
+		use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+
+		fn find<'a>(snapshot: &'a snapshot::Snapshot, name: &str) -> Option<&'a snapshot::Snapshot> {
+			if snapshot.name == name {
+				return Some(snapshot);
+			}
+			snapshot.children.iter().find_map(|child| find(child, name))
+		}
+
+		let directory = std::env::temp_dir().join(format!("carbon-capture-canonical-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&directory).unwrap();
+		let manifest_path = directory.join("state.carbon");
+		let root = Ref::new();
+		let workspace = Ref::new();
+		let mapped_parent = Ref::new();
+		let mapped = Ref::new();
+		let transform = CFrame::new(Vector3::new(1.0, 2.0, 3.0), Matrix3::identity());
+		let canonical = snapshot::Snapshot::new()
+			.with_id(root)
+			.with_name("CaptureCanonical")
+			.with_class("DataModel")
+			.with_children(vec![
+				snapshot::Snapshot::new()
+					.with_id(workspace)
+					.with_name("Workspace")
+					.with_class("Workspace")
+					.with_children(vec![snapshot::Snapshot::new()
+						.with_id(Ref::new())
+						.with_name("Live constraint")
+						.with_class("AnimationConstraint")
+						.with_properties(UstrMap::from_iter([(
+							Ustr::from("Transform"),
+							Variant::CFrame(transform),
+						)]))]),
+				snapshot::Snapshot::new()
+					.with_id(mapped_parent)
+					.with_name("ServerStorage")
+					.with_class("ServerStorage")
+					.with_children(vec![snapshot::Snapshot::new()
+						.with_id(mapped)
+						.with_name("Mapped")
+						.with_class("Folder")]),
+			]);
+		artifact_store::extract_snapshot(canonical, "CaptureCanonical".to_owned(), &manifest_path).unwrap();
+
+		let projected = artifact_store::load_projected_live(
+			&manifest_path,
+			&HashSet::from([mapped]),
+			&HashSet::from([root, mapped_parent]),
+		)
+		.unwrap()
+		.tree
+		.into_snapshot()
+		.unwrap();
+		assert!(find(&projected, "Live constraint").is_none());
+
+		let loaded = load_manifest_capture_canonical(&manifest_path).unwrap();
+		assert_eq!(
+			find(&loaded, "Live constraint")
+				.unwrap()
+				.properties
+				.get(&Ustr::from("Transform")),
+			Some(&Variant::CFrame(transform))
+		);
 		std::fs::remove_dir_all(directory).unwrap();
 	}
 }
@@ -347,15 +583,38 @@ struct ManifestCaptureLaunch {
 	managed_reload_transition_id: Option<String>,
 }
 
+fn load_manifest_capture_canonical(manifest_path: &Path) -> Result<snapshot::Snapshot> {
+	artifact_store::load_tree(manifest_path)?.tree.into_snapshot()
+}
+
 pub(crate) const CAPTURE_COLLECTING: u8 = 0;
-const CAPTURE_CANCELLED: u8 = 1;
-const CAPTURE_COMMITTING: u8 = 2;
-pub(crate) const CAPTURE_COMMITTED: u8 = 3;
+pub(crate) const CAPTURE_RECOVERED: u8 = 1;
+const CAPTURE_CANCELLED: u8 = 2;
+const CAPTURE_COMMITTING: u8 = 3;
+pub(crate) const CAPTURE_COMMITTED: u8 = 4;
+
+fn claim_capture_recovery(phase: &AtomicU8) -> Result<()> {
+	phase
+		.compare_exchange(
+			CAPTURE_COLLECTING,
+			CAPTURE_RECOVERED,
+			Ordering::AcqRel,
+			Ordering::Acquire,
+		)
+		.map(|_| ())
+		.map_err(|state| {
+			anyhow::anyhow!(if state == CAPTURE_CANCELLED {
+				"Capture Manifest was cancelled before the accepted recovery could be staged"
+			} else {
+				"Capture Manifest already accepted recovery evidence"
+			})
+		})
+}
 
 pub(crate) fn claim_capture_commit(phase: &AtomicU8) -> Result<()> {
 	phase
 		.compare_exchange(
-			CAPTURE_COLLECTING,
+			CAPTURE_RECOVERED,
 			CAPTURE_COMMITTING,
 			Ordering::AcqRel,
 			Ordering::Acquire,
@@ -371,6 +630,23 @@ pub(crate) fn claim_capture_commit(phase: &AtomicU8) -> Result<()> {
 }
 
 fn claim_capture_cancel(phase: &AtomicU8) -> Result<()> {
+	loop {
+		let state = phase.load(Ordering::Acquire);
+		if !matches!(state, CAPTURE_COLLECTING | CAPTURE_RECOVERED) {
+			return Err(anyhow::anyhow!(if state == CAPTURE_COMMITTING {
+				"Capture Manifest has begun its atomic commit and can no longer be cancelled"
+			} else {
+				"Capture Manifest request is not cancellable"
+			}));
+		}
+		match phase.compare_exchange(state, CAPTURE_CANCELLED, Ordering::AcqRel, Ordering::Acquire) {
+			Ok(_) => return Ok(()),
+			Err(_) => continue,
+		}
+	}
+}
+
+fn claim_idle_capture_cancel(phase: &AtomicU8) -> Result<()> {
 	phase
 		.compare_exchange(
 			CAPTURE_COLLECTING,
@@ -379,13 +655,7 @@ fn claim_capture_cancel(phase: &AtomicU8) -> Result<()> {
 			Ordering::Acquire,
 		)
 		.map(|_| ())
-		.map_err(|state| {
-			anyhow::anyhow!(if state == CAPTURE_COMMITTING {
-				"Capture Manifest has begun its atomic commit and can no longer be cancelled"
-			} else {
-				"Capture Manifest request is not cancellable"
-			})
-		})
+		.map_err(|_| anyhow::anyhow!("Capture Manifest received recovery evidence before idle shutdown cancellation"))
 }
 
 impl Core {
@@ -522,6 +792,9 @@ impl Core {
 			project_snapshot,
 			project_state_lock,
 			manifest_capture: Mutex::new(None),
+			last_successful_capture_generation: Mutex::new(None),
+			studio_change_state: Mutex::new(StudioChangeState::default()),
+			studio_change_condvar: Condvar::new(),
 			ephemeral_paths: Mutex::new(Vec::new()),
 			served_place_path: Mutex::new(None),
 			restart_required,
@@ -668,9 +941,23 @@ impl Core {
 
 	pub fn capture_before_shutdown(self: &Arc<Self>) -> Result<String> {
 		self.shutdown_capture_requested.store(true, Ordering::Release);
-		self.automatic_capture_enabled.store(false, Ordering::Release);
-		self.shutdown_coordinator
-			.execute_or_await(|| self.do_automatic_capture())
+		let monitor_was_enabled = self.automatic_capture_enabled.swap(false, Ordering::AcqRel);
+		let result = self.shutdown_coordinator.execute_or_await(|| {
+			if let Some(message) = self.retain_last_successful_capture_for_idle_shutdown()? {
+				return Ok(message);
+			}
+			self.do_automatic_capture()
+		});
+		if result.is_err() {
+			// A failed stop must leave the live Studio session recoverable and permit
+			// a later stop to retry once Studio produces recovery evidence.
+			self.shutdown_coordinator.reset_error();
+			self.shutdown_capture_requested.store(false, Ordering::Release);
+			if monitor_was_enabled {
+				self.automatic_capture_enabled.store(true, Ordering::Release);
+			}
+		}
+		result
 	}
 
 	pub fn capture_before_reload(self: &Arc<Self>) -> Result<String> {
@@ -726,6 +1013,164 @@ impl Core {
 
 	fn has_valid_manifest_fallback(&self) -> bool {
 		artifact_store::validated_artifact_receipt(&self.manifest_path).is_ok()
+	}
+
+	fn probe_studio_change_generation(&self, client_id: u32) -> Result<Option<String>> {
+		let request_id = uuid::Uuid::new_v4().simple().to_string();
+		{
+			let mut state = self.studio_change_state.lock().unwrap();
+			ensure!(
+				state.pending_probe.is_none(),
+				"another Studio change probe is already pending"
+			);
+			state.pending_probe = Some(PendingStudioChangeProbe {
+				request_id: request_id.clone(),
+				acknowledged_generation: None,
+			});
+		}
+		if let Err(error) = self.queue.push(
+			crate::server::Message::StudioChangeProbe(crate::server::StudioChangeProbe {
+				request_id: request_id.clone(),
+			}),
+			Some(client_id),
+		) {
+			self.studio_change_state.lock().unwrap().pending_probe = None;
+			return Err(error);
+		}
+
+		let deadline = Instant::now() + STUDIO_CHANGE_PROBE_TIMEOUT;
+		let mut state = self.studio_change_state.lock().unwrap();
+		loop {
+			let pending = state
+				.pending_probe
+				.as_ref()
+				.filter(|pending| pending.request_id == request_id)
+				.context("Studio change probe disappeared before acknowledgement")?;
+			if let Some(generation) = pending.acknowledged_generation.clone() {
+				state.pending_probe = None;
+				return Ok(Some(generation));
+			}
+			let now = Instant::now();
+			if now >= deadline {
+				state.pending_probe = None;
+				return Ok(None);
+			}
+			let (next, _) = self.studio_change_condvar.wait_timeout(state, deadline - now).unwrap();
+			state = next;
+		}
+	}
+
+	pub(crate) fn acknowledge_studio_change_generation(
+		&self,
+		client_id: u32,
+		request_id: &str,
+		generation: String,
+	) -> Result<()> {
+		ensure!(
+			self.queue.is_subscribed(client_id),
+			"Studio change acknowledgement is not subscribed"
+		);
+		ensure!(
+			!generation.is_empty(),
+			"Studio change acknowledgement generation is empty"
+		);
+		let mut state = self.studio_change_state.lock().unwrap();
+		let pending = state
+			.pending_probe
+			.as_mut()
+			.filter(|pending| pending.request_id == request_id)
+			.context("Studio change acknowledgement does not match the pending probe")?;
+		ensure!(
+			pending.acknowledged_generation.is_none(),
+			"Studio change probe was already acknowledged"
+		);
+		pending.acknowledged_generation = Some(generation);
+		self.studio_change_condvar.notify_all();
+		Ok(())
+	}
+
+	fn retain_last_successful_capture_for_idle_shutdown(&self) -> Result<Option<String>> {
+		let Some(successful_generation) = self.last_successful_capture_generation.lock().unwrap().clone() else {
+			return Ok(None);
+		};
+		if self.source_generation() != successful_generation || !self.has_valid_manifest_fallback() {
+			return Ok(None);
+		}
+		let client_id = {
+			let capture = self.manifest_capture.lock().unwrap();
+			match capture.as_ref() {
+				Some(operation)
+					if operation.source_generation == successful_generation
+						&& (operation.state == "complete"
+							|| (operation.state == "running" && operation.worker_active)) =>
+				{
+					operation.client_id
+				}
+				None => self.queue.single_listener_id()?,
+				Some(_) => return Ok(None),
+			}
+		};
+		let Some(studio_generation) = self.probe_studio_change_generation(client_id)? else {
+			return Ok(None);
+		};
+		if self
+			.studio_change_state
+			.lock()
+			.unwrap()
+			.last_captured_generation
+			.as_deref()
+			!= Some(studio_generation.as_str())
+		{
+			return Ok(None);
+		}
+
+		let idle_request = {
+			let mut capture = self.manifest_capture.lock().unwrap();
+			match capture.as_mut() {
+				Some(operation)
+					if operation.worker_active
+						&& operation.state == "running"
+						&& operation.source_generation == successful_generation =>
+				{
+					if claim_idle_capture_cancel(&operation.phase).is_err() {
+						return Ok(None);
+					}
+					operation.state = "failed".to_owned();
+					operation.message =
+						Some("Idle automatic recovery wait stopped after the last successful capture".to_owned());
+					Some(operation.request_id.clone())
+				}
+				Some(operation)
+					if operation.state == "complete" && operation.source_generation == successful_generation =>
+				{
+					None
+				}
+				None => None,
+				Some(_) => return Ok(None),
+			}
+		};
+
+		if let Some(request_id) = idle_request {
+			loop {
+				let worker_active = self
+					.manifest_capture
+					.lock()
+					.unwrap()
+					.as_ref()
+					.is_some_and(|operation| operation.request_id == request_id && operation.worker_active);
+				if !worker_active {
+					break;
+				}
+				thread::sleep(Duration::from_millis(25));
+			}
+		}
+
+		let message = format!(
+			"No newer Studio recovery followed the last successful capture; retained valid manifest {}",
+			self.manifest_path.display()
+		);
+		crate::carbon_info!("{message}");
+		Ok(Some(message))
 	}
 
 	pub fn start_automatic_capture_monitor(self: &Arc<Self>) -> Result<bool> {
@@ -931,13 +1376,18 @@ impl Core {
 			.read()
 			.unwrap()
 			.clone();
-		let canonical = self
+		let previous_projected = self
 			.project_snapshot
 			.as_ref()
 			.context("hybrid project snapshot is unavailable")?
 			.read()
 			.unwrap()
 			.clone();
+		// The live project snapshot intentionally contains only mapped source and
+		// routing ancestors. Recovery reconciliation also needs the Studio-owned
+		// complement (for example authored constraint transforms and explicit
+		// default-valued properties), so read the complete canonical artifact.
+		let canonical = load_manifest_capture_canonical(&self.manifest_path)?;
 		let expected = artifact_store::WorktreeContract {
 			endpoint: String::new(),
 			project: self.name.clone(),
@@ -946,17 +1396,22 @@ impl Core {
 			identity_exclusions: HashSet::new(),
 		};
 		let ManifestCaptureSource { sources, started_at } = source;
-		let (capture_kind, capture_path, recovered_tree) = crate::recovery::wait_for_new_recovery(
+		let (capture_kind, capture_path, recovered) = crate::recovery::wait_for_new_recovery(
 			&sources,
 			started_at,
 			crate::recovery::CAPTURE_TIMEOUT,
 			|| phase.load(Ordering::Acquire) == CAPTURE_CANCELLED || !self.queue.is_subscribed(client_id),
 			|path| match project::decode_captured_place(path, &expected, &canonical, &policy.mapped_roots) {
-				Ok(tree) => Ok(Some(tree)),
+				Ok(recovered) => {
+					claim_capture_recovery(&phase)?;
+					Ok(Some(recovered))
+				}
 				Err(error) if format!("{error:#}").contains("different Carbon Studio session") => Ok(None),
 				Err(error) => Err(error),
 			},
 		)?;
+		let recovered_tree = recovered.tree;
+		let captured_studio_change_generation = recovered.studio_change_generation;
 		let capture_kind = capture_kind.label();
 		self.update_manifest_capture_message(
 			request_id,
@@ -1012,7 +1467,7 @@ impl Core {
 			CapturePrecommitAttestation {
 				project_path: policy.project_path.clone(),
 				project_document: policy.project_document.clone(),
-				previous_projected: canonical,
+				previous_projected,
 				mapped_refs: policy.mapped_refs.clone(),
 				project_generation: project_realization_generation,
 			},
@@ -1022,6 +1477,8 @@ impl Core {
 		install_managed_hierarchy_contract(&self.managed_hierarchy, contract);
 		self.source_reader
 			.install_projected_state(projected_source_ids, generation.clone())?;
+		*self.last_successful_capture_generation.lock().unwrap() = Some(generation.clone());
+		self.studio_change_state.lock().unwrap().last_captured_generation = captured_studio_change_generation;
 		{
 			let mut operation = self.manifest_capture.lock().unwrap();
 			let operation = operation
@@ -2203,8 +2660,21 @@ mod source_watcher_tests {
 	}
 
 	#[test]
+	fn idle_shutdown_cancellation_cannot_discard_accepted_recovery() {
+		let phase = AtomicU8::new(CAPTURE_COLLECTING);
+		claim_capture_recovery(&phase).unwrap();
+		assert_eq!(phase.load(Ordering::Acquire), CAPTURE_RECOVERED);
+		assert!(claim_idle_capture_cancel(&phase)
+			.unwrap_err()
+			.to_string()
+			.contains("received recovery evidence"));
+		assert_eq!(phase.load(Ordering::Acquire), CAPTURE_RECOVERED);
+	}
+
+	#[test]
 	fn capture_cancellation_is_rejected_after_atomic_commit_begins() {
 		let phase = AtomicU8::new(CAPTURE_COLLECTING);
+		claim_capture_recovery(&phase).unwrap();
 		claim_capture_commit(&phase).unwrap();
 		assert_eq!(phase.load(Ordering::Acquire), CAPTURE_COMMITTING);
 		assert!(claim_capture_cancel(&phase)

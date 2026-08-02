@@ -656,7 +656,10 @@ mod tests {
 			.unwrap()
 			.iter()
 			.any(|value| value == "--force-full"));
-		assert!(capture["args"].as_array().unwrap().iter().any(|value| value == "stop"));
+		assert_eq!(
+			capture["args"],
+			serde_json::json!(["stop", "${studio_instance}", "--color", "never"])
+		);
 		assert!(steps
 			.iter()
 			.any(|step| step["name"] == "verify-rebuilt-place-contains-live-edit"));
