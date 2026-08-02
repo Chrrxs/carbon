@@ -27,6 +27,18 @@ pub(crate) enum RecoveryKind {
 	ServedPlace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryFreshness {
+	New,
+	Preexisting,
+}
+
+pub(crate) enum RecoveryAcceptance<T> {
+	Accept(T),
+	Reject,
+	Retry,
+}
+
 impl RecoveryKind {
 	pub(crate) fn label(self) -> &'static str {
 		match self {
@@ -232,16 +244,16 @@ fn inventory_file(path: &Path) -> Result<HashMap<PathBuf, RecoveryFingerprint>> 
 	)]))
 }
 
-/// Wait for a recovery file which did not exist in this state when capture
-/// began. A candidate must keep the same size and modification time across two
-/// polls before it is handed to the decoder, so Studio never races Carbon with
-/// a partially written place.
-pub(crate) fn wait_for_new_recovery<T>(
+/// Wait for either a new recovery file or a preexisting file which the caller
+/// can prove represents the current Studio state. A candidate must keep the
+/// same size and modification time across two polls before it is handed to the
+/// decoder, so Studio never races Carbon with a partially written place.
+pub(crate) fn wait_for_recovery<T>(
 	sources: &[RecoverySource],
 	started_at: SystemTime,
 	timeout: Duration,
 	cancelled: impl Fn() -> bool,
-	mut accept: impl FnMut(&Path) -> Result<Option<T>>,
+	mut accept: impl FnMut(&Path, RecoveryFreshness) -> Result<RecoveryAcceptance<T>>,
 ) -> Result<(RecoveryKind, PathBuf, T)> {
 	ensure!(
 		!sources.is_empty(),
@@ -260,17 +272,24 @@ pub(crate) fn wait_for_new_recovery<T>(
 			let current = source.inventory()?;
 			candidates.extend(current.into_iter().filter_map(|(path, fingerprint)| {
 				let key = (source.kind, path.clone());
-				(is_recovery_place(&path)
-					&& fingerprint.len > 0
-					&& modified_after_capture_started(fingerprint.modified, started_at)
-					&& source.baseline.get(&path) != Some(&fingerprint)
-					&& rejected.get(&key) != Some(&fingerprint))
-				.then_some((source.kind, path, fingerprint))
+				if !is_recovery_place(&path) || fingerprint.len == 0 || rejected.get(&key) == Some(&fingerprint) {
+					return None;
+				}
+				let freshness = if source.baseline.get(&path) == Some(&fingerprint) {
+					RecoveryFreshness::Preexisting
+				} else if modified_after_capture_started(fingerprint.modified, started_at) {
+					RecoveryFreshness::New
+				} else {
+					return None;
+				};
+				Some((source.kind, path, fingerprint, freshness))
 			}));
 		}
-		candidates.sort_by_key(|(_, _, fingerprint)| std::cmp::Reverse(fingerprint.modified));
+		candidates.sort_by_key(|(_, _, fingerprint, freshness)| {
+			std::cmp::Reverse((*freshness == RecoveryFreshness::New, fingerprint.modified))
+		});
 
-		for (kind, path, fingerprint) in candidates {
+		for (kind, path, fingerprint, freshness) in candidates {
 			let key = (kind, path.clone());
 			let entry = stable.entry(key.clone()).or_insert((fingerprint, 0));
 			if entry.0 == fingerprint {
@@ -281,12 +300,13 @@ pub(crate) fn wait_for_new_recovery<T>(
 			if entry.1 < STABLE_POLLS {
 				continue;
 			}
-			match accept(&path)? {
-				Some(value) => return Ok((kind, path, value)),
-				None => {
+			match accept(&path, freshness)? {
+				RecoveryAcceptance::Accept(value) => return Ok((kind, path, value)),
+				RecoveryAcceptance::Reject => {
 					rejected.insert(key.clone(), fingerprint);
 					stable.remove(&key);
 				}
+				RecoveryAcceptance::Retry => {}
 			}
 		}
 
@@ -371,6 +391,37 @@ mod tests {
 	}
 
 	#[test]
+	fn accepts_preexisting_recovery_when_acceptor_proves_it_matches_unchanged_studio() {
+		let directory = std::env::temp_dir().join(format!("carbon-recovery-unchanged-{}", uuid::Uuid::new_v4()));
+		fs::create_dir_all(&directory).unwrap();
+		let autosaves = directory.join("unchanged.rbxl");
+		fs::write(&autosaves, b"studio-generation-1").unwrap();
+		let sources = vec![RecoverySource::studio_auto_recovery(directory.clone()).unwrap()];
+
+		let (kind, path, value) = wait_for_recovery(
+			&sources,
+			SystemTime::now(),
+			Duration::from_secs(1),
+			|| false,
+			|path, freshness| {
+				assert_eq!(freshness, RecoveryFreshness::Preexisting);
+				let value = fs::read(path)?;
+				Ok(if value == b"studio-generation-1" {
+					RecoveryAcceptance::Accept(value)
+				} else {
+					RecoveryAcceptance::Reject
+				})
+			},
+		)
+		.unwrap();
+
+		assert_eq!(kind, RecoveryKind::StudioAutoRecovery);
+		assert_eq!(path, autosaves);
+		assert_eq!(value, b"studio-generation-1");
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
 	fn updated_temporary_served_place_wins_the_recovery_wait() {
 		let directory = std::env::temp_dir().join(format!("carbon-recovery-race-{}", uuid::Uuid::new_v4()));
 		fs::create_dir_all(&directory).unwrap();
@@ -385,12 +436,15 @@ mod tests {
 		let started_at = SystemTime::now();
 		fs::write(&served, b"manually saved place").unwrap();
 
-		let (kind, path, value) = wait_for_new_recovery(
+		let (kind, path, value) = wait_for_recovery(
 			&sources,
 			started_at,
 			Duration::from_secs(2),
 			|| false,
-			|path| Ok(Some(fs::read(path)?)),
+			|path, freshness| {
+				assert_eq!(freshness, RecoveryFreshness::New);
+				Ok(RecoveryAcceptance::Accept(fs::read(path)?))
+			},
 		)
 		.unwrap();
 

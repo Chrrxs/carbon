@@ -67,6 +67,7 @@ pub struct Core {
 	managed_reload_transition: Mutex<Option<String>>,
 	automatic_capture_enabled: AtomicBool,
 	shutdown_capture_requested: AtomicBool,
+	shutdown_recovery_studio_generation: Mutex<Option<String>>,
 	shutdown_coordinator: ShutdownCoordinator,
 }
 
@@ -475,6 +476,30 @@ mod manifest_capture_retry_tests {
 	}
 
 	#[test]
+	fn preexisting_recovery_requires_the_current_studio_generation() {
+		assert!(recovery_matches_studio_generation(
+			crate::recovery::RecoveryFreshness::Preexisting,
+			Some("studio-generation-1"),
+			Some("studio-generation-1"),
+		));
+		assert!(!recovery_matches_studio_generation(
+			crate::recovery::RecoveryFreshness::Preexisting,
+			Some("studio-generation-1"),
+			Some("studio-generation-2"),
+		));
+		assert!(!recovery_matches_studio_generation(
+			crate::recovery::RecoveryFreshness::Preexisting,
+			Some("studio-generation-1"),
+			None,
+		));
+		assert!(recovery_matches_studio_generation(
+			crate::recovery::RecoveryFreshness::New,
+			None,
+			None,
+		));
+	}
+
+	#[test]
 	fn automatic_capture_canonical_includes_studio_owned_descendants() {
 		use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
 
@@ -585,6 +610,19 @@ struct ManifestCaptureLaunch {
 
 fn load_manifest_capture_canonical(manifest_path: &Path) -> Result<snapshot::Snapshot> {
 	artifact_store::load_tree(manifest_path)?.tree.into_snapshot()
+}
+
+fn recovery_matches_studio_generation(
+	freshness: crate::recovery::RecoveryFreshness,
+	recovery_generation: Option<&str>,
+	studio_generation: Option<&str>,
+) -> bool {
+	match freshness {
+		crate::recovery::RecoveryFreshness::New => true,
+		crate::recovery::RecoveryFreshness::Preexisting => {
+			studio_generation.is_some() && recovery_generation == studio_generation
+		}
+	}
 }
 
 pub(crate) const CAPTURE_COLLECTING: u8 = 0;
@@ -801,6 +839,7 @@ impl Core {
 			managed_reload_transition: Mutex::new(None),
 			automatic_capture_enabled: AtomicBool::new(false),
 			shutdown_capture_requested: AtomicBool::new(false),
+			shutdown_recovery_studio_generation: Mutex::new(None),
 			shutdown_coordinator: ShutdownCoordinator::new(),
 		})
 	}
@@ -943,11 +982,20 @@ impl Core {
 		self.shutdown_capture_requested.store(true, Ordering::Release);
 		let monitor_was_enabled = self.automatic_capture_enabled.swap(false, Ordering::AcqRel);
 		let result = self.shutdown_coordinator.execute_or_await(|| {
-			if let Some(message) = self.retain_last_successful_capture_for_idle_shutdown()? {
+			let studio_generation = if self.queue.has_subscribers() {
+				self.probe_studio_change_generation(self.queue.single_listener_id()?)?
+			} else {
+				None
+			};
+			if let Some(message) =
+				self.retain_last_successful_capture_for_idle_shutdown(studio_generation.as_deref())?
+			{
 				return Ok(message);
 			}
+			*self.shutdown_recovery_studio_generation.lock().unwrap() = studio_generation;
 			self.do_automatic_capture()
 		});
+		*self.shutdown_recovery_studio_generation.lock().unwrap() = None;
 		if result.is_err() {
 			// A failed stop must leave the live Studio session recoverable and permit
 			// a later stop to retry once Studio produces recovery evidence.
@@ -1089,28 +1137,28 @@ impl Core {
 		Ok(())
 	}
 
-	fn retain_last_successful_capture_for_idle_shutdown(&self) -> Result<Option<String>> {
+	fn retain_last_successful_capture_for_idle_shutdown(
+		&self,
+		studio_generation: Option<&str>,
+	) -> Result<Option<String>> {
 		let Some(successful_generation) = self.last_successful_capture_generation.lock().unwrap().clone() else {
 			return Ok(None);
 		};
 		if self.source_generation() != successful_generation || !self.has_valid_manifest_fallback() {
 			return Ok(None);
 		}
-		let client_id = {
+		{
 			let capture = self.manifest_capture.lock().unwrap();
 			match capture.as_ref() {
 				Some(operation)
 					if operation.source_generation == successful_generation
 						&& (operation.state == "complete"
-							|| (operation.state == "running" && operation.worker_active)) =>
-				{
-					operation.client_id
-				}
-				None => self.queue.single_listener_id()?,
+							|| (operation.state == "running" && operation.worker_active)) => {}
+				None => {}
 				Some(_) => return Ok(None),
 			}
-		};
-		let Some(studio_generation) = self.probe_studio_change_generation(client_id)? else {
+		}
+		let Some(studio_generation) = studio_generation else {
 			return Ok(None);
 		};
 		if self
@@ -1119,7 +1167,7 @@ impl Core {
 			.unwrap()
 			.last_captured_generation
 			.as_deref()
-			!= Some(studio_generation.as_str())
+			!= Some(studio_generation)
 		{
 			return Ok(None);
 		}
@@ -1396,18 +1444,33 @@ impl Core {
 			identity_exclusions: HashSet::new(),
 		};
 		let ManifestCaptureSource { sources, started_at } = source;
-		let (capture_kind, capture_path, recovered) = crate::recovery::wait_for_new_recovery(
+		let (capture_kind, capture_path, recovered) = crate::recovery::wait_for_recovery(
 			&sources,
 			started_at,
 			crate::recovery::CAPTURE_TIMEOUT,
 			|| phase.load(Ordering::Acquire) == CAPTURE_CANCELLED || !self.queue.is_subscribed(client_id),
-			|path| match project::decode_captured_place(path, &expected, &canonical, &policy.mapped_roots) {
-				Ok(recovered) => {
-					claim_capture_recovery(&phase)?;
-					Ok(Some(recovered))
+			|path, freshness| {
+				let studio_generation = self.shutdown_recovery_studio_generation.lock().unwrap().clone();
+				if freshness == crate::recovery::RecoveryFreshness::Preexisting && studio_generation.is_none() {
+					return Ok(crate::recovery::RecoveryAcceptance::Retry);
 				}
-				Err(error) if format!("{error:#}").contains("different Carbon Studio session") => Ok(None),
-				Err(error) => Err(error),
+				match project::decode_captured_place(path, &expected, &canonical, &policy.mapped_roots) {
+					Ok(recovered)
+						if recovery_matches_studio_generation(
+							freshness,
+							recovered.studio_change_generation.as_deref(),
+							studio_generation.as_deref(),
+						) =>
+					{
+						claim_capture_recovery(&phase)?;
+						Ok(crate::recovery::RecoveryAcceptance::Accept(recovered))
+					}
+					Ok(_) => Ok(crate::recovery::RecoveryAcceptance::Reject),
+					Err(error) if format!("{error:#}").contains("different Carbon Studio session") => {
+						Ok(crate::recovery::RecoveryAcceptance::Reject)
+					}
+					Err(error) => Err(error),
+				}
 			},
 		)?;
 		let recovered_tree = recovered.tree;
