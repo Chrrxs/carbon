@@ -1949,7 +1949,8 @@ fn merge_node(
 		let incoming_value = incoming.properties.get(&name).cloned();
 		let capture_local = matches!(name.as_str(), "UniqueId" | "HistoryId")
 			|| (base.class.as_str() == "Workspace" && name.as_str() == "CurrentCamera")
-			|| (base.class.as_str() == "AnimationConstraint" && name.as_str() == "Transform");
+			|| (base.class.as_str() == "AnimationConstraint" && name.as_str() == "Transform")
+			|| util::is_studio_generated_property(base.class.as_str(), name.as_str());
 		let (value, conflicted) = if capture_local {
 			(base_value.clone(), false)
 		} else if name.as_str() == "Attributes" {
@@ -4465,6 +4466,44 @@ mod tests {
 		assert_eq!(
 			properties[&Ustr::from("HistoryId")],
 			Variant::UniqueId(rbx_dom_weak::types::UniqueId::new(2, 5, 6))
+		);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn semantic_merge_ignores_material_variant_texture_pack_drift() {
+		let directory = temp("merge-material-variant-texture-pack");
+		let root = Ref::new();
+		let material_variant = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let snapshot = |texture_pack: &str| {
+			Snapshot::new()
+				.with_id(root)
+				.with_name("Game")
+				.with_class("DataModel")
+				.with_children(vec![Snapshot::new()
+					.with_id(material_variant)
+					.with_name("LavaWarsStone")
+					.with_class("MaterialVariant")
+					.with_properties(UstrMap::from_iter([(
+						Ustr::from("TexturePack"),
+						Variant::ContentId(rbx_dom_weak::types::ContentId::from(texture_pack)),
+					)]))])
+		};
+		write(&base, snapshot("rbxassetid://121053130797125"));
+		write(&current, snapshot("rbxassetid://137621561276915"));
+		write(&incoming, snapshot("rbxassetid://121513957311704"));
+
+		assert!(matches!(
+			merge_artifacts(&base, &current, &incoming).unwrap(),
+			MergeOutcome::Merged(_)
+		));
+		let merged = load_tree(&current).unwrap();
+		assert_eq!(
+			merged.tree.get_instance(material_variant).unwrap().properties[&Ustr::from("TexturePack")],
+			Variant::ContentId(rbx_dom_weak::types::ContentId::from("rbxassetid://121053130797125"))
 		);
 		fs::remove_dir_all(directory).unwrap();
 	}

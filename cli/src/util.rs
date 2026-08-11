@@ -17,6 +17,12 @@ use std::{
 
 use crate::studio;
 
+/// Returns whether Studio serializes this property from other authored fields
+/// and may replace its value on each place load.
+pub(crate) fn is_studio_generated_property(class: &str, property: &str) -> bool {
+	class == "MaterialVariant" && property == "TexturePack"
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ApiDump {

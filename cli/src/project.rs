@@ -4396,6 +4396,16 @@ fn sanitize_recovery_runtime_state(snapshot: &mut Snapshot, canonical: &Snapshot
 		if snapshot.class.as_str() == "AnimationConstraint" && canonical_node.is_some() {
 			restore_property(snapshot, canonical_node, "Transform");
 		}
+		let studio_generated = snapshot
+			.properties
+			.keys()
+			.chain(canonical_node.into_iter().flat_map(|node| node.properties.keys()))
+			.copied()
+			.filter(|name| util::is_studio_generated_property(snapshot.class.as_str(), name.as_str()))
+			.collect::<HashSet<_>>();
+		for name in studio_generated {
+			restore_property(snapshot, canonical_node, name.as_str());
+		}
 		if let Some(canonical_node) = canonical_node {
 			for (name, value) in &canonical_node.properties {
 				if is_reflection_default(canonical_node.class.as_str(), name.as_str(), value) {
@@ -4682,6 +4692,7 @@ pub fn capture_saved_place(project_path: &Path, input: &Path, cancelled: &dyn Fn
 #[cfg(test)]
 mod recovery_capture_tests {
 	use super::*;
+	use rbx_dom_weak::types::ContentId;
 	use std::fs;
 
 	fn attributes(values: impl IntoIterator<Item = (&'static str, String)>) -> Variant {
@@ -4690,6 +4701,43 @@ mod recovery_capture_tests {
 				.into_iter()
 				.map(|(name, value)| (name.to_owned(), Variant::String(value))),
 		))
+	}
+
+	#[test]
+	fn recovery_sanitizer_preserves_canonical_material_variant_texture_pack() {
+		let root = Ref::new();
+		let material_service = Ref::new();
+		let material_variant = Ref::new();
+		let snapshot = |texture_pack: &str| {
+			Snapshot::new()
+				.with_id(root)
+				.with_name("Game")
+				.with_class("DataModel")
+				.with_children(vec![Snapshot::new()
+					.with_id(material_service)
+					.with_name("MaterialService")
+					.with_class("MaterialService")
+					.with_children(vec![Snapshot::new()
+						.with_id(material_variant)
+						.with_name("LavaWarsStone")
+						.with_class("MaterialVariant")
+						.with_properties(UstrMap::from_iter([(
+							Ustr::from("TexturePack"),
+							Variant::ContentId(ContentId::from(texture_pack)),
+						)]))])])
+		};
+		let canonical = snapshot("rbxassetid://121053130797125");
+		let mut recovered = snapshot("rbxassetid://137621561276915");
+
+		sanitize_recovery_runtime_state(&mut recovered, &canonical);
+
+		let recovered_variant = &recovered.children[0].children[0];
+		let canonical_variant = &canonical.children[0].children[0];
+		assert_eq!(
+			recovered_variant.properties.get(&Ustr::from("TexturePack")),
+			canonical_variant.properties.get(&Ustr::from("TexturePack")),
+			"Studio-generated TexturePack identity replaced canonical source"
+		);
 	}
 
 	#[test]

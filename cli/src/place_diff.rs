@@ -351,6 +351,11 @@ fn add_property_fingerprint(
 		));
 		return;
 	}
+	if util::is_studio_generated_property(node.class.as_str(), name.as_str()) {
+		let full = canonical_value(value, structure, false, None, None);
+		result.nodes[index].full.add(entry_digest(name.as_str(), &full));
+		return;
+	}
 	if node.class.as_str() == "Workspace" && name.as_str() == "CurrentCamera" {
 		if let Variant::Ref(target) = value {
 			if let Some(&target_index) = structure.by_ref.get(target) {
@@ -1470,6 +1475,9 @@ fn optional_gameplay_value(
 	if is_unique_property(property, value) {
 		return None;
 	}
+	if util::is_studio_generated_property(node.class.as_str(), property) {
+		return None;
+	}
 	Some(canonical_value(value, structure, true, Some(node), Some(pair_ids)))
 }
 
@@ -1486,6 +1494,8 @@ fn accepted_property_reason(node: &Node, property: &str, node_non_gameplay: bool
 		"tag ordering is set-like and does not affect gameplay".to_owned()
 	} else if node.class.as_str() == "Workspace" && property == "CurrentCamera" {
 		"the edit camera is dynamic Studio state".to_owned()
+	} else if util::is_studio_generated_property(node.class.as_str(), property) {
+		"Studio regenerates this property from canonical authored fields".to_owned()
 	} else {
 		"canonical values are gameplay-equivalent".to_owned()
 	}
@@ -1537,7 +1547,7 @@ fn truncate(value: &str, max: usize) -> String {
 mod tests {
 	use super::*;
 	use rbx_dom_weak::{
-		types::{Attributes, BinaryString, Enum, UniqueId},
+		types::{Attributes, BinaryString, ContentId, Enum, UniqueId},
 		InstanceBuilder, WeakDom,
 	};
 	use std::fs;
@@ -1595,6 +1605,31 @@ mod tests {
 			.differences
 			.iter()
 			.any(|difference| difference.kind == "instance_order"));
+		let _ = fs::remove_file(left);
+		let _ = fs::remove_file(right);
+	}
+
+	#[test]
+	fn material_variant_texture_pack_drift_is_non_gameplay() {
+		let place = |texture_pack: &str| {
+			InstanceBuilder::new("DataModel").with_child(
+				InstanceBuilder::new("MaterialService").with_child(
+					InstanceBuilder::new("MaterialVariant")
+						.with_name("LavaWarsStone")
+						.with_property("TexturePack", ContentId::from(texture_pack)),
+				),
+			)
+		};
+		let left = write_fixture("texture-pack-left", place("rbxassetid://121053130797125"));
+		let right = write_fixture("texture-pack-right", place("rbxassetid://137621561276915"));
+
+		let report = compare(&left, &right, 100).unwrap();
+
+		assert_eq!(report.blocking_differences, 0);
+		assert_eq!(report.non_gameplay_differences, 1);
+		assert!(report.differences.iter().any(|difference| {
+			difference.property.as_deref() == Some("TexturePack") && difference.impact == Impact::NonGameplay
+		}));
 		let _ = fs::remove_file(left);
 		let _ = fs::remove_file(right);
 	}
