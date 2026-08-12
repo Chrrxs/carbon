@@ -11,6 +11,7 @@ local Log = require(Carbon.Log)
 
 local Http = require(script.Http)
 local Error = require(script.Error)
+local PollLoop = require(script.PollLoop)
 local RequestPolicy = require(script.RequestPolicy)
 local InstanceIdentity = require(script.InstanceIdentity)
 
@@ -245,20 +246,48 @@ function Client:read(): Promise.TypedPromise<Types.Message>
 
 	local url = self:getUrl("read")
 
-	return Http.post(url, {
-		clientId = self.clientId,
-	})
-		:andThen(function(response)
-			return response:decode()
-		end)
-		:catch(function(err)
-			-- We don't need to handle this as Rust queue uses `recv_timeout`
-			if err == Error.Timedout then
-				return self:read()
+	return Promise.new(function(resolve, reject, onCancel)
+		local activeRequest = nil :: any
+		local canceled = false
+		if
+			onCancel(function()
+				canceled = true
+				if activeRequest ~= nil then
+					activeRequest:cancel()
+				end
+			end)
+		then
+			return
+		end
+
+		local success, result = PollLoop.run(function()
+			activeRequest = Http.post(url, {
+				clientId = self.clientId,
+			}):andThen(function(response)
+				return response:decode()
+			end)
+			local requestSucceeded, value = activeRequest:await()
+			if requestSucceeded then
+				return true, true, value
+			elseif value == Error.Timedout then
+				-- Rust's queue deliberately ends idle long polls with recv_timeout.
+				return false, false, nil
 			else
-				return Promise.reject(err)
+				return true, false, value
 			end
+		end, function()
+			return not canceled
 		end)
+		activeRequest = nil
+
+		if canceled then
+			return
+		elseif success then
+			resolve(result)
+		else
+			reject(result)
+		end
+	end)
 end
 
 function Client:reportWarnings(warnings: { string }): Promise.Promise
@@ -295,30 +324,63 @@ function Client:requestManifestCapture(
 	return Http.post(self:getUrl(endpoint)):andThen(function(response)
 		local started = HttpService:JSONDecode(response.Body) :: Types.ManifestCaptureStatus
 		local lastMessage = nil
-		local function poll(status: Types.ManifestCaptureStatus)
-			if onStatus then
-				onStatus(status)
-			end
-			if status.message ~= nil and status.message ~= lastMessage then
-				lastMessage = status.message
-				Log.info("Capture Manifest:", status.message)
-			end
-			if status.state == "complete" then
-				return status
-			elseif status.state == "failed" then
-				return Promise.reject(Error.fromMessage(status.message or "Capture Manifest failed without a reason"))
-			elseif status.state ~= "running" then
-				return Promise.reject(Error.fromMessage(`Capture Manifest returned unknown state {status.state}`))
-			end
-			return Promise.delay(0.1)
-				:andThen(function()
-					return Http.get(self:getUrl(`capture/status/{started.requestId}`))
+		local status = started
+		return Promise.new(function(resolve, reject, onCancel)
+			local activeRequest = nil :: any
+			local canceled = false
+			if
+				onCancel(function()
+					canceled = true
+					if activeRequest ~= nil then
+						activeRequest:cancel()
+					end
 				end)
-				:andThen(function(nextResponse)
-					return poll(HttpService:JSONDecode(nextResponse.Body) :: Types.ManifestCaptureStatus)
-				end)
-		end
-		return poll(started)
+			then
+				return
+			end
+
+			local success, result = PollLoop.run(function()
+				if onStatus then
+					onStatus(status)
+				end
+				if status.message ~= nil and status.message ~= lastMessage then
+					lastMessage = status.message
+					Log.info("Capture Manifest:", status.message)
+				end
+				if status.state == "complete" then
+					return true, true, status
+				elseif status.state == "failed" then
+					return true, false, Error.fromMessage(status.message or "Capture Manifest failed without a reason")
+				elseif status.state ~= "running" then
+					return true, false, Error.fromMessage(`Capture Manifest returned unknown state {status.state}`)
+				end
+
+				activeRequest = Promise.delay(0.1)
+					:andThen(function()
+						return Http.get(self:getUrl(`capture/status/{started.requestId}`))
+					end)
+					:andThen(function(nextResponse)
+						return HttpService:JSONDecode(nextResponse.Body) :: Types.ManifestCaptureStatus
+					end)
+				local requestSucceeded, value = activeRequest:await()
+				if not requestSucceeded then
+					return true, false, value
+				end
+				status = value
+				return false, false, nil
+			end, function()
+				return not canceled
+			end)
+			activeRequest = nil
+
+			if canceled then
+				return
+			elseif success then
+				resolve(result)
+			else
+				reject(result)
+			end
+		end)
 	end)
 end
 
