@@ -1,6 +1,7 @@
 use anyhow::{ensure, Context, Result};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
 	fs,
@@ -11,7 +12,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use crate::studio_plugin;
+use crate::{studio_plugin, util};
 
 #[cfg(target_os = "windows")]
 use winsafe::{co::SW, EnumWindows};
@@ -362,6 +363,45 @@ fn associate_managed_launch(launch: &ManagedLaunch) -> Result<String> {
 pub struct FocusMetadata {
 	pub studio_executable: String,
 	pub creation_filetime: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct StudioProcessIdentity {
+	pub(crate) process_id: u32,
+	pub(crate) studio_executable: String,
+	pub(crate) creation_filetime: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct StudioDesktopPlacement {
+	pub(crate) process: StudioProcessIdentity,
+	pub(crate) desktop_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub(crate) struct FocusDesktopArrangementReport {
+	pub(crate) parked: usize,
+	pub(crate) warnings: Vec<String>,
+}
+
+pub(crate) struct StudioFocusLock {
+	_file: fs::File,
+}
+
+pub(crate) fn acquire_focus_lock() -> Result<StudioFocusLock> {
+	let directory = util::get_carbon_dir()?;
+	fs::create_dir_all(&directory)?;
+	let path = directory.join("studio-focus.lock");
+	let file = fs::OpenOptions::new()
+		.create(true)
+		.truncate(false)
+		.read(true)
+		.write(true)
+		.open(&path)
+		.with_context(|| format!("failed to open Carbon Studio focus lock {}", path.display()))?;
+	file.lock()
+		.context("failed to serialize Carbon Studio focus operations")?;
+	Ok(StudioFocusLock { _file: file })
 }
 
 #[derive(Debug, Clone)]
@@ -723,7 +763,7 @@ fn broker_studio_executable(studio: &StudioInfo) -> Result<String> {
 	}
 }
 
-fn requested_virtual_desktop_name(configured: &str) -> Option<&str> {
+pub(crate) fn requested_virtual_desktop_name(configured: &str) -> Option<&str> {
 	let name = configured.trim();
 	(!name.is_empty()).then_some(name)
 }
@@ -812,7 +852,12 @@ interface IApplicationViewCollection
 }
 
 [ComImport, Guid("3F07F4BE-B107-441A-AF0F-39D82529072C"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IVirtualDesktop {}
+interface IVirtualDesktop
+{
+    [return: MarshalAs(UnmanagedType.Bool)]
+    bool IsViewVisible(IApplicationView view);
+    Guid GetId();
+}
 
 [ComImport, Guid("53F5CA0B-158F-4124-900C-057158060B27"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IVirtualDesktopManagerInternal
@@ -886,6 +931,16 @@ public static class CarbonVirtualDesktopInterop
         var result = manager.GetWindowDesktopId(hwnd, out desktopId);
         if (result != 0) Marshal.ThrowExceptionForHR(result);
         return desktopId;
+    }
+
+    public static Guid GetCurrentDesktopId()
+    {
+        IVirtualDesktopManagerInternal manager;
+        IApplicationViewCollection views;
+        GetServices(out manager, out views);
+        var desktop = manager.GetCurrentDesktop();
+        if (desktop == null) throw new InvalidOperationException("Windows did not report the active virtual desktop");
+        return desktop.GetId();
     }
 }
 "#;
@@ -962,6 +1017,148 @@ fn move_process_to_virtual_desktop(
 	{
 		let _ = (process_id, executable, creation_filetime, desktop);
 		anyhow::bail!("studio_desktop is supported only when Carbon runs on Windows or WSL")
+	}
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn focus_desktop_arrangement_script(
+	target: &StudioProcessIdentity,
+	peers: &[StudioDesktopPlacement],
+) -> Result<String> {
+	let peer_values = peers
+		.iter()
+		.map(|peer| {
+			json!({
+				"process": {
+					"process_id": peer.process.process_id,
+					"studio_executable": peer.process.studio_executable,
+					"creation_filetime": peer.process.creation_filetime.to_string(),
+				},
+				"desktop_name": peer.desktop_name,
+			})
+		})
+		.collect::<Vec<_>>();
+	let plan = json!({
+		"target": {
+			"process_id": target.process_id,
+			"studio_executable": target.studio_executable,
+			"creation_filetime": target.creation_filetime.to_string(),
+		},
+		"peers": peer_values,
+	});
+	let encoded_plan = BASE64_STANDARD.encode(serde_json::to_vec(&plan)?);
+	Ok(r#"
+$ErrorActionPreference = 'Stop'
+if ([Environment]::OSVersion.Version.Build -lt 26100) { throw 'automatic Studio desktop routing requires Windows 11 24H2 or newer' }
+$planText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_PLAN__'))
+$plan = ConvertFrom-Json -InputObject $planText
+Add-Type -TypeDefinition @'
+__CARBON_INTEROP__
+'@
+
+function Get-ExactStudioWindow([object]$identity) {
+    [uint32]$processId = $identity.process_id
+    [string]$expectedPath = $identity.studio_executable
+    [int64]$expectedCreation = $identity.creation_filetime
+    $studioProcess = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if ($null -eq $studioProcess) { throw "Roblox Studio process $processId is no longer running" }
+    $studioProcess.Refresh()
+    if (-not [string]::Equals($studioProcess.Path, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Roblox Studio process $processId path no longer matches"
+    }
+    if ($studioProcess.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $expectedCreation) {
+        throw "Roblox Studio process $processId creation time no longer matches"
+    }
+    $window = [IntPtr]::Zero
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        if ($studioProcess.HasExited) { throw "Roblox Studio process $processId exited before its window could be routed" }
+        $studioProcess.Refresh()
+        $window = $studioProcess.MainWindowHandle
+        if ($window -ne [IntPtr]::Zero) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    if ($window -eq [IntPtr]::Zero) { throw "Roblox Studio process $processId has no main window" }
+    return $window
+}
+
+function Resolve-ParkingDesktop([string]$name) {
+    $root = 'Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\Desktops'
+    $matches = @(Get-ChildItem -LiteralPath $root -ErrorAction Stop | ForEach-Object {
+        $desktopName = (Get-ItemProperty -LiteralPath $_.PSPath -Name Name -ErrorAction SilentlyContinue).Name
+        if (-not [string]::IsNullOrEmpty([string]$desktopName) -and [string]::Equals([string]$desktopName, $name, [StringComparison]::OrdinalIgnoreCase)) {
+            $_.PSChildName
+        }
+    })
+    if ($matches.Count -eq 0) { throw "Windows virtual desktop '$name' was not found" }
+    if ($matches.Count -gt 1) { throw "Windows virtual desktop name '$name' is ambiguous" }
+    return [Guid]::Parse([string]$matches[0])
+}
+
+function Move-VerifiedDesktop([IntPtr]$window, [Guid]$desktopId) {
+    $actualDesktopId = [CarbonVirtualDesktopInterop]::GetWindowDesktopId($window)
+    if ($actualDesktopId -eq $desktopId) { return }
+    [CarbonVirtualDesktopInterop]::MoveWindow($window, $desktopId)
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $actualDesktopId = [CarbonVirtualDesktopInterop]::GetWindowDesktopId($window)
+        if ($actualDesktopId -eq $desktopId) { return }
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'Windows did not move Roblox Studio to the requested virtual desktop'
+}
+
+$activeDesktopId = [CarbonVirtualDesktopInterop]::GetCurrentDesktopId()
+$targetWindow = Get-ExactStudioWindow $plan.target
+Move-VerifiedDesktop $targetWindow $activeDesktopId
+
+$warnings = [Collections.Generic.List[string]]::new()
+$parked = 0
+foreach ($peer in @($plan.peers)) {
+    [uint32]$peerProcessId = $peer.process.process_id
+    [string]$desktopName = $peer.desktop_name
+    if ($peerProcessId -eq [uint32]$plan.target.process_id) {
+        $warnings.Add("Studio PID $peerProcessId was not parked because it is also the focus target") | Out-Null
+        continue
+    }
+    try {
+        $peerWindow = Get-ExactStudioWindow $peer.process
+        $parkingDesktopId = Resolve-ParkingDesktop $desktopName
+        Move-VerifiedDesktop $peerWindow $parkingDesktopId
+        $parked++
+    } catch {
+        $warnings.Add("Studio PID $peerProcessId was not parked on desktop '$desktopName': $($_.Exception.Message)") | Out-Null
+    }
+}
+
+[PSCustomObject]@{ parked = $parked; warnings = @($warnings) } | ConvertTo-Json -Compress
+"#
+	.replace("__CARBON_PLAN__", &encoded_plan)
+	.replace("__CARBON_INTEROP__", WINDOWS_VIRTUAL_DESKTOP_INTEROP))
+}
+
+pub(crate) fn arrange_studios_for_focus(
+	target: &StudioProcessIdentity,
+	peers: &[StudioDesktopPlacement],
+) -> Result<FocusDesktopArrangementReport> {
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	{
+		let script = focus_desktop_arrangement_script(target, peers)?;
+		let output = powershell_command()?
+			.args(["-Sta", "-NoProfile", "-NonInteractive", "-Command", &script])
+			.output()
+			.context("failed to invoke automatic Studio desktop routing")?;
+		ensure!(
+			output.status.success(),
+			"automatic Studio desktop routing failed: {}",
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
+		let stdout = String::from_utf8(output.stdout).context("Studio desktop routing returned non-UTF-8 output")?;
+		serde_json::from_str(stdout.trim()).context("Studio desktop routing returned an invalid report")
+	}
+
+	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+	{
+		let _ = (target, peers);
+		anyhow::bail!("automatic Studio desktop routing is supported only when Carbon runs on Windows or WSL")
 	}
 }
 
@@ -1883,6 +2080,37 @@ mod tests {
 		assert!(script.contains("MoveViewToDesktop"));
 		assert!(script.contains("GetWindowDesktopId"));
 		assert!(script.contains("OSVersion.Version.Build -lt 26100"));
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn focus_desktop_arrangement_captures_active_desktop_and_isolates_peer_failures() {
+		let executable = r"C:\Roblox\RobloxStudioBeta.exe";
+		let desktop = "Studios'); Stop-Process -Name RobloxStudioBeta; ('";
+		let target = StudioProcessIdentity {
+			process_id: 47_312,
+			studio_executable: executable.to_owned(),
+			creation_filetime: 133_700_123_456,
+		};
+		let peers = vec![StudioDesktopPlacement {
+			process: StudioProcessIdentity {
+				process_id: 47_313,
+				studio_executable: executable.to_owned(),
+				creation_filetime: 133_700_123_457,
+			},
+			desktop_name: desktop.to_owned(),
+		}];
+
+		let script = focus_desktop_arrangement_script(&target, &peers).unwrap();
+
+		assert!(script.contains("GetCurrentDesktopId"));
+		assert!(script.contains("Move-VerifiedDesktop $targetWindow $activeDesktopId"));
+		assert!(script.contains("foreach ($peer in @($plan.peers))"));
+		assert!(script.contains("catch"));
+		assert!(script.contains("$warnings.Add"));
+		assert!(script.contains("OSVersion.Version.Build -lt 26100"));
+		assert!(!script.contains(executable));
+		assert!(!script.contains(desktop));
 	}
 
 	#[cfg(target_os = "linux")]

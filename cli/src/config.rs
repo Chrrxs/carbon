@@ -40,7 +40,7 @@ pub struct Config {
 	pub run_async: bool,
 	/// Scan for the first available port if selected one is in use
 	pub scan_ports: bool,
-	/// Windows virtual desktop name for newly launched Studio windows (empty disables)
+	/// Parking desktop for Studio windows and automatic focus routing (empty disables)
 	pub studio_desktop: String,
 
 	/// Maximum number of unsynced changes before showing a warning

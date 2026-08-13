@@ -307,7 +307,9 @@ impl Serve {
 	pub fn main(self) -> Result<()> {
 		raise_open_file_limit().context("Carbon serve cannot guarantee Capture Manifest capacity")?;
 		let project_path = source::resolve(self.source.unwrap_or_default())?;
-		let worktree = sessions::detect_worktree(&project_path)?;
+		let worktree_identity = sessions::detect_worktree_identity(&project_path)?;
+		let worktree = worktree_identity.as_ref().map(|identity| identity.root.clone());
+		let git_common_dir = worktree_identity.map(|identity| identity.git_common_dir);
 		Config::load_workspace(project_path.get_parent());
 		let (preferred_port, scan_ports, studio_desktop) = {
 			let config = Config::new();
@@ -388,6 +390,8 @@ impl Serve {
 			port: Some(port),
 			studio_pid: Some(studio_process_id),
 			worktree,
+			git_common_dir,
+			studio_desktop: studio::requested_virtual_desktop_name(&studio_desktop).map(str::to_owned),
 			studio_executable,
 			creation_filetime,
 			launch_id: Some(managed_studio.launch_id().to_owned()),

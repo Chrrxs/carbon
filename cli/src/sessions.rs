@@ -22,11 +22,21 @@ pub struct Session {
 	#[serde(default)]
 	pub worktree: Option<PathBuf>,
 	#[serde(default)]
+	pub git_common_dir: Option<PathBuf>,
+	#[serde(default)]
+	pub studio_desktop: Option<String>,
+	#[serde(default)]
 	pub studio_executable: Option<String>,
 	#[serde(default)]
 	pub creation_filetime: Option<u64>,
 	#[serde(default)]
 	pub launch_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktreeIdentity {
+	pub(crate) root: PathBuf,
+	pub(crate) git_common_dir: PathBuf,
 }
 
 impl Session {
@@ -149,7 +159,7 @@ pub fn get(id: Option<String>, host: Option<String>, port: Option<u16>) -> Resul
 	Ok(find_session(&sessions, id.as_deref(), host.as_deref(), port))
 }
 
-pub fn detect_worktree(path: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn detect_worktree_identity(path: &Path) -> Result<Option<WorktreeIdentity>> {
 	let directory = if path.is_file() {
 		path.parent()
 			.with_context(|| format!("{} does not have a parent directory", path.display()))?
@@ -167,9 +177,40 @@ pub fn detect_worktree(path: &Path) -> Result<Option<PathBuf>> {
 	let root = String::from_utf8(output.stdout).context("Git returned a non-UTF-8 worktree path")?;
 	let root = root.trim();
 	ensure!(!root.is_empty(), "Git returned an empty worktree path");
-	Ok(Some(fs::canonicalize(root).with_context(|| {
-		format!("failed to canonicalize Git worktree {root}")
-	})?))
+	let root = fs::canonicalize(root).with_context(|| format!("failed to canonicalize Git worktree {root}"))?;
+	let output = Command::new("git")
+		.args(["rev-parse", "--git-common-dir"])
+		.current_dir(&root)
+		.output()
+		.with_context(|| format!("failed to inspect the Git common directory for {}", root.display()))?;
+	ensure!(
+		output.status.success(),
+		"Git could not resolve the common directory for {}: {}",
+		root.display(),
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	let git_common_dir = String::from_utf8(output.stdout).context("Git returned a non-UTF-8 common directory")?;
+	let git_common_dir = PathBuf::from(git_common_dir.trim());
+	ensure!(
+		!git_common_dir.as_os_str().is_empty(),
+		"Git returned an empty common directory"
+	);
+	let git_common_dir = if git_common_dir.is_absolute() {
+		git_common_dir
+	} else {
+		root.join(git_common_dir)
+	};
+	let git_common_dir = fs::canonicalize(&git_common_dir).with_context(|| {
+		format!(
+			"failed to canonicalize Git common directory {}",
+			git_common_dir.display()
+		)
+	})?;
+	Ok(Some(WorktreeIdentity { root, git_common_dir }))
+}
+
+pub fn detect_worktree(path: &Path) -> Result<Option<PathBuf>> {
+	Ok(detect_worktree_identity(path)?.map(|identity| identity.root))
 }
 
 pub fn get_by_worktree(path: &Path) -> Result<Option<Session>> {
@@ -207,6 +248,57 @@ fn find_worktree_session(sessions: &Sessions, worktree: &Path) -> Result<Option<
 		worktree.display()
 	);
 	Ok(matches.first().map(|session| (*session).clone()))
+}
+
+fn find_repository_peers(sessions: &Sessions, target: &Session, git_common_dir: &Path) -> Vec<Session> {
+	let mut peers = sessions
+		.active_sessions
+		.values()
+		.filter(|candidate| *candidate != target && candidate.git_common_dir.as_deref() == Some(git_common_dir))
+		.cloned()
+		.collect::<Vec<_>>();
+	peers.sort_by_key(|session| (session.studio_pid, session.port, session.pid));
+	peers
+}
+
+fn session_git_common_dir(session: &Session) -> Result<Option<PathBuf>> {
+	if let Some(git_common_dir) = &session.git_common_dir {
+		return Ok(Some(git_common_dir.clone()));
+	}
+	let Some(worktree) = &session.worktree else {
+		return Ok(None);
+	};
+	Ok(detect_worktree_identity(worktree)?.map(|identity| identity.git_common_dir))
+}
+
+pub(crate) fn get_repository_peers(target: &Session) -> Result<Vec<Session>> {
+	let target_git_common_dir = match session_git_common_dir(target) {
+		Ok(Some(git_common_dir)) => git_common_dir,
+		Ok(None) => return Ok(Vec::new()),
+		Err(error) => {
+			crate::carbon_warn!(
+				"Could not identify the focused session's Git repository; sibling Studios will not be parked: {error:#}"
+			);
+			return Ok(Vec::new());
+		}
+	};
+	let sessions = get_sessions()?;
+	let mut peers = find_repository_peers(&sessions, target, &target_git_common_dir);
+	for candidate in sessions.active_sessions.values() {
+		if candidate == target || candidate.git_common_dir.is_some() {
+			continue;
+		}
+		match session_git_common_dir(candidate) {
+			Ok(Some(git_common_dir)) if git_common_dir == target_git_common_dir => peers.push(candidate.clone()),
+			Ok(_) => {}
+			Err(error) => crate::carbon_warn!(
+				"Could not identify the Git repository for Carbon session PID {}; that Studio will not be parked: {error:#}",
+				candidate.pid
+			),
+		}
+	}
+	peers.sort_by_key(|session| (session.studio_pid, session.port, session.pid));
+	Ok(peers)
 }
 
 fn replace_id_in(directory: &Path, session: &Session, id: String) -> Result<()> {
@@ -364,6 +456,8 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(20),
 			worktree: Some(PathBuf::from("/tmp/managed-worktree")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: Some("launch-carbon-a".to_owned()),
@@ -390,6 +484,8 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(20),
 			worktree: Some(PathBuf::from("/tmp/direct-worktree")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -418,6 +514,8 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(20),
 			worktree: Some(PathBuf::from("/tmp/refreshed-worktree")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: Some("launch-carbon".to_owned()),
@@ -475,6 +573,8 @@ mod tests {
 			port: Some(8000 + index),
 			studio_pid: Some(20 + u32::from(index)),
 			worktree: Some(PathBuf::from(format!("/tmp/carbon-worktree-{index}"))),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: Some(format!("launch-{index}")),
@@ -533,6 +633,8 @@ mod tests {
 							port: Some(8100 + index as u16),
 							studio_pid: Some(20_000 + index as u32),
 							worktree: None,
+							git_common_dir: None,
+							studio_desktop: None,
 							studio_executable: None,
 							creation_filetime: None,
 							launch_id: None,
@@ -561,6 +663,8 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(10),
 			worktree: Some(PathBuf::from("/tmp/first")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -571,6 +675,8 @@ mod tests {
 			port: Some(8001),
 			studio_pid: Some(11),
 			worktree: Some(PathBuf::from("/tmp/second")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -598,6 +704,8 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(20),
 			worktree: Some(PathBuf::from("/tmp/old")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -610,6 +718,8 @@ mod tests {
 			port: Some(8001),
 			studio_pid: Some(21),
 			worktree: Some(PathBuf::from("/tmp/replacement")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -638,6 +748,8 @@ port = 8000
 
 		assert_eq!(session.studio_pid, None);
 		assert_eq!(session.worktree, None);
+		assert_eq!(session.git_common_dir, None);
+		assert_eq!(session.studio_desktop, None);
 		assert_eq!(session.studio_executable, None);
 		assert_eq!(session.creation_filetime, None);
 		assert_eq!(session.launch_id, None);
@@ -651,6 +763,8 @@ port = 8000
 			port: Some(8000),
 			studio_pid: Some(100),
 			worktree: Some(PathBuf::from("/tmp/carbon-persistence")),
+			git_common_dir: Some(PathBuf::from("/tmp/carbon-main/.git")),
+			studio_desktop: Some("Studios".to_owned()),
 			studio_executable: Some("C:\\Roblox\\RobloxStudioBeta.exe".to_owned()),
 			creation_filetime: Some(133700123456),
 			launch_id: Some("launch-persistence".to_owned()),
@@ -661,6 +775,47 @@ port = 8000
 	}
 
 	#[test]
+	fn linked_worktrees_share_one_detected_repository_identity() {
+		let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let directory = std::env::temp_dir().join(format!("carbon-session-repository-{unique}"));
+		let repository = directory.join("repository");
+		let linked = directory.join("linked");
+		fs::create_dir_all(&repository).unwrap();
+		let git = |cwd: &Path, arguments: &[&str]| {
+			let output = Command::new("git").args(arguments).current_dir(cwd).output().unwrap();
+			assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+		};
+		git(&repository, &["init", "-b", "main"]);
+		git(&repository, &["config", "user.name", "Carbon Test"]);
+		git(&repository, &["config", "user.email", "carbon@example.invalid"]);
+		fs::write(repository.join("tracked.txt"), "tracked\n").unwrap();
+		git(&repository, &["add", "tracked.txt"]);
+		git(&repository, &["commit", "-m", "tracked"]);
+		let output = Command::new("git")
+			.args(["worktree", "add", "-b", "linked"])
+			.arg(&linked)
+			.current_dir(&repository)
+			.output()
+			.unwrap();
+		assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+		let main = detect_worktree_identity(&repository).unwrap().unwrap();
+		let sibling = detect_worktree_identity(&linked).unwrap().unwrap();
+		assert_eq!(main.root, fs::canonicalize(&repository).unwrap());
+		assert_eq!(sibling.root, fs::canonicalize(&linked).unwrap());
+		assert_eq!(main.git_common_dir, sibling.git_common_dir);
+
+		let output = Command::new("git")
+			.args(["worktree", "remove", "--force"])
+			.arg(&linked)
+			.current_dir(&repository)
+			.output()
+			.unwrap();
+		assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
 	fn worktree_focus_selects_only_the_exact_registered_session() {
 		let first = Session {
 			pid: 1,
@@ -668,6 +823,8 @@ port = 8000
 			port: Some(8000),
 			studio_pid: Some(101),
 			worktree: Some(PathBuf::from("/tmp/carbon-first")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -678,6 +835,8 @@ port = 8000
 			port: Some(8001),
 			studio_pid: Some(102),
 			worktree: Some(PathBuf::from("/tmp/carbon-second")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -704,6 +863,8 @@ port = 8000
 			port: Some(8000),
 			studio_pid: Some(101),
 			worktree: Some(PathBuf::from("/tmp/carbon-duplicate")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: None,
@@ -724,5 +885,49 @@ port = 8000
 
 		let error = find_worktree_session(&sessions, Path::new("/tmp/carbon-duplicate")).unwrap_err();
 		assert!(error.to_string().contains("multiple running Carbon serve sessions"));
+	}
+
+	#[test]
+	fn repository_peers_include_only_other_worktrees_from_the_same_git_common_dir() {
+		let target = Session {
+			pid: 1,
+			host: Some("127.0.0.1".to_owned()),
+			port: Some(8000),
+			studio_pid: Some(101),
+			worktree: Some(PathBuf::from("/tmp/game-main")),
+			git_common_dir: Some(PathBuf::from("/tmp/game-main/.git")),
+			studio_desktop: Some("Studios".to_owned()),
+			studio_executable: None,
+			creation_filetime: None,
+			launch_id: None,
+		};
+		let sibling = Session {
+			pid: 2,
+			port: Some(8001),
+			studio_pid: Some(102),
+			worktree: Some(PathBuf::from("/tmp/game-feature")),
+			..target.clone()
+		};
+		let unrelated = Session {
+			pid: 3,
+			port: Some(8002),
+			studio_pid: Some(103),
+			worktree: Some(PathBuf::from("/tmp/other-feature")),
+			git_common_dir: Some(PathBuf::from("/tmp/other-main/.git")),
+			..target.clone()
+		};
+		let sessions = Sessions {
+			last_session: "target".to_owned(),
+			active_sessions: HashMap::from([
+				("target".to_owned(), target.clone()),
+				("sibling".to_owned(), sibling.clone()),
+				("unrelated".to_owned(), unrelated),
+			]),
+		};
+
+		assert_eq!(
+			find_repository_peers(&sessions, &target, Path::new("/tmp/game-main/.git")),
+			vec![sibling]
+		);
 	}
 }

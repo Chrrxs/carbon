@@ -63,30 +63,40 @@ disposable place and printed during startup, so managed sessions from separate
 Git worktrees can build, launch, synchronize, capture, and stop concurrently.
 Each endpoint accepts one Studio client.
 
-To keep newly launched Studio windows on a custom-named Windows 11 virtual
-desktop, add this workspace setting to `carbon.toml` beside the project:
+To keep Studio windows on a custom-named Windows 11 parking desktop, add this
+workspace setting to `carbon.toml` beside the project:
 
 ```toml
 studio_desktop = "Studios"
 ```
 
 The setting applies to both managed `carbon serve` launches and the standalone
-`carbon studio` command. An empty value disables placement. Carbon resolves the
-name case-insensitively before launch, moves only the exact Studio process it
-started, verifies the resulting desktop, and does not switch the active
-desktop. Placement currently requires Windows 11 24H2 or newer (including when
-Carbon runs through WSL); a missing, duplicate, or unsupported desktop fails
-the launch and cleans up the new Studio process.
+`carbon studio` command. An empty value disables desktop placement and focus
+routing. Carbon resolves the name case-insensitively before launch, moves only
+the exact Studio process it started, verifies the resulting desktop, and does
+not switch the active desktop. Placement currently requires Windows 11 24H2 or
+newer (including when Carbon runs through WSL); a missing, duplicate, or
+unsupported desktop fails the launch and cleans up the new Studio process.
 
 `carbon focus` leaves the exact native Studio process launched for the selected
-serve session in the foreground. If Studio owns an active modal dialog, Carbon
-focuses that dialog instead of the disabled main window. Pass `--restore` to
-verify Studio activation and then return to the previously foreground window.
-A worktree target may be the repository root or any path inside it. Carbon never
-falls back to window-title matching; if more than one session is registered for
-the same worktree, select it by instance ID or port instead. Serve sessions
-started by an older Carbon version must be restarted once so their Studio
-process and worktree identity are registered.
+serve session in the foreground. When `studio_desktop` is configured, focus
+first captures the currently active Windows desktop, moves the selected Studio
+there, and moves other running Carbon Studio sessions from the same Git
+repository back to the parking desktop each session recorded at launch. Run
+`carbon focus` from the desktop where you want to work; that desktop does not
+need a configured name. Routing is serialized so concurrent focus commands do
+not interleave. Moving the selected Studio is strict, while a stale sibling is
+reported as a warning and does not block focus.
+
+If Studio owns an active modal dialog, Carbon focuses that dialog instead of the
+disabled main window. Pass `--restore` to verify Studio activation and then
+return to the previously foreground window. A worktree target may be the
+repository root or any path inside it. Carbon never falls back to process-name
+or window-title matching, and sessions from different Git repositories are
+left untouched. If more than one session is registered for the same worktree,
+select it by instance ID or port instead. Serve sessions started by an older
+Carbon version must be restarted once so their exact process, repository, and
+launch-time parking desktop are registered.
 
 Managed `serve` requires a loopback `robloxstudio-mcp` that advertises lifecycle
 protocol v3 with exact process identity. The default MCP URL is

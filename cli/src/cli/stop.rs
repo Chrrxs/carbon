@@ -178,6 +178,8 @@ mod tests {
 			port: Some(8000),
 			studio_pid: Some(20),
 			worktree: Some(PathBuf::from("/tmp/carbon-worktree")),
+			git_common_dir: None,
+			studio_desktop: None,
 			studio_executable: None,
 			creation_filetime: None,
 			launch_id: Some("launch-carbon-a".to_owned()),
