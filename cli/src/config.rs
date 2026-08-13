@@ -40,6 +40,8 @@ pub struct Config {
 	pub run_async: bool,
 	/// Scan for the first available port if selected one is in use
 	pub scan_ports: bool,
+	/// Windows virtual desktop name for newly launched Studio windows (empty disables)
+	pub studio_desktop: String,
 
 	/// Maximum number of unsynced changes before showing a warning
 	pub max_unsynced_changes: usize,
@@ -56,6 +58,7 @@ impl Default for Config {
 			port: 8000,
 			run_async: false,
 			scan_ports: true,
+			studio_desktop: String::new(),
 
 			max_unsynced_changes: 10,
 
@@ -260,5 +263,24 @@ impl Serialize for Config {
 		}
 
 		map.end()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn workspace_config_accepts_a_named_studio_desktop() {
+		let configured: OptConfig = toml::from_str("studio_desktop = \"Studios\"\n").unwrap();
+		let mut config = Config::default();
+
+		config.merge_opt(configured);
+
+		assert_eq!(config.studio_desktop, "Studios");
+		assert_eq!(
+			config.get("studio_desktop").map(|value| value.to_string()),
+			Some(String::from("Studios"))
+		);
 	}
 }

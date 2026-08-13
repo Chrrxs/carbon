@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 
-use crate::{carbon_info, studio};
+use crate::{carbon_info, config::Config, studio};
 
 /// Launch a new Roblox Studio instance
 #[derive(Parser)]
@@ -25,7 +25,8 @@ impl Studio {
 
 		carbon_info!("Launching Roblox Studio..");
 
-		studio::launch(self.path)?;
+		let studio_desktop = Config::new().studio_desktop.clone();
+		studio::launch(self.path, &studio_desktop)?;
 
 		Ok(())
 	}

@@ -63,6 +63,21 @@ disposable place and printed during startup, so managed sessions from separate
 Git worktrees can build, launch, synchronize, capture, and stop concurrently.
 Each endpoint accepts one Studio client.
 
+To keep newly launched Studio windows on a custom-named Windows 11 virtual
+desktop, add this workspace setting to `carbon.toml` beside the project:
+
+```toml
+studio_desktop = "Studios"
+```
+
+The setting applies to both managed `carbon serve` launches and the standalone
+`carbon studio` command. An empty value disables placement. Carbon resolves the
+name case-insensitively before launch, moves only the exact Studio process it
+started, verifies the resulting desktop, and does not switch the active
+desktop. Placement currently requires Windows 11 24H2 or newer (including when
+Carbon runs through WSL); a missing, duplicate, or unsupported desktop fails
+the launch and cleans up the new Studio process.
+
 `carbon focus` leaves the exact native Studio process launched for the selected
 serve session in the foreground. If Studio owns an active modal dialog, Carbon
 focuses that dialog instead of the disabled main window. Pass `--restore` to

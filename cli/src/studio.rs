@@ -309,6 +309,19 @@ impl ManagedLaunch {
 	}
 }
 
+fn close_managed_launch(launch: &ManagedLaunch, studio_executable: &str) -> Result<()> {
+	match launch.close() {
+		Ok(()) => Ok(()),
+		Err(broker_error) => terminate_process(launch.process_id, studio_executable, launch.creation_filetime)
+			.with_context(|| {
+				format!(
+					"robloxstudio-mcp could not close Studio launch {} ({broker_error:#}); exact-process fallback also failed",
+					launch.launch_id
+				)
+			}),
+	}
+}
+
 fn authorize_managed_launch(launch: &ManagedLaunch) -> Result<()> {
 	if let Err(error) = launch.authorize() {
 		return match launch.close() {
@@ -357,6 +370,12 @@ pub struct StudioInfo {
 	pub version_text: String,
 	pub version_components: [u32; 4],
 	pub build_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VirtualDesktopTarget {
+	name: String,
+	id: String,
 }
 
 #[derive(Clone)]
@@ -414,20 +433,7 @@ impl ManagedStudio {
 	}
 
 	pub fn stop(&self) -> Result<()> {
-		match self.launch.close() {
-			Ok(()) => Ok(()),
-			Err(broker_error) => terminate_process(
-				self.process_id(),
-				&self.studio_executable,
-				self.launch.creation_filetime,
-			)
-			.with_context(|| {
-				format!(
-					"robloxstudio-mcp could not close Studio launch {} ({broker_error:#}); exact-process fallback also failed",
-					self.launch_id()
-				)
-			}),
-		}
+		close_managed_launch(&self.launch, &self.studio_executable)
 	}
 }
 
@@ -717,6 +723,248 @@ fn broker_studio_executable(studio: &StudioInfo) -> Result<String> {
 	}
 }
 
+fn requested_virtual_desktop_name(configured: &str) -> Option<&str> {
+	let name = configured.trim();
+	(!name.is_empty()).then_some(name)
+}
+
+fn resolve_requested_virtual_desktop(configured: &str) -> Result<Option<VirtualDesktopTarget>> {
+	requested_virtual_desktop_name(configured)
+		.map(resolve_virtual_desktop)
+		.transpose()
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn virtual_desktop_lookup_script(name: &str) -> String {
+	let encoded_name = BASE64_STANDARD.encode(name.as_bytes());
+	format!(
+		r#"
+$ErrorActionPreference = 'Stop'
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_name}'))
+$root = 'Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\Desktops'
+$desktops = @(Get-ChildItem -LiteralPath $root -ErrorAction Stop | ForEach-Object {{
+    $desktopName = (Get-ItemProperty -LiteralPath $_.PSPath -Name Name -ErrorAction SilentlyContinue).Name
+    if (-not [string]::IsNullOrEmpty([string]$desktopName)) {{
+        [PSCustomObject]@{{ Id = $_.PSChildName; Name = [string]$desktopName }}
+    }}
+}})
+$matches = @($desktops | Where-Object {{ [string]::Equals($_.Name, $name, [StringComparison]::OrdinalIgnoreCase) }})
+if ($matches.Count -eq 0) {{
+    $available = @($desktops | ForEach-Object {{ $_.Name }}) -join ', '
+    if ([string]::IsNullOrEmpty($available)) {{ $available = '(none)' }}
+    throw "Windows virtual desktop '$name' was not found. Named desktops: $available"
+}}
+if ($matches.Count -gt 1) {{ throw "Windows virtual desktop name '$name' is ambiguous" }}
+[Guid]::Parse($matches[0].Id).ToString('D')
+"#
+	)
+}
+
+fn resolve_virtual_desktop(name: &str) -> Result<VirtualDesktopTarget> {
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	{
+		let script = virtual_desktop_lookup_script(name);
+		let output = powershell_command()?
+			.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+			.output()
+			.context("failed to inspect Windows virtual desktops")?;
+		ensure!(
+			output.status.success(),
+			"failed to resolve Windows virtual desktop {name:?}: {}",
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
+		let id = String::from_utf8(output.stdout)?.trim().to_owned();
+		let id = uuid::Uuid::parse_str(&id)
+			.with_context(|| format!("Windows returned an invalid identifier for virtual desktop {name:?}"))?
+			.hyphenated()
+			.to_string();
+		Ok(VirtualDesktopTarget {
+			name: name.to_owned(),
+			id,
+		})
+	}
+
+	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+	{
+		let _ = name;
+		anyhow::bail!("studio_desktop is supported only when Carbon runs on Windows or WSL")
+	}
+}
+
+// Windows' public IVirtualDesktopManager API rejects windows owned by another
+// process. These minimal shell interfaces are the Windows 11 24H2+ layout used
+// to move an exact external application view without switching desktops.
+// Interface layout reference: https://github.com/MScholtes/VirtualDesktop
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const WINDOWS_VIRTUAL_DESKTOP_INTEROP: &str = r#"using System;
+using System.Runtime.InteropServices;
+
+[ComImport, Guid("372E1D3B-38D3-42E4-A15B-8AB2B178F513"), InterfaceType(ComInterfaceType.InterfaceIsIInspectable)]
+interface IApplicationView {}
+
+[ComImport, Guid("1841C6D7-4F9D-42C0-AF41-8747538F10E5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IApplicationViewCollection
+{
+    int GetViews(out IntPtr array);
+    int GetViewsByZOrder(out IntPtr array);
+    int GetViewsByAppUserModelId(string id, out IntPtr array);
+    [PreserveSig] int GetViewForHwnd(IntPtr hwnd, out IApplicationView view);
+}
+
+[ComImport, Guid("3F07F4BE-B107-441A-AF0F-39D82529072C"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IVirtualDesktop {}
+
+[ComImport, Guid("53F5CA0B-158F-4124-900C-057158060B27"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IVirtualDesktopManagerInternal
+{
+    int GetCount();
+    void MoveViewToDesktop(IApplicationView view, IVirtualDesktop desktop);
+    bool CanViewMoveDesktops(IApplicationView view);
+    IVirtualDesktop GetCurrentDesktop();
+    void GetDesktops(out IntPtr desktops);
+    [PreserveSig] int GetAdjacentDesktop(IVirtualDesktop from, int direction, out IVirtualDesktop desktop);
+    void SwitchDesktop(IVirtualDesktop desktop);
+    void SwitchDesktopAndMoveForegroundView(IVirtualDesktop desktop);
+    IVirtualDesktop CreateDesktop();
+    void MoveDesktop(IVirtualDesktop desktop, int index);
+    void RemoveDesktop(IVirtualDesktop desktop, IVirtualDesktop fallback);
+    IVirtualDesktop FindDesktop(ref Guid desktopId);
+}
+
+[ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IServiceProvider10
+{
+    [return: MarshalAs(UnmanagedType.IUnknown)]
+    object QueryService(ref Guid service, ref Guid interfaceId);
+}
+
+[ComImport, Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IVirtualDesktopManager
+{
+    [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, out int onCurrentDesktop);
+    [PreserveSig] int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+    [PreserveSig] int MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
+}
+
+[ComImport, Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")]
+class VirtualDesktopManager {}
+
+public static class CarbonVirtualDesktopInterop
+{
+    static readonly Guid ImmersiveShell = new Guid("C2F03A33-21F5-47FA-B4BB-156362A2F239");
+    static readonly Guid ManagerService = new Guid("C5E0CDCA-7B6E-41B2-9FC4-D93975CC467B");
+
+    static void GetServices(out IVirtualDesktopManagerInternal manager, out IApplicationViewCollection views)
+    {
+        var shell = (IServiceProvider10)Activator.CreateInstance(Type.GetTypeFromCLSID(ImmersiveShell));
+        var managerService = ManagerService;
+        var managerInterface = typeof(IVirtualDesktopManagerInternal).GUID;
+        var viewsInterface = typeof(IApplicationViewCollection).GUID;
+        manager = (IVirtualDesktopManagerInternal)shell.QueryService(ref managerService, ref managerInterface);
+        views = (IApplicationViewCollection)shell.QueryService(ref viewsInterface, ref viewsInterface);
+    }
+
+    public static void MoveWindow(IntPtr hwnd, Guid desktopId)
+    {
+        IVirtualDesktopManagerInternal manager;
+        IApplicationViewCollection views;
+        GetServices(out manager, out views);
+
+        IApplicationView view;
+        var result = views.GetViewForHwnd(hwnd, out view);
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+
+        var desktop = manager.FindDesktop(ref desktopId);
+        if (desktop == null) throw new InvalidOperationException("Windows virtual desktop no longer exists");
+        manager.MoveViewToDesktop(view, desktop);
+    }
+
+    public static Guid GetWindowDesktopId(IntPtr hwnd)
+    {
+        var manager = (IVirtualDesktopManager)new VirtualDesktopManager();
+        Guid desktopId;
+        var result = manager.GetWindowDesktopId(hwnd, out desktopId);
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+        return desktopId;
+    }
+}
+"#;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn require_process_script(process_id: u32, executable: &str, creation_filetime: u64) -> String {
+	let encoded = BASE64_STANDARD.encode(executable.as_bytes());
+	format!(
+		r#"
+$expected = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))
+$process = Get-Process -Id {process_id} -ErrorAction SilentlyContinue
+if ($null -eq $process) {{ throw 'Roblox Studio process is no longer running' }}
+$process.Refresh()
+if (-not [string]::Equals($process.Path, $expected, [StringComparison]::OrdinalIgnoreCase)) {{ throw 'Roblox Studio process path no longer matches' }}
+if ($process.StartTime.ToUniversalTime().ToFileTimeUtc() -ne {creation_filetime}) {{ throw 'Roblox Studio process creation time no longer matches' }}
+"#
+	)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn virtual_desktop_move_script(process_id: u32, executable: &str, creation_filetime: u64, desktop_id: &str) -> String {
+	let validation = require_process_script(process_id, executable, creation_filetime);
+	let encoded_id = BASE64_STANDARD.encode(desktop_id.as_bytes());
+	format!(
+		r#"
+$ErrorActionPreference = 'Stop'
+{validation}
+$desktopIdText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_id}'))
+$desktopId = [Guid]::ParseExact($desktopIdText, 'D')
+if ([Environment]::OSVersion.Version.Build -lt 26100) {{ throw 'studio_desktop requires Windows 11 24H2 or newer' }}
+$window = [IntPtr]::Zero
+for ($attempt = 0; $attempt -lt 300; $attempt++) {{
+    if ($process.HasExited) {{ throw 'Roblox Studio exited before its window could be moved' }}
+    $process.Refresh()
+    $window = $process.MainWindowHandle
+    if ($window -ne [IntPtr]::Zero) {{ break }}
+    Start-Sleep -Milliseconds 100
+}}
+if ($window -eq [IntPtr]::Zero) {{ throw 'Roblox Studio main window was not found within 30 seconds' }}
+Add-Type -TypeDefinition @'
+{interop}
+'@
+[CarbonVirtualDesktopInterop]::MoveWindow($window, $desktopId)
+$actualDesktopId = [CarbonVirtualDesktopInterop]::GetWindowDesktopId($window)
+if ($actualDesktopId -ne $desktopId) {{ throw 'Windows did not move Roblox Studio to the requested virtual desktop' }}
+"#,
+		interop = WINDOWS_VIRTUAL_DESKTOP_INTEROP,
+	)
+}
+
+fn move_process_to_virtual_desktop(
+	process_id: u32,
+	executable: &str,
+	creation_filetime: u64,
+	desktop: &VirtualDesktopTarget,
+) -> Result<()> {
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	{
+		let script = virtual_desktop_move_script(process_id, executable, creation_filetime, &desktop.id);
+		let output = powershell_command()?
+			.args(["-Sta", "-NoProfile", "-NonInteractive", "-Command", &script])
+			.output()
+			.context("failed to invoke Windows virtual desktop placement")?;
+		ensure!(
+			output.status.success(),
+			"failed to move Roblox Studio to Windows virtual desktop {:?}: {}",
+			desktop.name,
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
+		Ok(())
+	}
+
+	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+	{
+		let _ = (process_id, executable, creation_filetime, desktop);
+		anyhow::bail!("studio_desktop is supported only when Carbon runs on Windows or WSL")
+	}
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn launch_process(path: Option<&Path>, studio: &StudioInfo) -> Result<(u32, String, u64)> {
 	#[cfg(target_os = "linux")]
@@ -782,20 +1030,47 @@ fn launch_process(path: Option<&Path>, studio: &StudioInfo) -> Result<(u32, Stri
 	Ok((child.id(), studio.executable.to_string_lossy().into_owned(), 0))
 }
 
-pub fn launch(path: Option<PathBuf>) -> Result<Option<u32>> {
+pub fn launch(path: Option<PathBuf>, desktop_name: &str) -> Result<Option<u32>> {
+	let desktop = resolve_requested_virtual_desktop(desktop_name)?;
 	let _plugin = ensure_plugin()?;
 	let studio = get_studio_info()?;
-	let (process_id, _, _) = launch_process(path.as_deref(), &studio)?;
+	let (process_id, studio_executable, creation_filetime) = launch_process(path.as_deref(), &studio)?;
+	if let Some(desktop) = desktop.as_ref() {
+		if let Err(error) = move_process_to_virtual_desktop(process_id, &studio_executable, creation_filetime, desktop)
+		{
+			return match terminate_process(process_id, &studio_executable, creation_filetime) {
+				Ok(()) => Err(error.context("Studio desktop placement failed; exact-process cleanup completed")),
+				Err(cleanup_error) => Err(error.context(format!(
+					"Studio desktop placement failed and exact-process cleanup also failed: {cleanup_error:#}"
+				))),
+			};
+		}
+		crate::carbon_info!("Moved Roblox Studio to Windows desktop {:?}", desktop.name);
+	}
 	Ok(Some(process_id))
 }
 
-pub fn launch_managed(path: PathBuf, _studio_dir: &Path) -> Result<ManagedStudio> {
+pub fn launch_managed(path: PathBuf, _studio_dir: &Path, desktop_name: &str) -> Result<ManagedStudio> {
+	let desktop = resolve_requested_virtual_desktop(desktop_name)?;
 	let installation = ensure_plugin()?;
 	let studio = get_studio_info()?;
 	let studio_executable = broker_studio_executable(&studio)?;
 	let lifecycle = discover_mcp_lifecycle()?;
 	let launch = lifecycle.launch(&path, &studio_executable)?;
 	authorize_managed_launch(&launch)?;
+	if let Some(desktop) = desktop.as_ref() {
+		if let Err(error) =
+			move_process_to_virtual_desktop(launch.process_id, &studio_executable, launch.creation_filetime, desktop)
+		{
+			return match close_managed_launch(&launch, &studio_executable) {
+				Ok(()) => Err(error.context("managed Studio desktop placement failed; cleanup completed")),
+				Err(cleanup_error) => Err(error.context(format!(
+					"managed Studio desktop placement failed and cleanup also failed: {cleanup_error:#}"
+				))),
+			};
+		}
+		crate::carbon_info!("Moved Roblox Studio to Windows desktop {:?}", desktop.name);
+	}
 	Ok(ManagedStudio {
 		launch,
 		studio_executable,
@@ -1566,6 +1841,48 @@ mod tests {
 			.map(|request| request["action"].as_str().unwrap().to_owned())
 			.collect::<Vec<_>>();
 		assert_eq!(actions, ["launch", "close"]);
+	}
+
+	#[test]
+	fn blank_studio_desktop_disables_placement() {
+		assert_eq!(requested_virtual_desktop_name(""), None);
+		assert_eq!(requested_virtual_desktop_name("  \t"), None);
+		assert_eq!(requested_virtual_desktop_name("  Studios  "), Some("Studios"));
+		assert_eq!(resolve_requested_virtual_desktop("  ").unwrap(), None);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn virtual_desktop_lookup_uses_named_windows_desktops_without_command_injection() {
+		let name = "Studios'); Stop-Process -Name RobloxStudioBeta; ('";
+		let script = virtual_desktop_lookup_script(name);
+
+		assert!(script.contains(
+			r"Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\Desktops"
+		));
+		assert!(script.contains("StringComparison]::OrdinalIgnoreCase"));
+		assert!(script.contains(&BASE64_STANDARD.encode(name.as_bytes())));
+		assert!(!script.contains(name));
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn virtual_desktop_move_requires_exact_process_identity_and_verifies_the_result() {
+		let executable = r"C:\Roblox\RobloxStudioBeta.exe";
+		let script = virtual_desktop_move_script(
+			47_312,
+			executable,
+			133_700_123_456,
+			"eea15e23-9782-496d-9df6-b6bcbe874e58",
+		);
+
+		assert!(script.contains("Get-Process -Id 47312"));
+		assert!(script.contains("133700123456"));
+		assert!(script.contains(&BASE64_STANDARD.encode(executable.as_bytes())));
+		assert!(!script.contains(executable));
+		assert!(script.contains("MoveViewToDesktop"));
+		assert!(script.contains("GetWindowDesktopId"));
+		assert!(script.contains("OSVersion.Version.Build -lt 26100"));
 	}
 
 	#[cfg(target_os = "linux")]

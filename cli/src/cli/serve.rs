@@ -309,9 +309,9 @@ impl Serve {
 		let project_path = source::resolve(self.source.unwrap_or_default())?;
 		let worktree = sessions::detect_worktree(&project_path)?;
 		Config::load_workspace(project_path.get_parent());
-		let (preferred_port, scan_ports) = {
+		let (preferred_port, scan_ports, studio_desktop) = {
 			let config = Config::new();
-			(config.port, config.scan_ports)
+			(config.port, config.scan_ports, config.studio_desktop.clone())
 		};
 		let inspection = project::inspect(&project_path)?;
 		ensure!(inspection.is_place(), "serve requires a complete place project");
@@ -352,8 +352,9 @@ impl Serve {
 		);
 		crate::carbon_info!("Launching Roblox Studio");
 		let studio_dir = &util::get_reflection_snapshot().studio_dir;
-		let managed_studio =
-			launch_disposable_managed_place(&build_path, || studio::launch_managed(build_path.clone(), studio_dir))?;
+		let managed_studio = launch_disposable_managed_place(&build_path, || {
+			studio::launch_managed(build_path.clone(), studio_dir, &studio_desktop)
+		})?;
 		let studio_process_id = managed_studio.process_id();
 		crate::carbon_info!(
 			"Waiting for Roblox Studio to connect on {} (launch ID: {}, Studio PID {}, lifecycle: {})",
