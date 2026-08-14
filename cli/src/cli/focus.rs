@@ -113,19 +113,68 @@ impl Focus {
 			for warning in plan.warnings {
 				crate::carbon_warn!("{warning}");
 			}
-			let report = studio::arrange_studios_for_focus(&plan.target, &plan.peers)
-				.with_context(|| format!("failed to route Studio desktops for {target}"))?;
-			let parked_processes = plan
-				.peers
+			let mut guarded_peers = Vec::new();
+			let mut guarded_sessions = 0;
+			let mut newly_muted_sessions = 0;
+			for placement in plan.peers {
+				match studio::set_studio_audio_policy(&placement.process, studio::StudioAudioPolicy::Parked) {
+					Ok(audio) => {
+						guarded_sessions += audio.matched_sessions;
+						newly_muted_sessions += audio.changed_sessions;
+						guarded_peers.push(placement);
+					}
+					Err(error) => crate::carbon_warn!(
+						"Did not park sibling Studio PID {} because its parked-audio guard failed: {error:#}",
+						placement.process.process_id
+					),
+				}
+			}
+			let report = match studio::arrange_studios_for_focus(&plan.target, &guarded_peers) {
+				Ok(report) => report,
+				Err(error) => {
+					for placement in &guarded_peers {
+						if let Err(restore_error) =
+							studio::set_studio_audio_policy(&placement.process, studio::StudioAudioPolicy::Audible)
+						{
+							crate::carbon_warn!(
+								"Could not restore Studio PID {} audio after desktop routing failed: {restore_error:#}",
+								placement.process.process_id
+							);
+						}
+					}
+					return Err(error).with_context(|| format!("failed to route Studio desktops for {target}"));
+				}
+			};
+			for placement in &guarded_peers {
+				if !report.parked_process_ids.contains(&placement.process.process_id) {
+					match studio::set_studio_audio_policy(&placement.process, studio::StudioAudioPolicy::Audible) {
+						Ok(_) => {}
+						Err(error) => crate::carbon_warn!(
+							"Could not restore Studio PID {} audio after it failed to park: {error:#}",
+							placement.process.process_id
+						),
+					}
+				}
+			}
+			let parked_processes = guarded_peers
 				.iter()
 				.filter(|placement| report.parked_process_ids.contains(&placement.process.process_id))
 				.map(|placement| placement.process.clone())
 				.collect::<Vec<_>>();
+			let target_audio = studio::set_studio_audio_policy(&plan.target, studio::StudioAudioPolicy::Audible)
+				.with_context(|| format!("failed to restore focused Studio audio for {target}"))?;
 			for warning in report.warnings {
 				crate::carbon_warn!("{warning}");
 			}
+			log::debug!(
+				"Focused Studio audio restored {} session(s) with {} mute change(s); sibling guards matched {} session(s) with {} mute change(s)",
+				target_audio.matched_sessions,
+				target_audio.changed_sessions,
+				guarded_sessions,
+				newly_muted_sessions
+			);
 			crate::carbon_info!(
-				"Moved Roblox Studio PID {studio_pid} to the active Windows desktop, parked {} sibling Studio(s), and cleared attention from {} sibling window(s)",
+				"Moved Roblox Studio PID {studio_pid} to the active Windows desktop, restored its audio, parked {} sibling Studio(s) with audio guarded, and cleared attention from {} sibling window(s)",
 				report.parked,
 				report.attention_windows
 			);

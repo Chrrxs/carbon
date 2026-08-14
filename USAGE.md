@@ -83,6 +83,11 @@ the exact Studio process it started, verifies the resulting desktop, and does
 not switch the active desktop. Placement currently requires Windows 11 24H2 or
 newer (including when Carbon runs through WSL); a missing, duplicate, or
 unsupported desktop fails the launch and cleans up the new Studio process.
+Parking also guards Studio audio by default; there is no separate audio setting.
+Carbon mutes shared-mode render sessions belonging to the exact parked Studio
+process on every active output device and keeps a Windows Core Audio guardian
+alive for streams created later. Focusing that Studio restores only mute states
+that Carbon changed, so a session that was already user-muted stays muted.
 
 `carbon focus` leaves the exact native Studio process launched for the selected
 serve session in the foreground. When `studio_desktop` is configured, focus

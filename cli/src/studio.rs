@@ -25,6 +25,9 @@ const MCP_PROTOCOL_VERSION: u64 = 3;
 const DEFAULT_MCP_URL: &str = "http://127.0.0.1:58741";
 const MCP_URL_ENV: &str = "CARBON_STUDIO_MCP_URL";
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const STUDIO_AUDIO_GUARD_SCRIPT: &str = include_str!("studio_audio_guard.ps1");
+
 #[derive(Clone)]
 struct McpLifecycle {
 	endpoint: String,
@@ -376,6 +379,27 @@ pub(crate) struct StudioProcessIdentity {
 pub(crate) struct StudioDesktopPlacement {
 	pub(crate) process: StudioProcessIdentity,
 	pub(crate) desktop_name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StudioAudioPolicy {
+	Parked,
+	Audible,
+}
+
+impl StudioAudioPolicy {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Parked => "muted",
+			Self::Audible => "audible",
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub(crate) struct StudioAudioPolicyReport {
+	pub(crate) matched_sessions: usize,
+	pub(crate) changed_sessions: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1108,6 +1132,154 @@ fn move_process_to_virtual_desktop(
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn install_studio_audio_guard_script() -> Result<PathBuf> {
+	let digest = blake3::hash(STUDIO_AUDIO_GUARD_SCRIPT.as_bytes()).to_hex().to_string();
+	let directory = util::get_carbon_dir()?.join("windows");
+	fs::create_dir_all(&directory).with_context(|| {
+		format!(
+			"failed to create Carbon Windows helper directory {}",
+			directory.display()
+		)
+	})?;
+	let path = directory.join(format!("studio-audio-guard-{}.ps1", &digest[..16]));
+	if !path.exists() {
+		let temporary = directory.join(format!(".studio-audio-guard-{}.tmp", uuid::Uuid::new_v4().simple()));
+		fs::write(&temporary, STUDIO_AUDIO_GUARD_SCRIPT)
+			.with_context(|| format!("failed to stage Carbon Studio audio guard {}", temporary.display()))?;
+		if let Err(error) = fs::rename(&temporary, &path) {
+			if !path.exists() {
+				let _ = fs::remove_file(&temporary);
+				return Err(error)
+					.with_context(|| format!("failed to install Carbon Studio audio guard {}", path.display()));
+			}
+			let _ = fs::remove_file(&temporary);
+		}
+	}
+	let installed =
+		fs::read(&path).with_context(|| format!("failed to verify Carbon Studio audio guard {}", path.display()))?;
+	ensure!(
+		installed == STUDIO_AUDIO_GUARD_SCRIPT.as_bytes(),
+		"Carbon Studio audio guard at {} does not match this Carbon build",
+		path.display()
+	);
+	Ok(path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn native_studio_audio_guard_path(path: &Path) -> Result<String> {
+	#[cfg(target_os = "linux")]
+	{
+		windows_path(path, "Carbon Studio audio guard")
+	}
+	#[cfg(target_os = "windows")]
+	{
+		Ok(path.to_string_lossy().into_owned())
+	}
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn studio_audio_guard_arguments(
+	script_path: &str,
+	process: &StudioProcessIdentity,
+	mode: &str,
+	policy: StudioAudioPolicy,
+	connect_timeout: Duration,
+) -> Vec<String> {
+	vec![
+		"-Mta".to_owned(),
+		"-NoProfile".to_owned(),
+		"-NonInteractive".to_owned(),
+		"-ExecutionPolicy".to_owned(),
+		"Bypass".to_owned(),
+		"-File".to_owned(),
+		script_path.to_owned(),
+		"-Mode".to_owned(),
+		mode.to_owned(),
+		"-TargetProcessId".to_owned(),
+		process.process_id.to_string(),
+		"-ExecutableBase64".to_owned(),
+		BASE64_STANDARD.encode(process.studio_executable.as_bytes()),
+		"-CreationFileTime".to_owned(),
+		process.creation_filetime.to_string(),
+		"-Policy".to_owned(),
+		policy.as_str().to_owned(),
+		"-ConnectTimeoutMilliseconds".to_owned(),
+		connect_timeout.as_millis().min(i32::MAX as u128).to_string(),
+	]
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn invoke_studio_audio_guard(
+	script_path: &str,
+	process: &StudioProcessIdentity,
+	policy: StudioAudioPolicy,
+	connect_timeout: Duration,
+) -> Result<StudioAudioPolicyReport> {
+	let arguments = studio_audio_guard_arguments(script_path, process, "command", policy, connect_timeout);
+	let output = powershell_command()?
+		.args(arguments)
+		.output()
+		.context("failed to invoke the Carbon Studio audio guard")?;
+	ensure!(
+		output.status.success(),
+		"Carbon Studio audio guard rejected the {} policy for PID {}: {}",
+		policy.as_str(),
+		process.process_id,
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	let stdout = String::from_utf8(output.stdout).context("Carbon Studio audio guard returned non-UTF-8 output")?;
+	serde_json::from_str(stdout.trim()).context("Carbon Studio audio guard returned an invalid policy acknowledgement")
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn spawn_studio_audio_guard(
+	script_path: &str,
+	process: &StudioProcessIdentity,
+	policy: StudioAudioPolicy,
+) -> Result<()> {
+	let arguments = studio_audio_guard_arguments(script_path, process, "spawn", policy, Duration::from_secs(10));
+	let output = powershell_command()?
+		.args(arguments)
+		.output()
+		.context("failed to start the persistent Carbon Studio audio guard")?;
+	ensure!(
+		output.status.success(),
+		"failed to detach the persistent Carbon Studio audio guard for PID {}: {}",
+		process.process_id,
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	Ok(())
+}
+
+pub(crate) fn set_studio_audio_policy(
+	process: &StudioProcessIdentity,
+	policy: StudioAudioPolicy,
+) -> Result<StudioAudioPolicyReport> {
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	{
+		let script = install_studio_audio_guard_script()?;
+		let script = native_studio_audio_guard_path(&script)?;
+		if let Ok(report) = invoke_studio_audio_guard(&script, process, policy, Duration::from_millis(250)) {
+			return Ok(report);
+		}
+		spawn_studio_audio_guard(&script, process, policy)?;
+		invoke_studio_audio_guard(&script, process, policy, Duration::from_secs(10)).with_context(|| {
+			format!(
+				"failed to make Roblox Studio PID {} audio {}",
+				process.process_id,
+				policy.as_str()
+			)
+		})
+	}
+
+	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+	{
+		let _ = (process, policy);
+		anyhow::bail!("parked Studio audio is supported only when Carbon runs on Windows or WSL")
+	}
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn desktop_arrangement_script(
 	target: Option<&StudioProcessIdentity>,
 	placements: &[StudioDesktopPlacement],
@@ -1440,6 +1612,19 @@ pub fn launch(path: Option<PathBuf>, desktop_name: &str) -> Result<Option<u32>> 
 	let studio = get_studio_info()?;
 	let (process_id, studio_executable, creation_filetime) = launch_process(path.as_deref(), &studio)?;
 	if let Some(desktop) = desktop.as_ref() {
+		let process = StudioProcessIdentity {
+			process_id,
+			studio_executable: studio_executable.clone(),
+			creation_filetime,
+		};
+		if let Err(error) = set_studio_audio_policy(&process, StudioAudioPolicy::Parked) {
+			return match terminate_process(process_id, &studio_executable, creation_filetime) {
+				Ok(()) => Err(error.context("Studio parked-audio guard failed; exact-process cleanup completed")),
+				Err(cleanup_error) => Err(error.context(format!(
+					"Studio parked-audio guard failed and exact-process cleanup also failed: {cleanup_error:#}"
+				))),
+			};
+		}
 		if let Err(error) = move_process_to_virtual_desktop(process_id, &studio_executable, creation_filetime, desktop)
 		{
 			return match terminate_process(process_id, &studio_executable, creation_filetime) {
@@ -1461,6 +1646,21 @@ pub fn launch_managed(path: PathBuf, _studio_dir: &Path, desktop_name: &str) -> 
 	let studio_executable = broker_studio_executable(&studio)?;
 	let lifecycle = discover_mcp_lifecycle()?;
 	let launch = lifecycle.launch(&path, &studio_executable)?;
+	if desktop.is_some() {
+		let process = StudioProcessIdentity {
+			process_id: launch.process_id,
+			studio_executable: studio_executable.clone(),
+			creation_filetime: launch.creation_filetime,
+		};
+		if let Err(error) = set_studio_audio_policy(&process, StudioAudioPolicy::Parked) {
+			return match close_managed_launch(&launch, &studio_executable) {
+				Ok(()) => Err(error.context("managed Studio parked-audio guard failed; cleanup completed")),
+				Err(cleanup_error) => Err(error.context(format!(
+					"managed Studio parked-audio guard failed and cleanup also failed: {cleanup_error:#}"
+				))),
+			};
+		}
+	}
 	authorize_managed_launch(&launch)?;
 	if let Some(desktop) = desktop.as_ref() {
 		if let Err(error) =
@@ -2280,6 +2480,50 @@ mod tests {
 		assert_eq!(requested_virtual_desktop_name("  \t"), None);
 		assert_eq!(requested_virtual_desktop_name("  Studios  "), Some("Studios"));
 		assert_eq!(resolve_requested_virtual_desktop("  ").unwrap(), None);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn parked_audio_guard_persists_for_late_sessions_and_owns_only_its_mutes() {
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("IAudioSessionNotification"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("RegisterSessionNotification"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetCount"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("EnumAudioEndpoints"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetProcessId"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetMute"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("SetMute"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbonOwnedMutes"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("eventContext"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (!isMuted)"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (!carbonOwnedMutes.Contains(session.Key))"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Start-Process @start"));
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn parked_audio_guard_runs_in_mta_with_an_encoded_exact_process_identity() {
+		let executable = r"C:\Roblox\RobloxStudioBeta.exe";
+		let process = StudioProcessIdentity {
+			process_id: 47_312,
+			studio_executable: executable.to_owned(),
+			creation_filetime: 133_700_123_456,
+		};
+		let arguments = studio_audio_guard_arguments(
+			r"C:\Carbon\studio-audio-guard.ps1",
+			&process,
+			"spawn",
+			StudioAudioPolicy::Parked,
+			Duration::from_secs(10),
+		);
+		let joined = arguments.join(" ");
+
+		assert_eq!(arguments.first().map(String::as_str), Some("-Mta"));
+		assert!(joined.contains("-Mode spawn"));
+		assert!(joined.contains("-TargetProcessId 47312"));
+		assert!(joined.contains("-CreationFileTime 133700123456"));
+		assert!(joined.contains("-Policy muted"));
+		assert!(joined.contains(&BASE64_STANDARD.encode(executable.as_bytes())));
+		assert!(!joined.contains(executable));
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
