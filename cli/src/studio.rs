@@ -904,6 +904,8 @@ class VirtualDesktopManager {}
 
 public static class CarbonVirtualDesktopInterop
 {
+	const int TypeElementNotFound = unchecked((int)0x8002802B);
+
 	[StructLayout(LayoutKind.Sequential)]
 	struct FlashInfo
 	{
@@ -936,6 +938,38 @@ public static class CarbonVirtualDesktopInterop
         var viewsInterface = typeof(IApplicationViewCollection).GUID;
         manager = (IVirtualDesktopManagerInternal)shell.QueryService(ref managerService, ref managerInterface);
         views = (IApplicationViewCollection)shell.QueryService(ref viewsInterface, ref viewsInterface);
+    }
+
+    public static bool TryMoveWindow(IntPtr hwnd, Guid desktopId)
+    {
+        IVirtualDesktopManagerInternal manager;
+        IApplicationViewCollection views;
+        GetServices(out manager, out views);
+
+        var desktop = manager.FindDesktop(ref desktopId);
+        if (desktop == null) throw new InvalidOperationException("Windows virtual desktop no longer exists");
+
+        IApplicationView view;
+        var result = views.GetViewForHwnd(hwnd, out view);
+        if (result == TypeElementNotFound) return false;
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+
+        try
+        {
+            manager.MoveViewToDesktop(view, desktop);
+        }
+        catch (COMException error)
+        {
+            if (error.HResult == TypeElementNotFound) return false;
+            throw;
+        }
+
+        var publicManager = (IVirtualDesktopManager)new VirtualDesktopManager();
+        Guid actualDesktopId;
+        result = publicManager.GetWindowDesktopId(hwnd, out actualDesktopId);
+        if (result == TypeElementNotFound) return false;
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+        return actualDesktopId == desktopId;
     }
 
     public static void MoveWindow(IntPtr hwnd, Guid desktopId)
@@ -1024,21 +1058,21 @@ $ErrorActionPreference = 'Stop'
 $desktopIdText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_id}'))
 $desktopId = [Guid]::ParseExact($desktopIdText, 'D')
 if ([Environment]::OSVersion.Version.Build -lt 26100) {{ throw 'studio_desktop requires Windows 11 24H2 or newer' }}
-$window = [IntPtr]::Zero
+Add-Type -TypeDefinition @'
+{interop}
+'@
+$moved = $false
 for ($attempt = 0; $attempt -lt 300; $attempt++) {{
     if ($process.HasExited) {{ throw 'Roblox Studio exited before its window could be moved' }}
     $process.Refresh()
     $window = $process.MainWindowHandle
-    if ($window -ne [IntPtr]::Zero) {{ break }}
+    if ($window -ne [IntPtr]::Zero -and [CarbonVirtualDesktopInterop]::TryMoveWindow($window, $desktopId)) {{
+        $moved = $true
+        break
+    }}
     Start-Sleep -Milliseconds 100
 }}
-if ($window -eq [IntPtr]::Zero) {{ throw 'Roblox Studio main window was not found within 30 seconds' }}
-Add-Type -TypeDefinition @'
-{interop}
-'@
-[CarbonVirtualDesktopInterop]::MoveWindow($window, $desktopId)
-$actualDesktopId = [CarbonVirtualDesktopInterop]::GetWindowDesktopId($window)
-if ($actualDesktopId -ne $desktopId) {{ throw 'Windows did not move Roblox Studio to the requested virtual desktop' }}
+if (-not $moved) {{ throw 'Roblox Studio application view was not ready within 30 seconds' }}
 "#,
 		interop = WINDOWS_VIRTUAL_DESKTOP_INTEROP,
 	)
@@ -2280,6 +2314,23 @@ mod tests {
 		assert!(script.contains("MoveViewToDesktop"));
 		assert!(script.contains("GetWindowDesktopId"));
 		assert!(script.contains("OSVersion.Version.Build -lt 26100"));
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn virtual_desktop_launch_waits_for_a_registered_application_view() {
+		let script = virtual_desktop_move_script(
+			47_312,
+			r"C:\Roblox\RobloxStudioBeta.exe",
+			133_700_123_456,
+			"eea15e23-9782-496d-9df6-b6bcbe874e58",
+		);
+
+		assert!(script.contains("TryMoveWindow($window, $desktopId)"));
+		assert!(script.contains("$process.Refresh()"));
+		assert!(script.contains("$window = $process.MainWindowHandle"));
+		assert!(script.contains("Start-Sleep -Milliseconds 100"));
+		assert!(script.contains("application view was not ready within 30 seconds"));
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
