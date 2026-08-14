@@ -4,26 +4,13 @@ use std::path::PathBuf;
 
 use crate::{sessions, studio};
 
+use super::studio_session;
+
 #[derive(Debug, PartialEq, Eq)]
 struct DesktopRoutingPlan {
 	target: studio::StudioProcessIdentity,
 	peers: Vec<studio::StudioDesktopPlacement>,
 	warnings: Vec<String>,
-}
-
-fn studio_process_identity(session: &sessions::Session, description: &str) -> Result<studio::StudioProcessIdentity> {
-	Ok(studio::StudioProcessIdentity {
-		process_id: session
-			.studio_pid
-			.with_context(|| format!("{description} does not record a managed Studio PID"))?,
-		studio_executable: session
-			.studio_executable
-			.clone()
-			.with_context(|| format!("{description} does not record the Studio executable identity"))?,
-		creation_filetime: session
-			.creation_filetime
-			.with_context(|| format!("{description} does not record the Studio process creation time"))?,
-	})
 }
 
 fn session_description(session: &sessions::Session) -> String {
@@ -48,7 +35,7 @@ fn desktop_routing_plan(
 	{
 		return Ok(None);
 	}
-	let target_identity = studio_process_identity(target, "the focused Carbon serve session")?;
+	let target_identity = studio_session::process_identity(target, "the focused Carbon serve session")?;
 	let mut placements = Vec::new();
 	let mut warnings = Vec::new();
 	for peer in peers {
@@ -58,7 +45,7 @@ fn desktop_routing_plan(
 			.as_deref()
 			.and_then(studio::requested_virtual_desktop_name)
 			.map(str::to_owned);
-		let identity = studio_process_identity(&peer, &description);
+		let identity = studio_session::process_identity(&peer, &description);
 		match (identity, desktop_name) {
 			(Ok(process), Some(desktop_name)) => placements.push(studio::StudioDesktopPlacement {
 				process,
@@ -106,28 +93,7 @@ pub struct Focus {
 impl Focus {
 	pub fn main(self) -> Result<()> {
 		let restore = self.restore;
-		let (session, target) = match (self.instance_id, self.port, self.worktree) {
-			(Some(instance_id), None, None) => {
-				let session = sessions::get(Some(instance_id.clone()), None, None)?
-					.with_context(|| format!("no running Carbon serve instance has ID {instance_id}"))?;
-				(session, format!("instance ID {instance_id}"))
-			}
-			(None, Some(port), None) => {
-				let session = sessions::get(None, None, Some(port))?
-					.with_context(|| format!("no running Carbon serve instance uses port {port}"))?;
-				(session, format!("port {port}"))
-			}
-			(None, None, Some(worktree)) => {
-				let session = sessions::get_by_worktree(&worktree)?.with_context(|| {
-					format!(
-						"no running Carbon serve instance is registered for worktree {}",
-						worktree.display()
-					)
-				})?;
-				(session, format!("worktree {}", worktree.display()))
-			}
-			_ => unreachable!("clap requires exactly one focus target"),
-		};
+		let (session, target) = studio_session::resolve(self.instance_id, self.port, self.worktree)?;
 
 		let studio_pid = session.studio_pid.with_context(|| {
 			format!(
@@ -135,7 +101,7 @@ impl Focus {
 			)
 		})?;
 		let _focus_lock = studio::acquire_focus_lock()?;
-		if session
+		let parked_processes = if session
 			.studio_desktop
 			.as_deref()
 			.and_then(studio::requested_virtual_desktop_name)
@@ -149,14 +115,24 @@ impl Focus {
 			}
 			let report = studio::arrange_studios_for_focus(&plan.target, &plan.peers)
 				.with_context(|| format!("failed to route Studio desktops for {target}"))?;
+			let parked_processes = plan
+				.peers
+				.iter()
+				.filter(|placement| report.parked_process_ids.contains(&placement.process.process_id))
+				.map(|placement| placement.process.clone())
+				.collect::<Vec<_>>();
 			for warning in report.warnings {
 				crate::carbon_warn!("{warning}");
 			}
 			crate::carbon_info!(
-				"Moved Roblox Studio PID {studio_pid} to the active Windows desktop and parked {} sibling Studio(s)",
-				report.parked
+				"Moved Roblox Studio PID {studio_pid} to the active Windows desktop, parked {} sibling Studio(s), and cleared attention from {} sibling window(s)",
+				report.parked,
+				report.attention_windows
 			);
-		}
+			Some(parked_processes)
+		} else {
+			None
+		};
 		studio::focus_process(
 			studio_pid,
 			session.creation_filetime,
@@ -164,6 +140,22 @@ impl Focus {
 			restore,
 		)
 		.with_context(|| format!("failed to focus the Studio process registered for {target}"))?;
+		if let Some(parked_processes) = parked_processes {
+			match studio::suppress_studio_attention(&parked_processes) {
+				Ok(report) => {
+					for warning in report.warnings {
+						crate::carbon_warn!("{warning}");
+					}
+					crate::carbon_info!(
+						"Cleared post-focus attention from {} parked sibling window(s)",
+						report.attention_windows
+					);
+				}
+				Err(error) => {
+					crate::carbon_warn!("Could not clear post-focus attention from parked sibling Studios: {error:#}")
+				}
+			}
+		}
 		if restore {
 			crate::carbon_info!(
 				"Activated Roblox Studio PID {studio_pid} for {target} and restored the previous window"

@@ -16,11 +16,13 @@ mod focus;
 mod init;
 mod merge_artifact;
 mod migrate;
+mod park;
 mod resolve;
 mod serve;
 mod sourcemap;
 mod stop;
 mod studio;
+mod studio_session;
 
 macro_rules! about {
 	() => {
@@ -161,6 +163,7 @@ impl Cli {
 				command.main()
 			}
 			Commands::Focus(command) => command.main(),
+			Commands::Park(command) => command.main(),
 			Commands::Sourcemap(command) => {
 				util::init_reflection()?;
 				command.main()
@@ -184,6 +187,7 @@ pub enum Commands {
 	Studio(studio::Studio),
 	Diff(diff::Diff),
 	Focus(focus::Focus),
+	Park(park::Park),
 	Sourcemap(sourcemap::Sourcemap),
 	Config(config::Config),
 }
@@ -260,5 +264,17 @@ mod tests {
 			"/tmp/carbon-worktree",
 		])
 		.is_err());
+	}
+
+	#[test]
+	fn park_command_requires_one_supported_target() {
+		assert!(Cli::try_parse_from(["carbon", "park", "anon:studio-a"]).is_ok());
+		assert!(Cli::try_parse_from(["carbon", "park", "--port", "8123"]).is_ok());
+		assert!(Cli::try_parse_from(["carbon", "park", "--worktree", "/tmp/carbon-worktree"]).is_ok());
+		assert!(Cli::try_parse_from(["carbon", "park"]).is_err());
+		assert!(Cli::try_parse_from(["carbon", "park", "anon:studio-a", "--port", "8123"]).is_err());
+		assert!(
+			Cli::try_parse_from(["carbon", "park", "--port", "8123", "--worktree", "/tmp/carbon-worktree",]).is_err()
+		);
 	}
 }

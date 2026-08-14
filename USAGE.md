@@ -46,6 +46,12 @@ carbon focus 'anon:550e8400-e29b-41d4-a716-446655440000'
 carbon focus --port 8000
 carbon focus --worktree . --restore
 
+# Move one managed Studio back to its configured parking desktop without
+# focusing another Studio.
+carbon park --worktree .
+carbon park 'anon:550e8400-e29b-41d4-a716-446655440000'
+carbon park --port 8000
+
 # Import a manually saved binary place directly into a project.
 carbon capture game.carbon.json manually-saved.rbxl
 
@@ -88,6 +94,16 @@ need a configured name. Routing is serialized so concurrent focus commands do
 not interleave. Moving the selected Studio is strict, while a stale sibling is
 reported as a warning and does not block focus.
 
+`carbon park` moves only the selected exact managed Studio back to the
+`studio_desktop` recorded when its serve session started. It does not activate
+Studio, switch desktops, or park repository siblings. This is useful after
+working in one Studio when no other Studio needs to be focused. Both explicit
+and automatic parking clear taskbar attention from every top-level window
+owned by the verified Studio process, including an off-desktop modal; Carbon
+never dismisses or answers that dialog. `carbon focus` repeats the parked
+sibling attention pass after activating the selected Studio because Windows
+can relatch a shared taskbar group during activation.
+
 If Studio owns an active modal dialog, Carbon focuses that dialog instead of the
 disabled main window. Pass `--restore` to verify Studio activation and then
 return to the previously foreground window. A worktree target may be the
@@ -97,6 +113,14 @@ left untouched. If more than one session is registered for the same worktree,
 select it by instance ID or port instead. Serve sessions started by an older
 Carbon version must be restarted once so their exact process, repository, and
 launch-time parking desktop are registered.
+
+After Carbon successfully validates an exact-session Studio auto-recovery and
+commits it atomically, it atomically moves that consumed `.rbxl` into the
+`.carbon-consumed` directory beside Roblox's AutoSaves. This keeps consumed
+Carbon recoveries out of Studio's recovery scan while preserving the original
+bytes. Carbon does not archive manual saves, rejected recoveries, unknown
+files, or evidence from a failed capture; an archive failure leaves the source
+in place and emits a warning.
 
 Managed `serve` requires a loopback `robloxstudio-mcp` that advertises lifecycle
 protocol v3 with exact process identity. The default MCP URL is

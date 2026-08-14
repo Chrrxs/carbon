@@ -1495,10 +1495,10 @@ impl Core {
 		)?;
 		let recovered_tree = recovered.tree;
 		let captured_studio_change_generation = recovered.studio_change_generation;
-		let capture_kind = capture_kind.label();
+		let capture_label = capture_kind.label();
 		self.update_manifest_capture_message(
 			request_id,
-			&format!("{capture_kind} arrived; validating {}", capture_path.display()),
+			&format!("{capture_label} arrived; validating {}", capture_path.display()),
 		)?;
 
 		self.update_manifest_capture_message(request_id, "Waiting for project source to settle")?;
@@ -1562,6 +1562,24 @@ impl Core {
 			.install_projected_state(projected_source_ids, generation.clone())?;
 		*self.last_successful_capture_generation.lock().unwrap() = Some(generation.clone());
 		self.studio_change_state.lock().unwrap().last_captured_generation = captured_studio_change_generation;
+		let archive_notice = match crate::recovery::quarantine_consumed_recovery(capture_kind, &capture_path) {
+			Ok(Some(archived)) => {
+				crate::carbon_info!(
+					"Archived consumed Studio auto-recovery {} at {}",
+					capture_path.display(),
+					archived.display()
+				);
+				format!("; archived consumed recovery at {}", archived.display())
+			}
+			Ok(None) => String::new(),
+			Err(error) => {
+				crate::carbon_warn!(
+					"The manifest was committed, but consumed Studio recovery {} could not be archived and remains in place: {error:#}",
+					capture_path.display()
+				);
+				"; consumed recovery archive failed and the original was retained".to_owned()
+			}
+		};
 		{
 			let mut operation = self.manifest_capture.lock().unwrap();
 			let operation = operation
@@ -1571,8 +1589,8 @@ impl Core {
 			operation.source_generation = generation;
 			operation.state = "complete".to_owned();
 			operation.message = Some(format!(
-				"{capture_kind} {} was captured and committed atomically",
-				capture_path.display()
+				"{capture_label} {} was captured and committed atomically{archive_notice}",
+				capture_path.display(),
 			));
 		}
 		if let Some(transition_id) = managed_reload_transition_id {

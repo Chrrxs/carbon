@@ -14,6 +14,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STABLE_POLLS: usize = 2;
 const MODIFIED_TIME_SLOP: Duration = Duration::from_secs(2);
 const AUTOSAVES_OVERRIDE: &str = "CARBON_STUDIO_AUTOSAVES_DIR";
+const CONSUMED_RECOVERY_DIRECTORY: &str = ".carbon-consumed";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryFingerprint {
@@ -134,6 +135,58 @@ pub(crate) fn is_recovery_place(path: &Path) -> bool {
 		path.extension().and_then(|extension| extension.to_str()),
 		Some(extension) if extension.eq_ignore_ascii_case("rbxl")
 	)
+}
+
+/// Move exact-session Studio recovery evidence out of Roblox's scan directory
+/// only after the caller has committed it successfully. The archive remains on
+/// the same volume so the move is atomic; any failure leaves the source intact.
+pub(crate) fn quarantine_consumed_recovery(kind: RecoveryKind, path: &Path) -> Result<Option<PathBuf>> {
+	if kind != RecoveryKind::StudioAutoRecovery {
+		return Ok(None);
+	}
+	ensure!(
+		is_recovery_place(path),
+		"consumed Studio recovery is not an .rbxl place: {}",
+		path.display()
+	);
+	let metadata = fs::symlink_metadata(path)
+		.with_context(|| format!("failed to inspect consumed Studio recovery {}", path.display()))?;
+	ensure!(
+		metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+		"consumed Studio recovery is not a regular file: {}",
+		path.display()
+	);
+	let parent = path
+		.parent()
+		.with_context(|| format!("consumed Studio recovery has no parent: {}", path.display()))?;
+	let file_name = path
+		.file_name()
+		.with_context(|| format!("consumed Studio recovery has no file name: {}", path.display()))?;
+	let archive = parent.join(CONSUMED_RECOVERY_DIRECTORY);
+	fs::create_dir_all(&archive).with_context(|| {
+		format!(
+			"failed to create consumed Studio recovery archive {}",
+			archive.display()
+		)
+	})?;
+	let mut archived_name = std::ffi::OsString::from(uuid::Uuid::new_v4().simple().to_string());
+	archived_name.push("-");
+	archived_name.push(file_name);
+	archived_name.push(".consumed");
+	let destination = archive.join(archived_name);
+	ensure!(
+		!destination.exists(),
+		"consumed Studio recovery archive destination already exists: {}",
+		destination.display()
+	);
+	fs::rename(path, &destination).with_context(|| {
+		format!(
+			"failed to atomically archive consumed Studio recovery {} at {}",
+			path.display(),
+			destination.display()
+		)
+	})?;
+	Ok(Some(destination))
 }
 
 pub(crate) fn autosaves_dir() -> Result<PathBuf> {
@@ -451,6 +504,46 @@ mod tests {
 		assert_eq!(kind, RecoveryKind::ServedPlace);
 		assert_eq!(path, served);
 		assert_eq!(value, b"manually saved place");
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn committed_studio_recovery_is_atomically_moved_out_of_the_scan_directory() {
+		let directory = std::env::temp_dir().join(format!("carbon-consumed-recovery-{}", uuid::Uuid::new_v4()));
+		fs::create_dir_all(&directory).unwrap();
+		let source = directory.join("Carbon AutoSave.rbxl");
+		fs::write(&source, b"committed exact-session recovery").unwrap();
+
+		let archived = quarantine_consumed_recovery(RecoveryKind::StudioAutoRecovery, &source)
+			.unwrap()
+			.unwrap();
+
+		assert!(!source.exists());
+		assert_eq!(
+			archived.parent(),
+			Some(directory.join(CONSUMED_RECOVERY_DIRECTORY).as_path())
+		);
+		assert_eq!(fs::read(&archived).unwrap(), b"committed exact-session recovery");
+		assert_eq!(
+			archived.extension().and_then(|extension| extension.to_str()),
+			Some("consumed")
+		);
+		assert!(inventory(&directory).unwrap().is_empty());
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn temporary_served_place_is_never_quarantined() {
+		let directory = std::env::temp_dir().join(format!("carbon-served-recovery-{}", uuid::Uuid::new_v4()));
+		fs::create_dir_all(&directory).unwrap();
+		let source = directory.join("served.rbxl");
+		fs::write(&source, b"manual save").unwrap();
+
+		assert_eq!(
+			quarantine_consumed_recovery(RecoveryKind::ServedPlace, &source).unwrap(),
+			None
+		);
+		assert_eq!(fs::read(&source).unwrap(), b"manual save");
 		fs::remove_dir_all(directory).unwrap();
 	}
 }
