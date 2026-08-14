@@ -16,6 +16,147 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Studio is still CREATE_SUSPENDED when launch installs this guard. .NET's
+# Process.Path/MainModule cannot inspect that state, but these kernel APIs can.
+$processIdentitySource = @'
+namespace CarbonStudioAudioGuard
+{
+    public static class ProcessIdentity
+    {
+        private const uint ProcessQueryLimitedInformation = 0x00001000;
+        private const uint StillActive = 259;
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct FileTime
+        {
+            internal uint Low;
+            internal uint High;
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern System.IntPtr OpenProcess(
+            uint desiredAccess,
+            bool inheritHandle,
+            uint processId);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(
+            System.IntPtr process,
+            out uint exitCode);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(
+            System.IntPtr process,
+            out FileTime creation,
+            out FileTime exit,
+            out FileTime kernel,
+            out FileTime user);
+
+        [System.Runtime.InteropServices.DllImport(
+            "kernel32.dll",
+            CharSet = System.Runtime.InteropServices.CharSet.Unicode,
+            SetLastError = true)]
+        private static extern bool QueryFullProcessImageNameW(
+            System.IntPtr process,
+            uint flags,
+            System.Text.StringBuilder executableName,
+            ref uint size);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(System.IntPtr handle);
+
+        private static string NativeError(string operation)
+        {
+            int code = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+            return operation + " failed: " +
+                new System.ComponentModel.Win32Exception(code).Message +
+                " (" + code.ToString() + ")";
+        }
+
+        private static string NormalizePath(string path)
+        {
+            if (path.StartsWith(@"\\?\UNC\", System.StringComparison.OrdinalIgnoreCase))
+            {
+                path = @"\\" + path.Substring(8);
+            }
+            else if (path.StartsWith(@"\\?\", System.StringComparison.OrdinalIgnoreCase))
+            {
+                path = path.Substring(4);
+            }
+            return path.TrimEnd('\\');
+        }
+
+        public static string Validate(uint processId, string expectedExecutable, long creationFileTime)
+        {
+            System.IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+            if (process == System.IntPtr.Zero)
+            {
+                return "Roblox Studio process " + processId.ToString() + " is no longer running";
+            }
+            try
+            {
+                uint exitCode;
+                if (!GetExitCodeProcess(process, out exitCode))
+                {
+                    return "Roblox Studio process " + processId.ToString() + " " +
+                        NativeError("running-state inspection");
+                }
+                if (exitCode != StillActive)
+                {
+                    return "Roblox Studio process " + processId.ToString() + " is no longer running";
+                }
+
+                FileTime creation;
+                FileTime exit;
+                FileTime kernel;
+                FileTime user;
+                if (!GetProcessTimes(process, out creation, out exit, out kernel, out user))
+                {
+                    return "Roblox Studio process " + processId.ToString() + " " +
+                        NativeError("creation-time inspection");
+                }
+                long actualCreation = unchecked((long)(((ulong)creation.High << 32) | creation.Low));
+                if (actualCreation != creationFileTime)
+                {
+                    return "Roblox Studio process " + processId.ToString() + " creation time no longer matches";
+                }
+
+                var executable = new System.Text.StringBuilder(32768);
+                uint executableLength = (uint)executable.Capacity;
+                if (!QueryFullProcessImageNameW(process, 0, executable, ref executableLength))
+                {
+                    return "Roblox Studio process " + processId.ToString() + " " +
+                        NativeError("path inspection");
+                }
+                if (!string.Equals(
+                    NormalizePath(executable.ToString()),
+                    NormalizePath(expectedExecutable),
+                    System.StringComparison.OrdinalIgnoreCase))
+                {
+                    return "Roblox Studio process " + processId.ToString() + " path no longer matches";
+                }
+                return null;
+            }
+            finally
+            {
+                CloseHandle(process);
+            }
+        }
+
+        public static bool IsExact(uint processId, string expectedExecutable, long creationFileTime)
+        {
+            return Validate(processId, expectedExecutable, creationFileTime) == null;
+        }
+    }
+}
+'@
+
+function Add-ProcessIdentityInterop {
+    if ($null -eq ('CarbonStudioAudioGuard.ProcessIdentity' -as [type])) {
+        Add-Type -TypeDefinition $processIdentitySource -Language CSharp
+    }
+}
+
 function Get-ExpectedExecutable {
     if ([string]::IsNullOrEmpty($ExecutableBase64)) {
         throw 'Carbon Studio audio guard requires an executable identity'
@@ -24,16 +165,13 @@ function Get-ExpectedExecutable {
 }
 
 function Assert-ExactProcess([string]$ExpectedExecutable) {
-    $process = Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue
-    if ($null -eq $process) {
-        throw "Roblox Studio process $TargetProcessId is no longer running"
-    }
-    $process.Refresh()
-    if (-not [string]::Equals($process.Path, $ExpectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Roblox Studio process $TargetProcessId path no longer matches"
-    }
-    if ($process.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $CreationFileTime) {
-        throw "Roblox Studio process $TargetProcessId creation time no longer matches"
+    Add-ProcessIdentityInterop
+    $validationError = [CarbonStudioAudioGuard.ProcessIdentity]::Validate(
+        $TargetProcessId,
+        $ExpectedExecutable,
+        $CreationFileTime)
+    if (-not [string]::IsNullOrEmpty($validationError)) {
+        throw $validationError
     }
 }
 
@@ -112,7 +250,6 @@ if ($Mode -eq 'spawn') {
 $source = @'
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
@@ -861,22 +998,7 @@ namespace CarbonStudioAudioGuard
     {
         private static bool IsExactProcess(uint processId, string expectedExecutable, long creationFileTime)
         {
-            try
-            {
-                using (Process process = Process.GetProcessById((int)processId))
-                {
-                    return string.Equals(
-                            process.MainModule.FileName,
-                            expectedExecutable,
-                            StringComparison.OrdinalIgnoreCase) &&
-                        process.StartTime.ToUniversalTime().ToFileTimeUtc() == creationFileTime &&
-                        !process.HasExited;
-                }
-            }
-            catch
-            {
-                return false;
-            }
+            return ProcessIdentity.IsExact(processId, expectedExecutable, creationFileTime);
         }
 
         public static void Run(uint processId, string expectedExecutable, long creationFileTime,
@@ -958,7 +1080,7 @@ namespace CarbonStudioAudioGuard
 }
 '@
 
-Add-Type -TypeDefinition $source -Language CSharp
+Add-Type -TypeDefinition ($source + [Environment]::NewLine + $processIdentitySource) -Language CSharp
 if ($Mode -eq 'compile') {
     Write-Output 'ok'
     exit 0

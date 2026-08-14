@@ -2528,6 +2528,54 @@ mod tests {
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
+	fn parked_audio_guard_accepts_an_exact_suspended_process_identity() {
+		#[cfg(target_os = "linux")]
+		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
+			return;
+		}
+
+		let temporary = tempfile::tempdir().unwrap();
+		let guard_script = temporary.path().join("studio-audio-guard.ps1");
+		let harness_script = temporary.path().join("studio-audio-guard-suspended.ps1");
+		fs::write(&guard_script, STUDIO_AUDIO_GUARD_SCRIPT).unwrap();
+		fs::write(
+			&harness_script,
+			include_str!("../tests/fixtures/studio_audio_guard_suspended.ps1"),
+		)
+		.unwrap();
+
+		let guard_script = native_studio_audio_guard_path(&guard_script).unwrap();
+		let harness_script = native_studio_audio_guard_path(&harness_script).unwrap();
+		let output = powershell_command()
+			.unwrap()
+			.args([
+				"-Mta",
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				&harness_script,
+				"-GuardScript",
+				&guard_script,
+			])
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"suspended-process guard failed\nstdout:\n{}\nstderr:\n{}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr),
+		);
+
+		let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+		assert_eq!(report["policy"], "muted");
+		assert_eq!(report["matched_sessions"], 0);
+		assert_eq!(report["changed_sessions"], 0);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
 	fn virtual_desktop_lookup_uses_named_windows_desktops_without_command_injection() {
 		let name = "Studios'); Stop-Process -Name RobloxStudioBeta; ('";
 		let script = virtual_desktop_lookup_script(name);
