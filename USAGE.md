@@ -88,6 +88,9 @@ Carbon mutes shared-mode render sessions belonging to the exact parked Studio
 process on every active output device and keeps a Windows Core Audio guardian
 alive for streams created later. Focusing that Studio restores only mute states
 that Carbon changed, so a session that was already user-muted stays muted.
+Carbon carries that ownership through Windows' persisted replacement audio
+sessions, including a replacement Studio process at the same executable path,
+and verifies that no Carbon-owned mute remains before focus reports success.
 
 `carbon focus` leaves the exact native Studio process launched for the selected
 serve session in the foreground. When `studio_desktop` is configured, focus

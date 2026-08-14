@@ -400,6 +400,8 @@ impl StudioAudioPolicy {
 pub(crate) struct StudioAudioPolicyReport {
 	pub(crate) matched_sessions: usize,
 	pub(crate) changed_sessions: usize,
+	pub(crate) remaining_owned_mutes: usize,
+	pub(crate) failed_sessions: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1260,16 +1262,18 @@ pub(crate) fn set_studio_audio_policy(
 		let script = install_studio_audio_guard_script()?;
 		let script = native_studio_audio_guard_path(&script)?;
 		if let Ok(report) = invoke_studio_audio_guard(&script, process, policy, Duration::from_millis(250)) {
-			return Ok(report);
+			return verify_studio_audio_policy_report(process, policy, report);
 		}
 		spawn_studio_audio_guard(&script, process, policy)?;
-		invoke_studio_audio_guard(&script, process, policy, Duration::from_secs(10)).with_context(|| {
-			format!(
-				"failed to make Roblox Studio PID {} audio {}",
-				process.process_id,
-				policy.as_str()
-			)
-		})
+		let report =
+			invoke_studio_audio_guard(&script, process, policy, Duration::from_secs(10)).with_context(|| {
+				format!(
+					"failed to make Roblox Studio PID {} audio {}",
+					process.process_id,
+					policy.as_str()
+				)
+			})?;
+		verify_studio_audio_policy_report(process, policy, report)
 	}
 
 	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1277,6 +1281,29 @@ pub(crate) fn set_studio_audio_policy(
 		let _ = (process, policy);
 		anyhow::bail!("parked Studio audio is supported only when Carbon runs on Windows or WSL")
 	}
+}
+
+fn verify_studio_audio_policy_report(
+	process: &StudioProcessIdentity,
+	policy: StudioAudioPolicy,
+	report: StudioAudioPolicyReport,
+) -> Result<StudioAudioPolicyReport> {
+	ensure!(
+		report.failed_sessions == 0,
+		"Carbon Studio audio guard could not apply the {} policy to {} session(s) for PID {}",
+		policy.as_str(),
+		report.failed_sessions,
+		process.process_id
+	);
+	if policy == StudioAudioPolicy::Audible {
+		ensure!(
+			report.remaining_owned_mutes == 0,
+			"Carbon Studio audio guard left {} Carbon-owned session(s) muted for PID {}",
+			report.remaining_owned_mutes,
+			process.process_id
+		);
+	}
+	Ok(report)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2490,12 +2517,16 @@ mod tests {
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetCount"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("EnumAudioEndpoints"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetProcessId"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetSessionIdentifier"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetMute"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("SetMute"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbonOwnedMutes"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("eventContext"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (!isMuted)"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (!carbonOwnedMutes.Contains(session.Key))"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (!carbonOwnedMutes.Contains(session.OwnershipKey))"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("remaining_owned_mutes"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbon-studio-audio-v2-"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Set-LegacyGuardAudible"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Start-Process @start"));
 	}
 
@@ -2524,6 +2555,28 @@ mod tests {
 		assert!(joined.contains("-Policy muted"));
 		assert!(joined.contains(&BASE64_STANDARD.encode(executable.as_bytes())));
 		assert!(!joined.contains(executable));
+	}
+
+	#[test]
+	fn audible_audio_policy_rejects_unrestored_carbon_mutes() {
+		let process = StudioProcessIdentity {
+			process_id: 47_312,
+			studio_executable: r"C:\Roblox\RobloxStudioBeta.exe".to_owned(),
+			creation_filetime: 133_700_123_456,
+		};
+		let error = verify_studio_audio_policy_report(
+			&process,
+			StudioAudioPolicy::Audible,
+			StudioAudioPolicyReport {
+				matched_sessions: 1,
+				changed_sessions: 0,
+				remaining_owned_mutes: 1,
+				failed_sessions: 0,
+			},
+		)
+		.unwrap_err();
+
+		assert!(format!("{error:#}").contains("left 1 Carbon-owned session(s) muted for PID 47312"));
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2572,6 +2625,59 @@ mod tests {
 		assert_eq!(report["policy"], "muted");
 		assert_eq!(report["matched_sessions"], 0);
 		assert_eq!(report["changed_sessions"], 0);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn parked_audio_guard_restores_a_replacement_session_that_inherits_its_mute() {
+		#[cfg(target_os = "linux")]
+		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
+			return;
+		}
+
+		let temporary = tempfile::tempdir().unwrap();
+		let guard_script = temporary.path().join("studio-audio-guard.ps1");
+		let harness_script = temporary.path().join("studio-audio-guard-replacement.ps1");
+		fs::write(&guard_script, STUDIO_AUDIO_GUARD_SCRIPT).unwrap();
+		fs::write(
+			&harness_script,
+			include_str!("../tests/fixtures/studio_audio_guard_replacement.ps1"),
+		)
+		.unwrap();
+
+		let guard_script = native_studio_audio_guard_path(&guard_script).unwrap();
+		let harness_script = native_studio_audio_guard_path(&harness_script).unwrap();
+		let output = powershell_command()
+			.unwrap()
+			.args([
+				"-Mta",
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				&harness_script,
+				"-GuardScript",
+				&guard_script,
+			])
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"replacement-session guard failed\nstdout:\n{}\nstderr:\n{}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr),
+		);
+
+		let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+		assert_eq!(report["policy"], "audible");
+		assert_eq!(report["stable_session_preserved"], true);
+		assert_eq!(report["instance_replaced"], true);
+		assert_eq!(report["process_replaced"], true);
+		assert_eq!(report["muted_after_restore"], false);
+		assert_eq!(report["remaining_owned_mutes"], 0);
+		assert_eq!(report["failed_sessions"], 0);
+		assert_eq!(report["user_mute_preserved"], true);
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
