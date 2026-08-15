@@ -504,6 +504,32 @@ try {
         'Carbon to mute the first fixture audio session'
 
     Stop-AudioGuard $fixture.Id
+    $ledger = Join-Path $env:LOCALAPPDATA "Carbon\audio-guards\$firstProcessId-$firstCreationFileTime.owned"
+    $changedSessionId = @($firstMuted)[0].SessionId + '-replacement'
+    $changedOwnershipKey = @($firstMuted)[0].EndpointId + "`n" + $changedSessionId
+    $changedOwnershipLine = 'v2:' + [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($changedOwnershipKey)
+    )
+    [IO.File]::WriteAllText($ledger, $changedOwnershipLine + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+
+    Invoke-Guard 'spawn' 'audible'
+    $identityChangedAudible = Invoke-Guard 'command' 'audible'
+    $identityChangedAudibleJson = $identityChangedAudible | ConvertTo-Json -Compress
+    $identityChangedRestored = Invoke-WithDeadline `
+        { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
+        { param($sessions) @($sessions).Count -eq 1 -and -not @($sessions)[0].Muted } `
+        "Carbon to restore audio whose owned session identity changed after acknowledging $identityChangedAudibleJson"
+
+    $reparked = Invoke-Guard 'command' 'muted'
+    if ($reparked.matched_sessions -lt 1 -or $reparked.changed_sessions -ne 1) {
+        throw "Carbon did not re-establish mute ownership after the identity-change check: $($reparked | ConvertTo-Json -Compress)"
+    }
+    $firstMuted = Invoke-WithDeadline `
+        { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
+        { param($sessions) @($sessions).Count -eq 1 -and @($sessions)[0].Muted } `
+        'Carbon to re-mute the first fixture audio session'
+    Stop-AudioGuard $fixture.Id
+
     $fixture.Kill()
     if (-not $fixture.WaitForExit(5000)) {
         throw 'The first audio fixture did not stop'
@@ -552,6 +578,8 @@ try {
 
     [pscustomobject]@{
         policy = $audible.policy
+        session_identity_changed = $changedSessionId -ne @($identityChangedRestored)[0].SessionId
+        muted_after_identity_change_restore = @($identityChangedRestored)[0].Muted
         matched_sessions = $audible.matched_sessions
         changed_sessions = $audible.changed_sessions
         stable_session_preserved = @($restored)[0].SessionId -eq @($firstMuted)[0].SessionId

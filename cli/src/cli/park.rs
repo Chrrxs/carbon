@@ -48,20 +48,35 @@ impl Park {
 			desktop_name: desktop_name.clone(),
 		};
 		let _focus_lock = studio::acquire_focus_lock()?;
-		let audio = studio::set_studio_audio_policy(&placement.process, studio::StudioAudioPolicy::Parked)
-			.with_context(|| format!("failed to guard parked Studio audio for {target}"))?;
-		let report = studio::park_studio(&placement)
-			.with_context(|| format!("failed to park the Studio process registered for {target}"))?;
+		let guard = studio::set_studio_parking_policy(&placement.process, studio::StudioParkingPolicy::Parked)
+			.with_context(|| format!("failed to guard parked Studio for {target}"))?;
+		let report = match studio::park_studio(&placement) {
+			Ok(report) => report,
+			Err(error) => {
+				return match studio::set_studio_parking_policy(
+					&placement.process,
+					studio::StudioParkingPolicy::Active,
+				) {
+					Ok(_) => Err(error.context(format!(
+						"failed to park the Studio process registered for {target}; parking guard rollback completed"
+					))),
+					Err(rollback_error) => Err(error.context(format!(
+						"failed to park the Studio process registered for {target}; parking guard rollback also failed: {rollback_error:#}"
+					))),
+				};
+			}
+		};
 		for warning in report.warnings {
 			crate::carbon_warn!("{warning}");
 		}
 		log::debug!(
-			"Parked Studio audio guard matched {} session(s) and changed {} mute state(s)",
-			audio.matched_sessions,
-			audio.changed_sessions
+			"Parked Studio guard protected {} UI thread(s), matched {} audio session(s), and changed {} mute state(s)",
+			guard.guarded_threads,
+			guard.audio.matched_sessions,
+			guard.audio.changed_sessions
 		);
 		crate::carbon_info!(
-			"Parked Roblox Studio PID {studio_pid} for {target} on Windows desktop {desktop_name:?}, guarded its audio, and cleared attention from {} window(s)",
+			"Parked Roblox Studio PID {studio_pid} for {target} on Windows desktop {desktop_name:?}, guarded its focus and audio, and cleared attention from {} window(s)",
 			report.attention_windows,
 		);
 		Ok(())

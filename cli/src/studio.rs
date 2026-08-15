@@ -27,6 +27,10 @@ const MCP_URL_ENV: &str = "CARBON_STUDIO_MCP_URL";
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const STUDIO_AUDIO_GUARD_SCRIPT: &str = include_str!("studio_audio_guard.ps1");
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const STUDIO_WINDOW_GUARD_SCRIPT: &str = include_str!("studio_window_guard.ps1");
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const STUDIO_WINDOW_GUARD_HOOK: &[u8] = include_bytes!("../native/carbon_studio_window_guard_hook.dll");
 
 #[derive(Clone)]
 struct McpLifecycle {
@@ -382,7 +386,7 @@ pub(crate) struct StudioDesktopPlacement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StudioAudioPolicy {
+enum StudioAudioPolicy {
 	Parked,
 	Audible,
 }
@@ -396,12 +400,44 @@ impl StudioAudioPolicy {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StudioWindowPolicy {
+	Parked,
+	Active,
+}
+
+impl StudioWindowPolicy {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Parked => "parked",
+			Self::Active => "active",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StudioParkingPolicy {
+	Parked,
+	Active,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(crate) struct StudioAudioPolicyReport {
 	pub(crate) matched_sessions: usize,
 	pub(crate) changed_sessions: usize,
 	pub(crate) remaining_owned_mutes: usize,
 	pub(crate) failed_sessions: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct StudioWindowPolicyReport {
+	guarded_threads: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StudioParkingPolicyReport {
+	pub(crate) audio: StudioAudioPolicyReport,
+	pub(crate) guarded_threads: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1134,8 +1170,8 @@ fn move_process_to_virtual_desktop(
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn install_studio_audio_guard_script() -> Result<PathBuf> {
-	let digest = blake3::hash(STUDIO_AUDIO_GUARD_SCRIPT.as_bytes()).to_hex().to_string();
+fn install_windows_helper(stem: &str, extension: &str, contents: &[u8]) -> Result<PathBuf> {
+	let digest = blake3::hash(contents).to_hex().to_string();
 	let directory = util::get_carbon_dir()?.join("windows");
 	fs::create_dir_all(&directory).with_context(|| {
 		format!(
@@ -1143,35 +1179,47 @@ fn install_studio_audio_guard_script() -> Result<PathBuf> {
 			directory.display()
 		)
 	})?;
-	let path = directory.join(format!("studio-audio-guard-{}.ps1", &digest[..16]));
+	let path = directory.join(format!("{stem}-{}.{}", &digest[..16], extension));
 	if !path.exists() {
-		let temporary = directory.join(format!(".studio-audio-guard-{}.tmp", uuid::Uuid::new_v4().simple()));
-		fs::write(&temporary, STUDIO_AUDIO_GUARD_SCRIPT)
-			.with_context(|| format!("failed to stage Carbon Studio audio guard {}", temporary.display()))?;
+		let temporary = directory.join(format!(".{stem}-{}.tmp", uuid::Uuid::new_v4().simple()));
+		fs::write(&temporary, contents)
+			.with_context(|| format!("failed to stage Carbon Windows helper {}", temporary.display()))?;
 		if let Err(error) = fs::rename(&temporary, &path) {
 			if !path.exists() {
 				let _ = fs::remove_file(&temporary);
 				return Err(error)
-					.with_context(|| format!("failed to install Carbon Studio audio guard {}", path.display()));
+					.with_context(|| format!("failed to install Carbon Windows helper {}", path.display()));
 			}
 			let _ = fs::remove_file(&temporary);
 		}
 	}
 	let installed =
-		fs::read(&path).with_context(|| format!("failed to verify Carbon Studio audio guard {}", path.display()))?;
+		fs::read(&path).with_context(|| format!("failed to verify Carbon Windows helper {}", path.display()))?;
 	ensure!(
-		installed == STUDIO_AUDIO_GUARD_SCRIPT.as_bytes(),
-		"Carbon Studio audio guard at {} does not match this Carbon build",
+		installed == contents,
+		"Carbon Windows helper at {} does not match this Carbon build",
 		path.display()
 	);
 	Ok(path)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn native_studio_audio_guard_path(path: &Path) -> Result<String> {
+fn install_studio_audio_guard_script() -> Result<PathBuf> {
+	install_windows_helper("studio-audio-guard", "ps1", STUDIO_AUDIO_GUARD_SCRIPT.as_bytes())
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn install_studio_window_guard_assets() -> Result<(PathBuf, PathBuf)> {
+	let script = install_windows_helper("studio-window-guard", "ps1", STUDIO_WINDOW_GUARD_SCRIPT.as_bytes())?;
+	let hook = install_windows_helper("studio-window-guard-hook", "dll", STUDIO_WINDOW_GUARD_HOOK)?;
+	Ok((script, hook))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn native_windows_helper_path(path: &Path) -> Result<String> {
 	#[cfg(target_os = "linux")]
 	{
-		windows_path(path, "Carbon Studio audio guard")
+		windows_path(path, "Carbon Windows helper")
 	}
 	#[cfg(target_os = "windows")]
 	{
@@ -1253,14 +1301,14 @@ fn spawn_studio_audio_guard(
 	Ok(())
 }
 
-pub(crate) fn set_studio_audio_policy(
+fn set_studio_audio_policy(
 	process: &StudioProcessIdentity,
 	policy: StudioAudioPolicy,
 ) -> Result<StudioAudioPolicyReport> {
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
 		let script = install_studio_audio_guard_script()?;
-		let script = native_studio_audio_guard_path(&script)?;
+		let script = native_windows_helper_path(&script)?;
 		if let Ok(report) = invoke_studio_audio_guard(&script, process, policy, Duration::from_millis(250)) {
 			return verify_studio_audio_policy_report(process, policy, report);
 		}
@@ -1304,6 +1352,171 @@ fn verify_studio_audio_policy_report(
 		);
 	}
 	Ok(report)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn studio_window_guard_arguments(
+	script_path: &str,
+	hook_path: &str,
+	process: &StudioProcessIdentity,
+	mode: &str,
+	policy: StudioWindowPolicy,
+	connect_timeout: Duration,
+) -> Vec<String> {
+	vec![
+		"-Sta".to_owned(),
+		"-NoProfile".to_owned(),
+		"-NonInteractive".to_owned(),
+		"-ExecutionPolicy".to_owned(),
+		"Bypass".to_owned(),
+		"-File".to_owned(),
+		script_path.to_owned(),
+		"-Mode".to_owned(),
+		mode.to_owned(),
+		"-TargetProcessId".to_owned(),
+		process.process_id.to_string(),
+		"-ExecutableBase64".to_owned(),
+		BASE64_STANDARD.encode(process.studio_executable.as_bytes()),
+		"-CreationFileTime".to_owned(),
+		process.creation_filetime.to_string(),
+		"-Policy".to_owned(),
+		policy.as_str().to_owned(),
+		"-HookLibrary".to_owned(),
+		hook_path.to_owned(),
+		"-ConnectTimeoutMilliseconds".to_owned(),
+		connect_timeout.as_millis().min(i32::MAX as u128).to_string(),
+	]
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn invoke_studio_window_guard(
+	script_path: &str,
+	hook_path: &str,
+	process: &StudioProcessIdentity,
+	policy: StudioWindowPolicy,
+	connect_timeout: Duration,
+) -> Result<StudioWindowPolicyReport> {
+	let arguments = studio_window_guard_arguments(script_path, hook_path, process, "command", policy, connect_timeout);
+	let output = powershell_command()?
+		.args(arguments)
+		.output()
+		.context("failed to invoke the Carbon Studio window guard")?;
+	ensure!(
+		output.status.success(),
+		"Carbon Studio window guard rejected the {} policy for PID {}: {}",
+		policy.as_str(),
+		process.process_id,
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	let stdout = String::from_utf8(output.stdout).context("Carbon Studio window guard returned non-UTF-8 output")?;
+	serde_json::from_str(stdout.trim()).context("Carbon Studio window guard returned an invalid policy acknowledgement")
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn spawn_studio_window_guard(
+	script_path: &str,
+	hook_path: &str,
+	process: &StudioProcessIdentity,
+	policy: StudioWindowPolicy,
+) -> Result<()> {
+	let arguments = studio_window_guard_arguments(
+		script_path,
+		hook_path,
+		process,
+		"spawn",
+		policy,
+		Duration::from_secs(10),
+	);
+	let output = powershell_command()?
+		.args(arguments)
+		.output()
+		.context("failed to start the persistent Carbon Studio window guard")?;
+	ensure!(
+		output.status.success(),
+		"failed to detach the persistent Carbon Studio window guard for PID {}: {}",
+		process.process_id,
+		String::from_utf8_lossy(&output.stderr).trim()
+	);
+	Ok(())
+}
+
+fn set_studio_window_policy(
+	process: &StudioProcessIdentity,
+	policy: StudioWindowPolicy,
+) -> Result<StudioWindowPolicyReport> {
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	{
+		let (script, hook) = install_studio_window_guard_assets()?;
+		let script = native_windows_helper_path(&script)?;
+		let hook = native_windows_helper_path(&hook)?;
+		let report = match invoke_studio_window_guard(&script, &hook, process, policy, Duration::from_millis(250)) {
+			Ok(report) => report,
+			Err(_) => {
+				spawn_studio_window_guard(&script, &hook, process, policy)?;
+				invoke_studio_window_guard(&script, &hook, process, policy, Duration::from_secs(10)).with_context(
+					|| {
+						format!(
+							"failed to make Roblox Studio PID {} window policy {}",
+							process.process_id,
+							policy.as_str()
+						)
+					},
+				)?
+			}
+		};
+		if policy == StudioWindowPolicy::Active {
+			ensure!(
+				report.guarded_threads == 0,
+				"Carbon Studio window guard left {} UI thread(s) guarded for PID {}",
+				report.guarded_threads,
+				process.process_id
+			);
+		}
+		Ok(report)
+	}
+
+	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+	{
+		let _ = (process, policy);
+		anyhow::bail!("parked Studio window guarding is supported only when Carbon runs on Windows or WSL")
+	}
+}
+
+pub(crate) fn set_studio_parking_policy(
+	process: &StudioProcessIdentity,
+	policy: StudioParkingPolicy,
+) -> Result<StudioParkingPolicyReport> {
+	match policy {
+		StudioParkingPolicy::Parked => {
+			let window = set_studio_window_policy(process, StudioWindowPolicy::Parked)
+				.context("failed to guard parked Studio window activation")?;
+			let audio = match set_studio_audio_policy(process, StudioAudioPolicy::Parked) {
+				Ok(audio) => audio,
+				Err(error) => {
+					return match set_studio_window_policy(process, StudioWindowPolicy::Active) {
+						Ok(_) => Err(error.context("parked Studio audio failed; window guard rollback completed")),
+						Err(rollback_error) => Err(error.context(format!(
+							"parked Studio audio failed and window guard rollback also failed: {rollback_error:#}"
+						))),
+					};
+				}
+			};
+			Ok(StudioParkingPolicyReport {
+				audio,
+				guarded_threads: window.guarded_threads,
+			})
+		}
+		StudioParkingPolicy::Active => {
+			let window = set_studio_window_policy(process, StudioWindowPolicy::Active)
+				.context("failed to release parked Studio window activation guard")?;
+			let audio = set_studio_audio_policy(process, StudioAudioPolicy::Audible)
+				.context("failed to restore active Studio audio")?;
+			Ok(StudioParkingPolicyReport {
+				audio,
+				guarded_threads: window.guarded_threads,
+			})
+		}
+	}
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1644,11 +1857,11 @@ pub fn launch(path: Option<PathBuf>, desktop_name: &str) -> Result<Option<u32>> 
 			studio_executable: studio_executable.clone(),
 			creation_filetime,
 		};
-		if let Err(error) = set_studio_audio_policy(&process, StudioAudioPolicy::Parked) {
+		if let Err(error) = set_studio_parking_policy(&process, StudioParkingPolicy::Parked) {
 			return match terminate_process(process_id, &studio_executable, creation_filetime) {
-				Ok(()) => Err(error.context("Studio parked-audio guard failed; exact-process cleanup completed")),
+				Ok(()) => Err(error.context("Studio parking guard failed; exact-process cleanup completed")),
 				Err(cleanup_error) => Err(error.context(format!(
-					"Studio parked-audio guard failed and exact-process cleanup also failed: {cleanup_error:#}"
+					"Studio parking guard failed and exact-process cleanup also failed: {cleanup_error:#}"
 				))),
 			};
 		}
@@ -1679,11 +1892,11 @@ pub fn launch_managed(path: PathBuf, _studio_dir: &Path, desktop_name: &str) -> 
 			studio_executable: studio_executable.clone(),
 			creation_filetime: launch.creation_filetime,
 		};
-		if let Err(error) = set_studio_audio_policy(&process, StudioAudioPolicy::Parked) {
+		if let Err(error) = set_studio_parking_policy(&process, StudioParkingPolicy::Parked) {
 			return match close_managed_launch(&launch, &studio_executable) {
-				Ok(()) => Err(error.context("managed Studio parked-audio guard failed; cleanup completed")),
+				Ok(()) => Err(error.context("managed Studio parking guard failed; cleanup completed")),
 				Err(cleanup_error) => Err(error.context(format!(
-					"managed Studio parked-audio guard failed and cleanup also failed: {cleanup_error:#}"
+					"managed Studio parking guard failed and cleanup also failed: {cleanup_error:#}"
 				))),
 			};
 		}
@@ -2527,6 +2740,7 @@ mod tests {
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("remaining_owned_mutes"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbon-studio-audio-v2-"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Set-LegacyGuardAudible"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("TryTransferEndpointOwnership"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Start-Process @start"));
 	}
 
@@ -2555,6 +2769,39 @@ mod tests {
 		assert!(joined.contains("-Policy muted"));
 		assert!(joined.contains(&BASE64_STANDARD.encode(executable.as_bytes())));
 		assert!(!joined.contains(executable));
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn parked_window_guard_uses_an_exact_process_native_cbt_veto() {
+		let executable = r"C:\Roblox\RobloxStudioBeta.exe";
+		let process = StudioProcessIdentity {
+			process_id: 47_312,
+			studio_executable: executable.to_owned(),
+			creation_filetime: 133_700_123_456,
+		};
+		let arguments = studio_window_guard_arguments(
+			r"C:\Carbon\studio-window-guard.ps1",
+			r"C:\Carbon\studio-window-guard-hook.dll",
+			&process,
+			"spawn",
+			StudioWindowPolicy::Parked,
+			Duration::from_secs(10),
+		);
+		let joined = arguments.join(" ");
+
+		assert_eq!(arguments.first().map(String::as_str), Some("-Sta"));
+		assert!(joined.contains("-Mode spawn"));
+		assert!(joined.contains("-TargetProcessId 47312"));
+		assert!(joined.contains("-CreationFileTime 133700123456"));
+		assert!(joined.contains("-Policy parked"));
+		assert!(joined.contains("-HookLibrary C:\\Carbon\\studio-window-guard-hook.dll"));
+		assert!(joined.contains(&BASE64_STANDARD.encode(executable.as_bytes())));
+		assert!(!joined.contains(executable));
+		assert!(STUDIO_WINDOW_GUARD_SCRIPT.contains("SetWindowsHookExW"));
+		assert!(STUDIO_WINDOW_GUARD_SCRIPT.contains("carbon-studio-window-v1-"));
+		assert!(include_str!("../native/studio_window_guard_hook.rs").contains("CarbonWindowGuardHook"));
+		assert!(STUDIO_WINDOW_GUARD_HOOK.starts_with(b"MZ"));
 	}
 
 	#[test]
@@ -2597,8 +2844,8 @@ mod tests {
 		)
 		.unwrap();
 
-		let guard_script = native_studio_audio_guard_path(&guard_script).unwrap();
-		let harness_script = native_studio_audio_guard_path(&harness_script).unwrap();
+		let guard_script = native_windows_helper_path(&guard_script).unwrap();
+		let harness_script = native_windows_helper_path(&harness_script).unwrap();
 		let output = powershell_command()
 			.unwrap()
 			.args([
@@ -2629,7 +2876,7 @@ mod tests {
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
-	fn parked_audio_guard_restores_a_replacement_session_that_inherits_its_mute() {
+	fn parked_studio_regressions_restore_owned_audio_after_session_identity_changes() {
 		#[cfg(target_os = "linux")]
 		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
 			return;
@@ -2645,8 +2892,8 @@ mod tests {
 		)
 		.unwrap();
 
-		let guard_script = native_studio_audio_guard_path(&guard_script).unwrap();
-		let harness_script = native_studio_audio_guard_path(&harness_script).unwrap();
+		let guard_script = native_windows_helper_path(&guard_script).unwrap();
+		let harness_script = native_windows_helper_path(&harness_script).unwrap();
 		let output = powershell_command()
 			.unwrap()
 			.args([
@@ -2671,6 +2918,8 @@ mod tests {
 
 		let report: Value = serde_json::from_slice(&output.stdout).unwrap();
 		assert_eq!(report["policy"], "audible");
+		assert_eq!(report["session_identity_changed"], true);
+		assert_eq!(report["muted_after_identity_change_restore"], false);
 		assert_eq!(report["stable_session_preserved"], true);
 		assert_eq!(report["instance_replaced"], true);
 		assert_eq!(report["process_replaced"], true);
@@ -2678,6 +2927,62 @@ mod tests {
 		assert_eq!(report["remaining_owned_mutes"], 0);
 		assert_eq!(report["failed_sessions"], 0);
 		assert_eq!(report["user_mute_preserved"], true);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn parked_studio_regressions_block_programmatic_self_focus_until_unparked() {
+		#[cfg(target_os = "linux")]
+		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
+			return;
+		}
+
+		let temporary = tempfile::tempdir().unwrap();
+		let guard_script = temporary.path().join("studio-window-guard.ps1");
+		let hook_library = temporary.path().join("carbon-studio-window-guard-hook.dll");
+		let harness_script = temporary.path().join("studio-window-guard-focus.ps1");
+		fs::write(&guard_script, STUDIO_WINDOW_GUARD_SCRIPT).unwrap();
+		fs::write(&hook_library, STUDIO_WINDOW_GUARD_HOOK).unwrap();
+		fs::write(
+			&harness_script,
+			include_str!("../tests/fixtures/studio_window_guard_focus.ps1"),
+		)
+		.unwrap();
+
+		let guard_script = native_windows_helper_path(&guard_script).unwrap();
+		let hook_library = native_windows_helper_path(&hook_library).unwrap();
+		let harness_script = native_windows_helper_path(&harness_script).unwrap();
+		let output = powershell_command()
+			.unwrap()
+			.args([
+				"-Sta",
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				&harness_script,
+				"-GuardScript",
+				&guard_script,
+				"-HookLibrary",
+				&hook_library,
+			])
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"window guard failed\nstdout:\n{}\nstderr:\n{}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr),
+		);
+
+		let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+		assert_eq!(report["parked_policy"], "parked");
+		assert!(report["parked_guarded_threads"].as_u64().unwrap() >= 1);
+		assert_eq!(report["active_policy"], "active");
+		assert_eq!(report["active_guarded_threads"], 0);
+		assert_eq!(report["self_activation_blocked"], true);
+		assert_eq!(report["active_self_activation_allowed"], true);
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]

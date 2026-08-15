@@ -89,8 +89,17 @@ process on every active output device and keeps a Windows Core Audio guardian
 alive for streams created later. Focusing that Studio restores only mute states
 that Carbon changed, so a session that was already user-muted stays muted.
 Carbon carries that ownership through Windows' persisted replacement audio
-sessions, including a replacement Studio process at the same executable path,
-and verifies that no Carbon-owned mute remains before focus reports success.
+sessions, including a changed session identifier or a replacement Studio process
+at the same executable path, and verifies that no Carbon-owned mute remains
+before focus reports success.
+
+Parking also keeps an exact-process Windows activation guardian alive. The
+guardian installs a CBT veto only on the parked Studio's UI threads, so Studio
+cannot make itself foreground when playtest state changes or another internal
+action requests activation. Mouse activation and Alt+Tab remain user-controlled.
+Carbon removes every veto before it focuses or unparks that Studio. The guardian
+revalidates the process executable and creation time throughout its lifetime and
+exits with the exact Studio process generation.
 
 `carbon focus` leaves the exact native Studio process launched for the selected
 serve session in the foreground. When `studio_desktop` is configured, focus
@@ -106,7 +115,8 @@ reported as a warning and does not block focus.
 `studio_desktop` recorded when its serve session started. It does not activate
 Studio, switch desktops, or park repository siblings. This is useful after
 working in one Studio when no other Studio needs to be focused. Both explicit
-and automatic parking clear taskbar attention from every top-level window
+and automatic parking guard programmatic focus, mute Carbon-owned audio, and
+clear taskbar attention from every top-level window
 owned by the verified Studio process, including an off-desktop modal; Carbon
 never dismisses or answers that dialog. `carbon focus` repeats the parked
 sibling attention pass after activating the selected Studio because Windows

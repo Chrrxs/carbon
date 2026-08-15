@@ -994,8 +994,20 @@ namespace CarbonStudioAudioGuard
 
         private void AcquireOwnershipEvidence(AudioSessionHandle session, bool isMuted)
         {
-            if (carbonOwnedMutes.Contains(session.OwnershipKey) ||
-                !ownershipInheritanceChecked.Add(session.OwnershipKey))
+            if (carbonOwnedMutes.Contains(session.OwnershipKey))
+            {
+                return;
+            }
+
+            // A replacement session can be announced before the expired handle
+            // is pruned. Retry this transfer while it remains muted so that the
+            // ownership handoff succeeds once the old session disappears.
+            if (isMuted && TryTransferEndpointOwnership(session))
+            {
+                return;
+            }
+
+            if (!ownershipInheritanceChecked.Add(session.OwnershipKey))
             {
                 return;
             }
@@ -1035,6 +1047,48 @@ namespace CarbonStudioAudioGuard
                 ownershipInheritanceChecked.Remove(session.OwnershipKey);
                 throw;
             }
+        }
+
+        private bool TryTransferEndpointOwnership(AudioSessionHandle session)
+        {
+            string endpointPrefix = session.EndpointId + "\n";
+            string candidate = null;
+            foreach (string ownershipKey in carbonOwnedMutes)
+            {
+                if (string.Equals(ownershipKey, session.OwnershipKey, StringComparison.Ordinal) ||
+                    !ownershipKey.StartsWith(endpointPrefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                bool stillObserved = false;
+                foreach (AudioSessionHandle observed in sessions.Values)
+                {
+                    if (string.Equals(observed.OwnershipKey, ownershipKey, StringComparison.Ordinal))
+                    {
+                        stillObserved = true;
+                        break;
+                    }
+                }
+                if (stillObserved)
+                {
+                    continue;
+                }
+                if (candidate != null)
+                {
+                    return false;
+                }
+                candidate = ownershipKey;
+            }
+
+            if (candidate == null)
+            {
+                return false;
+            }
+            carbonOwnedMutes.Remove(candidate);
+            carbonOwnedMutes.Add(session.OwnershipKey);
+            PersistLedger();
+            return true;
         }
 
         private void RefreshEndpoints()
