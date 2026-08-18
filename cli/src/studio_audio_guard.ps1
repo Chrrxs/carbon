@@ -148,36 +148,6 @@ namespace CarbonStudioAudioGuard
             return Validate(processId, expectedExecutable, creationFileTime) == null;
         }
 
-        public static bool IsRunningGeneration(uint processId, long creationFileTime)
-        {
-            System.IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
-            if (process == System.IntPtr.Zero)
-            {
-                return false;
-            }
-            try
-            {
-                uint exitCode;
-                if (!GetExitCodeProcess(process, out exitCode) || exitCode != StillActive)
-                {
-                    return false;
-                }
-                FileTime creation;
-                FileTime exit;
-                FileTime kernel;
-                FileTime user;
-                if (!GetProcessTimes(process, out creation, out exit, out kernel, out user))
-                {
-                    return false;
-                }
-                long actualCreation = unchecked((long)(((ulong)creation.High << 32) | creation.Low));
-                return actualCreation == creationFileTime;
-            }
-            finally
-            {
-                CloseHandle(process);
-            }
-        }
     }
 }
 '@
@@ -206,37 +176,43 @@ function Assert-ExactProcess([string]$ExpectedExecutable) {
     }
 }
 
-function Set-LegacyGuardAudible {
-    $legacyPipeName = "carbon-studio-audio-$TargetProcessId-$CreationFileTime"
-    $legacyPipe = [IO.Pipes.NamedPipeClientStream]::new(
-        '.',
-        $legacyPipeName,
-        [IO.Pipes.PipeDirection]::InOut,
-        [IO.Pipes.PipeOptions]::Asynchronous
+function Set-PreviousGuardsAudible {
+    $previousPipeNames = @(
+        "carbon-studio-audio-$TargetProcessId-$CreationFileTime",
+        "carbon-studio-audio-v2-$TargetProcessId-$CreationFileTime",
+        "carbon-studio-audio-v3-$TargetProcessId-$CreationFileTime"
     )
-    try {
+    foreach ($previousPipeName in $previousPipeNames) {
+        $previousPipe = [IO.Pipes.NamedPipeClientStream]::new(
+            '.',
+            $previousPipeName,
+            [IO.Pipes.PipeDirection]::InOut,
+            [IO.Pipes.PipeOptions]::Asynchronous
+        )
         try {
-            $legacyPipe.Connect(100)
+            try {
+                $previousPipe.Connect(100)
+            } catch {
+                continue
+            }
+            $writer = [IO.StreamWriter]::new($previousPipe, [Text.UTF8Encoding]::new($false), 1024, $true)
+            try {
+                $writer.AutoFlush = $true
+                $writer.WriteLine('audible')
+            } finally {
+                $writer.Dispose()
+            }
         } catch {
-            return
-        }
-        $writer = [IO.StreamWriter]::new($legacyPipe, [Text.UTF8Encoding]::new($false), 1024, $true)
-        try {
-            $writer.AutoFlush = $true
-            $writer.WriteLine('audible')
         } finally {
-            $writer.Dispose()
+            $previousPipe.Dispose()
         }
-    } catch {
-    } finally {
-        $legacyPipe.Dispose()
     }
 }
 
 if ($Mode -eq 'command') {
     $expectedExecutable = Get-ExpectedExecutable
     Assert-ExactProcess $expectedExecutable
-    $pipeName = "carbon-studio-audio-v2-$TargetProcessId-$CreationFileTime"
+    $pipeName = "carbon-studio-audio-v4-$TargetProcessId-$CreationFileTime"
     $pipe = [IO.Pipes.NamedPipeClientStream]::new(
         '.',
         $pipeName,
@@ -276,7 +252,7 @@ if ($Mode -eq 'command') {
 if ($Mode -eq 'spawn') {
     $expectedExecutable = Get-ExpectedExecutable
     Assert-ExactProcess $expectedExecutable
-    Set-LegacyGuardAudible
+    Set-PreviousGuardsAudible
     $quotedScript = '"' + $PSCommandPath + '"'
     $arguments = @(
         '-Mta',
@@ -575,16 +551,14 @@ namespace CarbonStudioAudioGuard
     {
         internal readonly string EndpointId;
         internal readonly string InstanceKey;
-        internal readonly string OwnershipKey;
         internal readonly IAudioSessionControl Control;
         internal readonly ISimpleAudioVolume Volume;
 
-        internal AudioSessionHandle(string endpointId, string instanceKey, string ownershipKey,
+        internal AudioSessionHandle(string endpointId, string instanceKey,
             IAudioSessionControl control, ISimpleAudioVolume volume)
         {
             EndpointId = endpointId;
             InstanceKey = instanceKey;
-            OwnershipKey = ownershipKey;
             Control = control;
             Volume = volume;
         }
@@ -707,45 +681,26 @@ namespace CarbonStudioAudioGuard
     {
         private const uint DeviceStateActive = 0x00000001;
         private const uint ClassContextAll = 0x00000017;
-        private const string StableLedgerPrefix = "v2:";
-        private const string LedgerMutexName = "Local\\CarbonStudioAudioOwnership-v2";
         private static readonly Guid AudioSessionManager2Id =
             new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
 
         private readonly object sync = new object();
         private readonly uint targetProcessId;
-        private readonly string stateDirectory;
-        private readonly string ledgerPath;
         private readonly IMMDeviceEnumerator deviceEnumerator;
         private readonly EndpointNotification endpointNotification;
         private readonly Dictionary<string, EndpointRegistration> endpoints =
             new Dictionary<string, EndpointRegistration>(StringComparer.Ordinal);
         private readonly Dictionary<string, AudioSessionHandle> sessions =
             new Dictionary<string, AudioSessionHandle>(StringComparer.Ordinal);
-        private readonly HashSet<string> carbonOwnedMutes =
-            new HashSet<string>(StringComparer.Ordinal);
-        private readonly HashSet<string> legacyOwnedMutes =
-            new HashSet<string>(StringComparer.Ordinal);
-        private readonly HashSet<string> ownershipInheritanceChecked =
-            new HashSet<string>(StringComparer.Ordinal);
         private Guid eventContext = new Guid("7552A64B-A35C-4D4E-84B0-A2FB1DD81B02");
         private bool muted;
         private int devicesDirty = 1;
         private DateTime lastSessionRefresh = DateTime.MinValue;
 
-        internal AudioGuard(uint targetProcessId, long creationFileTime, bool initiallyMuted)
+        internal AudioGuard(uint targetProcessId, bool initiallyMuted)
         {
             this.targetProcessId = targetProcessId;
             muted = initiallyMuted;
-            stateDirectory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Carbon",
-                "audio-guards");
-            Directory.CreateDirectory(stateDirectory);
-            ledgerPath = Path.Combine(
-                stateDirectory,
-                targetProcessId.ToString() + "-" + creationFileTime.ToString() + ".owned");
-            LoadLedger();
             deviceEnumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
             endpointNotification = new EndpointNotification(this);
             Check(deviceEnumerator.RegisterEndpointNotificationCallback(endpointNotification));
@@ -777,12 +732,9 @@ namespace CarbonStudioAudioGuard
                     return null;
                 }
 
-                string sessionId;
                 string instanceId;
-                Check(control2.GetSessionIdentifier(out sessionId));
                 Check(control2.GetSessionInstanceIdentifier(out instanceId));
                 string instanceKey = endpointId + "\n" + instanceId;
-                string ownershipKey = endpointId + "\n" + sessionId;
                 ISimpleAudioVolume volume = (ISimpleAudioVolume)control;
                 lock (sync)
                 {
@@ -792,7 +744,6 @@ namespace CarbonStudioAudioGuard
                         handle = new AudioSessionHandle(
                             endpointId,
                             instanceKey,
-                            ownershipKey,
                             control,
                             volume);
                         sessions.Add(instanceKey, handle);
@@ -866,6 +817,10 @@ namespace CarbonStudioAudioGuard
 
         internal string SetPolicy(bool shouldMute)
         {
+            lock (sync)
+            {
+                muted = shouldMute;
+            }
             RefreshEndpoints();
             List<EndpointRegistration> endpointSnapshot;
             lock (sync)
@@ -886,11 +841,10 @@ namespace CarbonStudioAudioGuard
 
             int changed = 0;
             int matched;
+            int remainingMismatched = 0;
             HashSet<string> failed = new HashSet<string>(StringComparer.Ordinal);
-            int remainingOwnedMutes;
             lock (sync)
             {
-                muted = shouldMute;
                 foreach (AudioSessionHandle session in sessions.Values)
                 {
                     bool applicationFailed;
@@ -904,12 +858,27 @@ namespace CarbonStudioAudioGuard
                     }
                 }
                 matched = sessions.Count;
-                remainingOwnedMutes = CountRemainingOwnedMutes(failed);
+                foreach (AudioSessionHandle session in sessions.Values)
+                {
+                    try
+                    {
+                        bool isMuted;
+                        Check(session.Volume.GetMute(out isMuted));
+                        if (isMuted != shouldMute)
+                        {
+                            remainingMismatched++;
+                        }
+                    }
+                    catch
+                    {
+                        failed.Add(session.InstanceKey);
+                    }
+                }
             }
             return "{\"policy\":\"" + (shouldMute ? "muted" : "audible") +
                 "\",\"matched_sessions\":" + matched.ToString() +
                 ",\"changed_sessions\":" + changed.ToString() +
-                ",\"remaining_owned_mutes\":" + remainingOwnedMutes.ToString() +
+                ",\"remaining_mismatched_sessions\":" + remainingMismatched.ToString() +
                 ",\"failed_sessions\":" + failed.Count.ToString() + "}";
         }
 
@@ -920,175 +889,25 @@ namespace CarbonStudioAudioGuard
             {
                 bool isMuted;
                 Check(session.Volume.GetMute(out isMuted));
-                AcquireOwnershipEvidence(session, isMuted);
-                if (muted)
-                {
-                    if (!isMuted)
-                    {
-                        if (carbonOwnedMutes.Add(session.OwnershipKey))
-                        {
-                            PersistLedger();
-                        }
-                        Check(session.Volume.SetMute(true, ref eventContext));
-                        bool mutedAfterChange;
-                        Check(session.Volume.GetMute(out mutedAfterChange));
-                        if (!mutedAfterChange)
-                        {
-                            throw new InvalidOperationException("audio session remained audible after Carbon muted it");
-                        }
-                        return true;
-                    }
-                    return false;
-                }
-
-                if (!carbonOwnedMutes.Contains(session.OwnershipKey))
+                if (isMuted == muted)
                 {
                     return false;
                 }
-                if (isMuted)
+                Check(session.Volume.SetMute(muted, ref eventContext));
+                bool mutedAfterChange;
+                Check(session.Volume.GetMute(out mutedAfterChange));
+                if (mutedAfterChange != muted)
                 {
-                    Check(session.Volume.SetMute(false, ref eventContext));
-                    bool mutedAfterChange;
-                    Check(session.Volume.GetMute(out mutedAfterChange));
-                    if (mutedAfterChange)
-                    {
-                        throw new InvalidOperationException("audio session remained muted after Carbon restored it");
-                    }
+                    throw new InvalidOperationException(
+                        "audio session did not match Carbon's authoritative mute policy after reconciliation");
                 }
-                carbonOwnedMutes.Remove(session.OwnershipKey);
-                PersistLedger();
-                return isMuted;
+                return true;
             }
             catch
             {
                 failed = true;
                 return false;
             }
-        }
-
-        private int CountRemainingOwnedMutes(HashSet<string> failed)
-        {
-            int remaining = 0;
-            foreach (AudioSessionHandle session in sessions.Values)
-            {
-                if (!carbonOwnedMutes.Contains(session.OwnershipKey))
-                {
-                    continue;
-                }
-                try
-                {
-                    bool isMuted;
-                    Check(session.Volume.GetMute(out isMuted));
-                    if (isMuted)
-                    {
-                        remaining++;
-                    }
-                }
-                catch
-                {
-                    failed.Add(session.InstanceKey);
-                }
-            }
-            return remaining;
-        }
-
-        private void AcquireOwnershipEvidence(AudioSessionHandle session, bool isMuted)
-        {
-            if (carbonOwnedMutes.Contains(session.OwnershipKey))
-            {
-                return;
-            }
-
-            // A replacement session can be announced before the expired handle
-            // is pruned. Retry this transfer while it remains muted so that the
-            // ownership handoff succeeds once the old session disappears.
-            if (isMuted && TryTransferEndpointOwnership(session))
-            {
-                return;
-            }
-
-            if (!ownershipInheritanceChecked.Add(session.OwnershipKey))
-            {
-                return;
-            }
-
-            try
-            {
-                bool migrated = legacyOwnedMutes.Remove(session.InstanceKey);
-                if (!migrated && isMuted)
-                {
-                    string endpointPrefix = session.EndpointId + "\n";
-                    List<string> matchingLegacyKeys = new List<string>();
-                    foreach (string key in legacyOwnedMutes)
-                    {
-                        if (key.StartsWith(endpointPrefix, StringComparison.Ordinal))
-                        {
-                            matchingLegacyKeys.Add(key);
-                        }
-                    }
-                    foreach (string key in matchingLegacyKeys)
-                    {
-                        legacyOwnedMutes.Remove(key);
-                    }
-                    migrated = matchingLegacyKeys.Count != 0;
-                }
-
-                if (migrated)
-                {
-                    carbonOwnedMutes.Add(session.OwnershipKey);
-                    PersistLedger();
-                    return;
-                }
-
-                TryTakeAbandonedOwnership(session.OwnershipKey);
-            }
-            catch
-            {
-                ownershipInheritanceChecked.Remove(session.OwnershipKey);
-                throw;
-            }
-        }
-
-        private bool TryTransferEndpointOwnership(AudioSessionHandle session)
-        {
-            string endpointPrefix = session.EndpointId + "\n";
-            string candidate = null;
-            foreach (string ownershipKey in carbonOwnedMutes)
-            {
-                if (string.Equals(ownershipKey, session.OwnershipKey, StringComparison.Ordinal) ||
-                    !ownershipKey.StartsWith(endpointPrefix, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                bool stillObserved = false;
-                foreach (AudioSessionHandle observed in sessions.Values)
-                {
-                    if (string.Equals(observed.OwnershipKey, ownershipKey, StringComparison.Ordinal))
-                    {
-                        stillObserved = true;
-                        break;
-                    }
-                }
-                if (stillObserved)
-                {
-                    continue;
-                }
-                if (candidate != null)
-                {
-                    return false;
-                }
-                candidate = ownershipKey;
-            }
-
-            if (candidate == null)
-            {
-                return false;
-            }
-            carbonOwnedMutes.Remove(candidate);
-            carbonOwnedMutes.Add(session.OwnershipKey);
-            PersistLedger();
-            return true;
         }
 
         private void RefreshEndpoints()
@@ -1170,193 +989,8 @@ namespace CarbonStudioAudioGuard
             }
         }
 
-        private void LoadLedger()
-        {
-            WithLedgerLock(delegate
-            {
-                ReadLedger(ledgerPath, carbonOwnedMutes, legacyOwnedMutes);
-            });
-        }
-
-        private void PersistLedger()
-        {
-            WithLedgerLock(delegate
-            {
-                WriteLedger(ledgerPath, carbonOwnedMutes, legacyOwnedMutes);
-            });
-        }
-
-        private bool TryTakeAbandonedOwnership(string ownershipKey)
-        {
-            bool inherited = false;
-            WithLedgerLock(delegate
-            {
-                foreach (string candidatePath in Directory.GetFiles(stateDirectory, "*.owned"))
-                {
-                    if (string.Equals(candidatePath, ledgerPath, StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    uint ownerProcessId;
-                    long ownerCreationFileTime;
-                    if (!TryParseLedgerIdentity(candidatePath, out ownerProcessId, out ownerCreationFileTime) ||
-                        ProcessIdentity.IsRunningGeneration(ownerProcessId, ownerCreationFileTime))
-                    {
-                        continue;
-                    }
-
-                    HashSet<string> stable = new HashSet<string>(StringComparer.Ordinal);
-                    HashSet<string> legacy = new HashSet<string>(StringComparer.Ordinal);
-                    ReadLedger(candidatePath, stable, legacy);
-                    if (stable.Remove(ownershipKey))
-                    {
-                        inherited = true;
-                        WriteLedger(candidatePath, stable, legacy);
-                    }
-                }
-
-                if (inherited)
-                {
-                    carbonOwnedMutes.Add(ownershipKey);
-                    WriteLedger(ledgerPath, carbonOwnedMutes, legacyOwnedMutes);
-                }
-            });
-            return inherited;
-        }
-
-        private static bool TryParseLedgerIdentity(
-            string path,
-            out uint processId,
-            out long creationFileTime)
-        {
-            processId = 0;
-            creationFileTime = 0;
-            string identity = Path.GetFileNameWithoutExtension(path);
-            int separator = identity.IndexOf('-');
-            return separator > 0 &&
-                uint.TryParse(identity.Substring(0, separator), out processId) &&
-                long.TryParse(identity.Substring(separator + 1), out creationFileTime);
-        }
-
-        private static void ReadLedger(
-            string path,
-            HashSet<string> stable,
-            HashSet<string> legacy)
-        {
-            if (!File.Exists(path))
-            {
-                return;
-            }
-            foreach (string line in File.ReadAllLines(path))
-            {
-                try
-                {
-                    bool isStable = line.StartsWith(StableLedgerPrefix, StringComparison.Ordinal);
-                    string encoded = isStable ? line.Substring(StableLedgerPrefix.Length) : line;
-                    string key = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
-                    if (isStable)
-                    {
-                        stable.Add(key);
-                    }
-                    else
-                    {
-                        legacy.Add(key);
-                    }
-                }
-                catch
-                {
-                }
-            }
-        }
-
-        private static void WriteLedger(
-            string path,
-            HashSet<string> stable,
-            HashSet<string> legacy)
-        {
-            if (stable.Count == 0 && legacy.Count == 0)
-            {
-                File.Delete(path);
-                return;
-            }
-
-            List<string> encoded = new List<string>();
-            foreach (string key in stable)
-            {
-                encoded.Add(StableLedgerPrefix + Convert.ToBase64String(Encoding.UTF8.GetBytes(key)));
-            }
-            foreach (string key in legacy)
-            {
-                encoded.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(key)));
-            }
-            encoded.Sort(StringComparer.Ordinal);
-            string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            try
-            {
-                File.WriteAllLines(temporary, encoded.ToArray(), new UTF8Encoding(false));
-                if (File.Exists(path))
-                {
-                    File.Replace(temporary, path, null);
-                }
-                else
-                {
-                    File.Move(temporary, path);
-                }
-            }
-            catch
-            {
-                try
-                {
-                    File.Delete(temporary);
-                }
-                catch
-                {
-                }
-                throw;
-            }
-        }
-
-        private static void WithLedgerLock(Action action)
-        {
-            bool ownsMutex = false;
-            using (Mutex ledgerMutex = new Mutex(false, LedgerMutexName))
-            {
-                try
-                {
-                    try
-                    {
-                        ownsMutex = ledgerMutex.WaitOne(5000);
-                    }
-                    catch (AbandonedMutexException)
-                    {
-                        ownsMutex = true;
-                    }
-                    if (!ownsMutex)
-                    {
-                        throw new TimeoutException("timed out waiting for Carbon audio ownership ledger");
-                    }
-                    action();
-                }
-                finally
-                {
-                    if (ownsMutex)
-                    {
-                        ledgerMutex.ReleaseMutex();
-                    }
-                }
-            }
-        }
-
         public void Dispose()
         {
-            try
-            {
-                SetPolicy(false);
-            }
-            catch
-            {
-            }
             try
             {
                 deviceEnumerator.UnregisterEndpointNotificationCallback(endpointNotification);
@@ -1389,9 +1023,9 @@ namespace CarbonStudioAudioGuard
             string initialPolicy)
         {
             string identity = processId.ToString() + "-" + creationFileTime.ToString();
-            string pipeName = "carbon-studio-audio-v2-" + identity;
+            string pipeName = "carbon-studio-audio-v4-" + identity;
             bool ownsMutex = false;
-            using (Mutex singleton = new Mutex(true, "Local\\CarbonStudioAudio-v2-" + identity, out ownsMutex))
+            using (Mutex singleton = new Mutex(true, "Local\\CarbonStudioAudio-v4-" + identity, out ownsMutex))
             {
                 if (!ownsMutex)
                 {
@@ -1405,7 +1039,6 @@ namespace CarbonStudioAudioGuard
                     }
                     using (AudioGuard guard = new AudioGuard(
                         processId,
-                        creationFileTime,
                         string.Equals(initialPolicy, "muted", StringComparison.Ordinal)))
                     {
                         while (IsExactProcess(processId, expectedExecutable, creationFileTime))

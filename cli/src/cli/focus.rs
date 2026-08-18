@@ -113,54 +113,33 @@ impl Focus {
 			for warning in plan.warnings {
 				crate::carbon_warn!("{warning}");
 			}
+			studio::set_studio_parking_policy(&plan.target, studio::StudioParkingPolicy::Parked)
+				.with_context(|| format!("failed to mute the selected Studio before routing desktops for {target}"))?;
 			let mut guarded_peers = Vec::new();
 			let mut guarded_sessions = 0;
 			let mut newly_muted_sessions = 0;
 			let mut guarded_threads = 0;
 			for placement in plan.peers {
-				match studio::set_studio_parking_policy(&placement.process, studio::StudioParkingPolicy::Parked) {
-					Ok(guard) => {
-						guarded_sessions += guard.audio.matched_sessions;
-						newly_muted_sessions += guard.audio.changed_sessions;
-						guarded_threads += guard.guarded_threads;
-						guarded_peers.push(placement);
-					}
-					Err(error) => crate::carbon_warn!(
-						"Did not park sibling Studio PID {} because its parking guard failed: {error:#}",
-						placement.process.process_id
-					),
-				}
+				let guard = studio::set_studio_parking_policy(
+                    &placement.process,
+                    studio::StudioParkingPolicy::Parked,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to mute sibling Studio PID {} before focusing {target}; already guarded Studios remain parked",
+                        placement.process.process_id
+                    )
+                })?;
+				guarded_sessions += guard.audio.matched_sessions;
+				newly_muted_sessions += guard.audio.changed_sessions;
+				guarded_threads += guard.guarded_threads;
+				guarded_peers.push(placement);
 			}
-			let report = match studio::arrange_studios_for_focus(&plan.target, &guarded_peers) {
-				Ok(report) => report,
-				Err(error) => {
-					for placement in &guarded_peers {
-						if let Err(restore_error) =
-							studio::set_studio_parking_policy(&placement.process, studio::StudioParkingPolicy::Active)
-						{
-							crate::carbon_warn!(
-								"Could not release Studio PID {} parking guard after desktop routing failed: {restore_error:#}",
-								placement.process.process_id
-							);
-						}
-					}
-					return Err(error).with_context(|| format!("failed to route Studio desktops for {target}"));
-				}
-			};
-			for placement in &guarded_peers {
-				if !report.parked_process_ids.contains(&placement.process.process_id) {
-					match studio::set_studio_parking_policy(&placement.process, studio::StudioParkingPolicy::Active) {
-						Ok(_) => {}
-						Err(error) => crate::carbon_warn!(
-							"Could not release Studio PID {} parking guard after it failed to park: {error:#}",
-							placement.process.process_id
-						),
-					}
-				}
-			}
+			let report = studio::arrange_studios_for_focus(&plan.target, &guarded_peers).with_context(|| {
+				format!("failed to route Studio desktops for {target}; all selected Studios remain parked and muted")
+			})?;
 			let parked_processes = guarded_peers
 				.iter()
-				.filter(|placement| report.parked_process_ids.contains(&placement.process.process_id))
 				.map(|placement| placement.process.clone())
 				.collect::<Vec<_>>();
 			let target_guard = studio::set_studio_parking_policy(&plan.target, studio::StudioParkingPolicy::Active)

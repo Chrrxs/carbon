@@ -31,6 +31,9 @@ const STUDIO_AUDIO_GUARD_SCRIPT: &str = include_str!("studio_audio_guard.ps1");
 const STUDIO_WINDOW_GUARD_SCRIPT: &str = include_str!("studio_window_guard.ps1");
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const STUDIO_WINDOW_GUARD_HOOK: &[u8] = include_bytes!("../native/carbon_studio_window_guard_hook.dll");
+#[cfg(test)]
+const STRICT_TEST_WINDOW_GUARD_HOOK: &[u8] =
+	include_bytes!("../tests/fixtures/carbon_studio_window_guard_strict_hook.dll");
 
 #[derive(Clone)]
 struct McpLifecycle {
@@ -425,7 +428,7 @@ pub(crate) enum StudioParkingPolicy {
 pub(crate) struct StudioAudioPolicyReport {
 	pub(crate) matched_sessions: usize,
 	pub(crate) changed_sessions: usize,
-	pub(crate) remaining_owned_mutes: usize,
+	pub(crate) remaining_mismatched_sessions: usize,
 	pub(crate) failed_sessions: usize,
 }
 
@@ -1343,14 +1346,13 @@ fn verify_studio_audio_policy_report(
 		report.failed_sessions,
 		process.process_id
 	);
-	if policy == StudioAudioPolicy::Audible {
-		ensure!(
-			report.remaining_owned_mutes == 0,
-			"Carbon Studio audio guard left {} Carbon-owned session(s) muted for PID {}",
-			report.remaining_owned_mutes,
-			process.process_id
-		);
-	}
+	ensure!(
+		report.remaining_mismatched_sessions == 0,
+		"Carbon Studio audio guard left {} session(s) outside the {} policy for PID {}",
+		report.remaining_mismatched_sessions,
+		policy.as_str(),
+		process.process_id
+	);
 	Ok(report)
 }
 
@@ -1488,29 +1490,20 @@ pub(crate) fn set_studio_parking_policy(
 ) -> Result<StudioParkingPolicyReport> {
 	match policy {
 		StudioParkingPolicy::Parked => {
+			let audio = set_studio_audio_policy(process, StudioAudioPolicy::Parked)
+				.context("failed to enforce parked Studio audio")?;
 			let window = set_studio_window_policy(process, StudioWindowPolicy::Parked)
-				.context("failed to guard parked Studio window activation")?;
-			let audio = match set_studio_audio_policy(process, StudioAudioPolicy::Parked) {
-				Ok(audio) => audio,
-				Err(error) => {
-					return match set_studio_window_policy(process, StudioWindowPolicy::Active) {
-						Ok(_) => Err(error.context("parked Studio audio failed; window guard rollback completed")),
-						Err(rollback_error) => Err(error.context(format!(
-							"parked Studio audio failed and window guard rollback also failed: {rollback_error:#}"
-						))),
-					};
-				}
-			};
+				.context("failed to guard parked Studio window activation after muting it")?;
 			Ok(StudioParkingPolicyReport {
 				audio,
 				guarded_threads: window.guarded_threads,
 			})
 		}
 		StudioParkingPolicy::Active => {
-			let window = set_studio_window_policy(process, StudioWindowPolicy::Active)
-				.context("failed to release parked Studio window activation guard")?;
 			let audio = set_studio_audio_policy(process, StudioAudioPolicy::Audible)
-				.context("failed to restore active Studio audio")?;
+				.context("failed to enforce active Studio audio")?;
+			let window = set_studio_window_policy(process, StudioWindowPolicy::Active)
+				.context("failed to release parked Studio window activation guard after making it audible")?;
 			Ok(StudioParkingPolicyReport {
 				audio,
 				guarded_threads: window.guarded_threads,
@@ -2724,23 +2717,23 @@ mod tests {
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
-	fn parked_audio_guard_persists_for_late_sessions_and_owns_only_its_mutes() {
+	fn studio_audio_guard_persists_and_enforces_exact_process_policy() {
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("IAudioSessionNotification"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("RegisterSessionNotification"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetCount"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("EnumAudioEndpoints"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetProcessId"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetSessionIdentifier"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetSessionInstanceIdentifier"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("GetMute"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("SetMute"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbonOwnedMutes"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("eventContext"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (!isMuted)"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (!carbonOwnedMutes.Contains(session.OwnershipKey))"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("remaining_owned_mutes"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("if (isMuted == muted)"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("remaining_mismatched_sessions"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbon-studio-audio-v4-"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbon-studio-audio-v3-"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("carbon-studio-audio-v2-"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Set-LegacyGuardAudible"));
-		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("TryTransferEndpointOwnership"));
+		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Set-PreviousGuardsAudible"));
+		assert!(!STUDIO_AUDIO_GUARD_SCRIPT.contains("carbonOwnedMutes"));
 		assert!(STUDIO_AUDIO_GUARD_SCRIPT.contains("Start-Process @start"));
 	}
 
@@ -2805,7 +2798,7 @@ mod tests {
 	}
 
 	#[test]
-	fn audible_audio_policy_rejects_unrestored_carbon_mutes() {
+	fn audio_policy_rejects_mismatched_sessions() {
 		let process = StudioProcessIdentity {
 			process_id: 47_312,
 			studio_executable: r"C:\Roblox\RobloxStudioBeta.exe".to_owned(),
@@ -2817,13 +2810,13 @@ mod tests {
 			StudioAudioPolicyReport {
 				matched_sessions: 1,
 				changed_sessions: 0,
-				remaining_owned_mutes: 1,
+				remaining_mismatched_sessions: 1,
 				failed_sessions: 0,
 			},
 		)
 		.unwrap_err();
 
-		assert!(format!("{error:#}").contains("left 1 Carbon-owned session(s) muted for PID 47312"));
+		assert!(format!("{error:#}").contains("left 1 session(s) outside the audible policy for PID 47312"));
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2876,7 +2869,7 @@ mod tests {
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
-	fn parked_studio_regressions_restore_owned_audio_after_session_identity_changes() {
+	fn focused_studio_audio_policy_forces_audible_across_session_replacement() {
 		#[cfg(target_os = "linux")]
 		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
 			return;
@@ -2918,20 +2911,76 @@ mod tests {
 
 		let report: Value = serde_json::from_slice(&output.stdout).unwrap();
 		assert_eq!(report["policy"], "audible");
-		assert_eq!(report["session_identity_changed"], true);
-		assert_eq!(report["muted_after_identity_change_restore"], false);
 		assert_eq!(report["stable_session_preserved"], true);
 		assert_eq!(report["instance_replaced"], true);
 		assert_eq!(report["process_replaced"], true);
 		assert_eq!(report["muted_after_restore"], false);
-		assert_eq!(report["remaining_owned_mutes"], 0);
+		assert_eq!(report["remaining_mismatched_sessions"], 0);
 		assert_eq!(report["failed_sessions"], 0);
-		assert_eq!(report["user_mute_preserved"], true);
+		assert_eq!(report["manual_mute_forced_audible"], true);
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	#[test]
-	fn parked_studio_regressions_block_programmatic_self_focus_until_unparked() {
+	fn parked_studio_regressions_restore_inherited_audio_with_a_live_owner() {
+		#[cfg(target_os = "linux")]
+		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
+			return;
+		}
+
+		let temporary = tempfile::tempdir().unwrap();
+		let guard_script = temporary.path().join("studio-audio-guard.ps1");
+		let harness_script = temporary.path().join("studio-audio-guard-replacement.ps1");
+		fs::write(&guard_script, STUDIO_AUDIO_GUARD_SCRIPT).unwrap();
+		fs::write(
+			&harness_script,
+			include_str!("../tests/fixtures/studio_audio_guard_replacement.ps1"),
+		)
+		.unwrap();
+
+		let guard_script = native_windows_helper_path(&guard_script).unwrap();
+		let harness_script = native_windows_helper_path(&harness_script).unwrap();
+		let output = powershell_command()
+			.unwrap()
+			.args([
+				"-Mta",
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				&harness_script,
+				"-GuardScript",
+				&guard_script,
+				"-ConcurrentLiveOwner",
+			])
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"concurrent-session guard failed\nstdout:\n{}\nstderr:\n{}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr),
+		);
+
+		let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+		assert_eq!(report["policy"], "audible");
+		assert_eq!(report["same_stable_session"], true);
+		assert_eq!(report["different_session_instance"], true);
+		assert_eq!(report["different_process"], true);
+		assert_eq!(report["inherited_mute"], true);
+		assert!(report["changed_sessions"].as_u64().is_some());
+		assert_eq!(report["focused_muted_after_restore"], false);
+		assert_eq!(report["parked_owner_muted_after_restore"], true);
+		assert_eq!(report["parked_drift_reconciled"], true);
+		assert_eq!(report["focused_drift_reconciled"], true);
+		assert_eq!(report["remaining_mismatched_sessions"], 0);
+		assert_eq!(report["failed_sessions"], 0);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	#[test]
+	fn parked_studio_regressions_install_and_remove_activation_veto() {
 		#[cfg(target_os = "linux")]
 		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
 			return;
@@ -2942,7 +2991,7 @@ mod tests {
 		let hook_library = temporary.path().join("carbon-studio-window-guard-hook.dll");
 		let harness_script = temporary.path().join("studio-window-guard-focus.ps1");
 		fs::write(&guard_script, STUDIO_WINDOW_GUARD_SCRIPT).unwrap();
-		fs::write(&hook_library, STUDIO_WINDOW_GUARD_HOOK).unwrap();
+		fs::write(&hook_library, STRICT_TEST_WINDOW_GUARD_HOOK).unwrap();
 		fs::write(
 			&harness_script,
 			include_str!("../tests/fixtures/studio_window_guard_focus.ps1"),
@@ -2981,8 +3030,7 @@ mod tests {
 		assert!(report["parked_guarded_threads"].as_u64().unwrap() >= 1);
 		assert_eq!(report["active_policy"], "active");
 		assert_eq!(report["active_guarded_threads"], 0);
-		assert_eq!(report["self_activation_blocked"], true);
-		assert_eq!(report["active_self_activation_allowed"], true);
+		assert_eq!(report["strict_hook_blocks_activation"], true);
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]

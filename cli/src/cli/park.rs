@@ -50,22 +50,9 @@ impl Park {
 		let _focus_lock = studio::acquire_focus_lock()?;
 		let guard = studio::set_studio_parking_policy(&placement.process, studio::StudioParkingPolicy::Parked)
 			.with_context(|| format!("failed to guard parked Studio for {target}"))?;
-		let report = match studio::park_studio(&placement) {
-			Ok(report) => report,
-			Err(error) => {
-				return match studio::set_studio_parking_policy(
-					&placement.process,
-					studio::StudioParkingPolicy::Active,
-				) {
-					Ok(_) => Err(error.context(format!(
-						"failed to park the Studio process registered for {target}; parking guard rollback completed"
-					))),
-					Err(rollback_error) => Err(error.context(format!(
-						"failed to park the Studio process registered for {target}; parking guard rollback also failed: {rollback_error:#}"
-					))),
-				};
-			}
-		};
+		let report = studio::park_studio(&placement).with_context(|| {
+			format!("failed to move the Studio process registered for {target}; it remains muted and guarded for retry")
+		})?;
 		for warning in report.warnings {
 			crate::carbon_warn!("{warning}");
 		}

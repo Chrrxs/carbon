@@ -86,17 +86,21 @@ unsupported desktop fails the launch and cleans up the new Studio process.
 Parking also guards Studio audio by default; there is no separate audio setting.
 Carbon mutes shared-mode render sessions belonging to the exact parked Studio
 process on every active output device and keeps a Windows Core Audio guardian
-alive for streams created later. Focusing that Studio restores only mute states
-that Carbon changed, so a session that was already user-muted stays muted.
-Carbon carries that ownership through Windows' persisted replacement audio
-sessions, including a changed session identifier or a replacement Studio process
-at the same executable path, and verifies that no Carbon-owned mute remains
-before focus reports success.
+alive for streams created later. The policy is authoritative for managed Studio
+processes: parked always means muted, and Carbon-focused always means audible.
+`carbon focus` therefore clears even a persisted or manually applied mixer mute
+on the selected Studio, while `carbon park` reapplies mute if it was manually
+cleared. Carbon keys each live stream by its Core Audio session-instance ID,
+reconciles late and replacement streams, reads the resulting mute state back,
+and reports success only when every discovered stream matches the requested
+policy. Desktop-routing failures leave affected Studios muted so retrying is
+safe.
 
 Parking also keeps an exact-process Windows activation guardian alive. The
 guardian installs a CBT veto only on the parked Studio's UI threads, so Studio
 cannot make itself foreground when playtest state changes or another internal
-action requests activation. Mouse activation and Alt+Tab remain user-controlled.
+action requests activation. Direct mouse activation over that Studio and Alt+Tab
+remain user-controlled.
 Carbon removes every veto before it focuses or unparks that Studio. The guardian
 revalidates the process executable and creation time throughout its lifetime and
 exits with the exact Studio process generation.

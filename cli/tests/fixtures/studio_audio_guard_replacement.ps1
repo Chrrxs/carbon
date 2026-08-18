@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$GuardScript
+    [string]$GuardScript,
+
+    [switch]$ConcurrentLiveOwner
 )
 
 $ErrorActionPreference = 'Stop'
@@ -376,8 +378,13 @@ public static class CarbonAudioReplacementProbe
 }
 '@
 
-function Invoke-WithDeadline([scriptblock]$Operation, [scriptblock]$Accept, [string]$Description) {
-    $deadline = [DateTime]::UtcNow.AddSeconds(12)
+function Invoke-WithDeadline(
+    [scriptblock]$Operation,
+    [scriptblock]$Accept,
+    [string]$Description,
+    [int]$TimeoutMilliseconds = 12000
+) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
     do {
         $value = & $Operation
         if (& $Accept $value) {
@@ -471,14 +478,153 @@ function Stop-AudioGuard([int]$TargetProcessId) {
     }
 }
 
+if ($ConcurrentLiveOwner) {
+    $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("carbon-audio-concurrent-" + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
+    $fixtureExecutable = Join-Path $temporaryDirectory 'CarbonAudioReplacementFixture.exe'
+    $ownerFixture = $null
+    $focusedFixture = $null
+    $ownerProcessId = 0
+    $ownerCreationFileTime = 0
+    $focusedProcessId = 0
+    $focusedCreationFileTime = 0
+    $ownerGuardStarted = $false
+    $focusedGuardStarted = $false
+    try {
+        Add-Type -TypeDefinition $fixtureSource -Language CSharp -OutputAssembly $fixtureExecutable -OutputType ConsoleApplication
+        Add-Type -TypeDefinition $probeSource -Language CSharp
+        $encodedExecutable = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($fixtureExecutable))
+
+        $ownerFixture = Start-AudioFixture $fixtureExecutable
+        $ownerProcessId = $ownerFixture.Id
+        $ownerCreationFileTime = [CarbonAudioReplacementProbe]::CreationFileTime($ownerProcessId)
+        $fixture = $ownerFixture
+        $creationFileTime = $ownerCreationFileTime
+        $ownerSession = Invoke-WithDeadline `
+            { @([CarbonAudioReplacementProbe]::Find($ownerProcessId)) } `
+            { param($sessions) @($sessions).Count -eq 1 } `
+            'the owning fixture audio session'
+
+        Invoke-Guard 'spawn' 'audible'
+        $ownerGuardStarted = $true
+        $ownerMuted = Invoke-Guard 'command' 'muted'
+        if ($ownerMuted.matched_sessions -lt 1 -or $ownerMuted.remaining_mismatched_sessions -ne 0 -or $ownerMuted.failed_sessions -ne 0) {
+            throw "Carbon did not enforce the live parked mute: $($ownerMuted | ConvertTo-Json -Compress)"
+        }
+        $ownerSession = Invoke-WithDeadline `
+            { @([CarbonAudioReplacementProbe]::Find($ownerProcessId)) } `
+            { param($sessions) @($sessions).Count -eq 1 -and @($sessions)[0].Muted } `
+            'Carbon to mute the live owner session'
+
+        $focusedFixture = Start-AudioFixture $fixtureExecutable
+        $focusedProcessId = $focusedFixture.Id
+        $focusedCreationFileTime = [CarbonAudioReplacementProbe]::CreationFileTime($focusedProcessId)
+        $inherited = Invoke-WithDeadline `
+            { @([CarbonAudioReplacementProbe]::Find($focusedProcessId)) } `
+            {
+                param($sessions)
+                @($sessions).Count -eq 1 -and
+                    @($sessions)[0].SessionId -eq @($ownerSession)[0].SessionId -and
+                    @($sessions)[0].InstanceId -ne @($ownerSession)[0].InstanceId
+            } `
+            'a concurrent fixture with the same stable audio session'
+        if (-not @($inherited)[0].Muted) {
+            # SoundPlayer does not apply the persisted mute while the original
+            # process is still active. Put its real CoreAudio session into the
+            # state observed for concurrent Roblox Studio processes instead.
+            if ([CarbonAudioReplacementProbe]::SetMute($focusedProcessId, $true) -ne 1) {
+                throw 'The fixture could not reproduce the inherited Carbon mute'
+            }
+            $inherited = Invoke-WithDeadline `
+                { @([CarbonAudioReplacementProbe]::Find($focusedProcessId)) } `
+                { param($sessions) @($sessions).Count -eq 1 -and @($sessions)[0].Muted } `
+                'the concurrent fixture to reproduce the inherited Carbon mute'
+        }
+
+        $fixture = $focusedFixture
+        $creationFileTime = $focusedCreationFileTime
+        Invoke-Guard 'spawn' 'muted'
+        $focusedGuardStarted = $true
+        $audible = Invoke-Guard 'command' 'audible'
+        $audibleJson = $audible | ConvertTo-Json -Compress
+        $restored = Invoke-WithDeadline `
+            { @([CarbonAudioReplacementProbe]::Find($focusedProcessId)) } `
+            { param($sessions) @($sessions).Count -eq 1 -and -not @($sessions)[0].Muted } `
+            "Carbon to restore a concurrent inherited mute after acknowledging $audibleJson" `
+            3000
+        $ownerAfterRestore = @([CarbonAudioReplacementProbe]::Find($ownerProcessId))
+        if ($ownerAfterRestore.Count -ne 1 -or -not $ownerAfterRestore[0].Muted) {
+            throw 'Restoring the focused concurrent session also unmuted its parked owner'
+        }
+
+        if ([CarbonAudioReplacementProbe]::SetMute($ownerProcessId, $false) -ne 1) {
+            throw 'The fixture could not introduce parked-session audio drift'
+        }
+        $ownerReconciled = Invoke-WithDeadline `
+            { @([CarbonAudioReplacementProbe]::Find($ownerProcessId)) } `
+            { param($sessions) @($sessions).Count -eq 1 -and @($sessions)[0].Muted } `
+            'the parked guard to reapply mute without another Carbon command' `
+            3000
+
+        if ([CarbonAudioReplacementProbe]::SetMute($focusedProcessId, $true) -ne 1) {
+            throw 'The fixture could not introduce focused-session audio drift'
+        }
+        $focusedReconciled = Invoke-WithDeadline `
+            { @([CarbonAudioReplacementProbe]::Find($focusedProcessId)) } `
+            { param($sessions) @($sessions).Count -eq 1 -and -not @($sessions)[0].Muted } `
+            'the focused guard to restore audio without another Carbon command' `
+            3000
+
+        [pscustomobject]@{
+            policy = $audible.policy
+            same_stable_session = @($restored)[0].SessionId -eq @($ownerSession)[0].SessionId
+            different_session_instance = @($restored)[0].InstanceId -ne @($ownerSession)[0].InstanceId
+            different_process = $focusedProcessId -ne $ownerProcessId
+            inherited_mute = @($inherited)[0].Muted
+            changed_sessions = $audible.changed_sessions
+            focused_muted_after_restore = @($restored)[0].Muted
+            parked_owner_muted_after_restore = $ownerAfterRestore[0].Muted
+            parked_drift_reconciled = @($ownerReconciled)[0].Muted
+            focused_drift_reconciled = -not @($focusedReconciled)[0].Muted
+            remaining_mismatched_sessions = $audible.remaining_mismatched_sessions
+            failed_sessions = $audible.failed_sessions
+        } | ConvertTo-Json -Compress
+    } finally {
+        if ($focusedGuardStarted -and $focusedProcessId -ne 0) {
+            try { Stop-AudioGuard $focusedProcessId } catch { }
+        }
+        if ($ownerGuardStarted -and $ownerProcessId -ne 0) {
+            try { Stop-AudioGuard $ownerProcessId } catch { }
+        }
+        foreach ($candidate in @($focusedFixture, $ownerFixture)) {
+            if ($null -eq $candidate) {
+                continue
+            }
+            try {
+                if (-not $candidate.HasExited) {
+                    $candidate.StandardInput.WriteLine('exit')
+                    $candidate.StandardInput.Flush()
+                    if (-not $candidate.WaitForExit(5000)) {
+                        $candidate.Kill()
+                        $candidate.WaitForExit()
+                    }
+                }
+            } catch {
+                try { $candidate.Kill() } catch { }
+            }
+            $candidate.Dispose()
+        }
+        Start-Sleep -Milliseconds 250
+        Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    exit
+}
+
 $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("carbon-audio-replacement-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
 $fixtureExecutable = Join-Path $temporaryDirectory 'CarbonAudioReplacementFixture.exe'
 $fixture = $null
 $firstProcessId = 0
-$firstCreationFileTime = 0
-$secondProcessId = 0
-$secondCreationFileTime = 0
 try {
     Add-Type -TypeDefinition $fixtureSource -Language CSharp -OutputAssembly $fixtureExecutable -OutputType ConsoleApplication
     Add-Type -TypeDefinition $probeSource -Language CSharp
@@ -486,7 +632,6 @@ try {
     $fixture = Start-AudioFixture $fixtureExecutable
     $creationFileTime = [CarbonAudioReplacementProbe]::CreationFileTime($fixture.Id)
     $firstProcessId = $fixture.Id
-    $firstCreationFileTime = $creationFileTime
     $encodedExecutable = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($fixtureExecutable))
     Invoke-WithDeadline `
         { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
@@ -495,39 +640,14 @@ try {
 
     Invoke-Guard 'spawn' 'audible'
     $muted = Invoke-Guard 'command' 'muted'
-    if ($muted.matched_sessions -lt 1 -or $muted.changed_sessions -ne 1) {
-        throw "Carbon did not establish ownership of the first mute: $($muted | ConvertTo-Json -Compress)"
+    if ($muted.matched_sessions -lt 1 -or $muted.remaining_mismatched_sessions -ne 0 -or $muted.failed_sessions -ne 0) {
+        throw "Carbon did not enforce the first parked mute: $($muted | ConvertTo-Json -Compress)"
     }
     $firstMuted = Invoke-WithDeadline `
         { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
         { param($sessions) @($sessions).Count -eq 1 -and @($sessions)[0].Muted } `
         'Carbon to mute the first fixture audio session'
 
-    Stop-AudioGuard $fixture.Id
-    $ledger = Join-Path $env:LOCALAPPDATA "Carbon\audio-guards\$firstProcessId-$firstCreationFileTime.owned"
-    $changedSessionId = @($firstMuted)[0].SessionId + '-replacement'
-    $changedOwnershipKey = @($firstMuted)[0].EndpointId + "`n" + $changedSessionId
-    $changedOwnershipLine = 'v2:' + [Convert]::ToBase64String(
-        [Text.Encoding]::UTF8.GetBytes($changedOwnershipKey)
-    )
-    [IO.File]::WriteAllText($ledger, $changedOwnershipLine + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-
-    Invoke-Guard 'spawn' 'audible'
-    $identityChangedAudible = Invoke-Guard 'command' 'audible'
-    $identityChangedAudibleJson = $identityChangedAudible | ConvertTo-Json -Compress
-    $identityChangedRestored = Invoke-WithDeadline `
-        { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
-        { param($sessions) @($sessions).Count -eq 1 -and -not @($sessions)[0].Muted } `
-        "Carbon to restore audio whose owned session identity changed after acknowledging $identityChangedAudibleJson"
-
-    $reparked = Invoke-Guard 'command' 'muted'
-    if ($reparked.matched_sessions -lt 1 -or $reparked.changed_sessions -ne 1) {
-        throw "Carbon did not re-establish mute ownership after the identity-change check: $($reparked | ConvertTo-Json -Compress)"
-    }
-    $firstMuted = Invoke-WithDeadline `
-        { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
-        { param($sessions) @($sessions).Count -eq 1 -and @($sessions)[0].Muted } `
-        'Carbon to re-mute the first fixture audio session'
     Stop-AudioGuard $fixture.Id
 
     $fixture.Kill()
@@ -539,8 +659,6 @@ try {
 
     $fixture = Start-AudioFixture $fixtureExecutable
     $creationFileTime = [CarbonAudioReplacementProbe]::CreationFileTime($fixture.Id)
-    $secondProcessId = $fixture.Id
-    $secondCreationFileTime = $creationFileTime
     $replacement = Invoke-WithDeadline `
         { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
         {
@@ -551,7 +669,13 @@ try {
         } `
         'a replacement fixture audio-session instance'
     if (-not @($replacement)[0].Muted) {
-        throw 'The replacement audio session did not inherit Carbon''s mute, so the regression was not exercised'
+        if ([CarbonAudioReplacementProbe]::SetMute($fixture.Id, $true) -ne 1) {
+            throw 'The fixture could not reproduce a persisted replacement-session mute'
+        }
+        $replacement = Invoke-WithDeadline `
+            { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
+            { param($sessions) @($sessions).Count -eq 1 -and @($sessions)[0].Muted } `
+            'the replacement fixture to reproduce a persisted mute'
     }
 
     Invoke-Guard 'spawn' 'audible'
@@ -563,7 +687,7 @@ try {
         "Carbon to restore the replacement audio session after acknowledging $audibleJson"
 
     if ([CarbonAudioReplacementProbe]::SetMute($fixture.Id, $true) -ne 1) {
-        throw 'The fixture could not establish a user-owned mute'
+        throw 'The fixture could not establish a manual mute on the focused session'
     }
     Invoke-WithDeadline `
         { @([CarbonAudioReplacementProbe]::Find($fixture.Id)) } `
@@ -571,24 +695,22 @@ try {
         'the fixture user mute to become visible' | Out-Null
     $userAudible = Invoke-Guard 'command' 'audible'
     $afterUserAudible = @([CarbonAudioReplacementProbe]::Find($fixture.Id))
-    if ($afterUserAudible.Count -ne 1 -or -not $afterUserAudible[0].Muted) {
-        throw "Carbon changed a user-owned mute: $($userAudible | ConvertTo-Json -Compress)"
+    if ($afterUserAudible.Count -ne 1 -or $afterUserAudible[0].Muted) {
+        throw "Carbon left the focused Studio manually muted: $($userAudible | ConvertTo-Json -Compress)"
     }
     [CarbonAudioReplacementProbe]::SetMute($fixture.Id, $false) | Out-Null
 
     [pscustomobject]@{
         policy = $audible.policy
-        session_identity_changed = $changedSessionId -ne @($identityChangedRestored)[0].SessionId
-        muted_after_identity_change_restore = @($identityChangedRestored)[0].Muted
         matched_sessions = $audible.matched_sessions
         changed_sessions = $audible.changed_sessions
         stable_session_preserved = @($restored)[0].SessionId -eq @($firstMuted)[0].SessionId
         instance_replaced = @($restored)[0].InstanceId -ne @($firstMuted)[0].InstanceId
         process_replaced = $fixture.Id -ne $firstProcessId
         muted_after_restore = @($restored)[0].Muted
-        remaining_owned_mutes = $audible.remaining_owned_mutes
+        remaining_mismatched_sessions = $audible.remaining_mismatched_sessions
         failed_sessions = $audible.failed_sessions
-        user_mute_preserved = $afterUserAudible[0].Muted
+        manual_mute_forced_audible = -not $afterUserAudible[0].Muted
     } | ConvertTo-Json -Compress
 } finally {
     if ($null -ne $fixture) {
@@ -607,13 +729,5 @@ try {
         $fixture.Dispose()
     }
     Start-Sleep -Milliseconds 250
-    if ($firstProcessId -ne 0 -and $firstCreationFileTime -ne 0) {
-        $ledger = Join-Path $env:LOCALAPPDATA "Carbon\audio-guards\$firstProcessId-$firstCreationFileTime.owned"
-        Remove-Item -LiteralPath $ledger -Force -ErrorAction SilentlyContinue
-    }
-    if ($secondProcessId -ne 0 -and $secondCreationFileTime -ne 0) {
-        $ledger = Join-Path $env:LOCALAPPDATA "Carbon\audio-guards\$secondProcessId-$secondCreationFileTime.owned"
-        Remove-Item -LiteralPath $ledger -Force -ErrorAction SilentlyContinue
-    }
     Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }

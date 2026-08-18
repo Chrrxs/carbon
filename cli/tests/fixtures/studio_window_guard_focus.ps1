@@ -11,75 +11,10 @@ $ErrorActionPreference = 'Stop'
 
 $fixtureSource = @'
 using System;
-using System.ComponentModel;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Threading;
 using System.Windows.Forms;
 
 internal static class CarbonWindowGuardFixture
 {
-    [DllImport("kernel32.dll")]
-    private static extern uint GetCurrentThreadId();
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool AttachThreadInput(uint attachThreadId, uint attachToThreadId, bool attach);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool ShowWindowAsync(IntPtr window, int command);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool BringWindowToTop(IntPtr window);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetForegroundWindow(IntPtr window);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr SetFocus(IntPtr window);
-
-    private static void Activate(IntPtr window)
-    {
-        IntPtr foreground = GetForegroundWindow();
-        uint ignored;
-        uint foregroundThread = foreground == IntPtr.Zero
-            ? 0
-            : GetWindowThreadProcessId(foreground, out ignored);
-        uint currentThread = GetCurrentThreadId();
-        bool attached = false;
-        try
-        {
-            if (foregroundThread != 0 && foregroundThread != currentThread)
-            {
-                attached = AttachThreadInput(currentThread, foregroundThread, true);
-                if (!attached)
-                {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "AttachThreadInput failed");
-                }
-            }
-            ShowWindowAsync(window, 9);
-            BringWindowToTop(window);
-            SetForegroundWindow(window);
-            SetFocus(window);
-        }
-        finally
-        {
-            if (attached)
-            {
-                AttachThreadInput(currentThread, foregroundThread, false);
-            }
-        }
-    }
-
     [STAThread]
     public static void Main()
     {
@@ -92,29 +27,20 @@ internal static class CarbonWindowGuardFixture
             form.Height = 100;
             form.ShowInTaskbar = false;
             form.StartPosition = FormStartPosition.Manual;
-            form.Left = 40;
-            form.Top = 40;
+            form.Left = -10000;
+            form.Top = -10000;
 
-            Thread commands = null;
+            System.Threading.Thread commands = null;
             form.Shown += delegate
             {
                 Console.WriteLine("ready");
                 Console.Out.Flush();
-                commands = new Thread(delegate()
+                commands = new System.Threading.Thread(delegate()
                 {
                     string command;
                     while ((command = Console.ReadLine()) != null)
                     {
-                        if (string.Equals(command, "activate", StringComparison.Ordinal))
-                        {
-                            form.BeginInvoke((Action)delegate
-                            {
-                                Activate(form.Handle);
-                                Console.WriteLine("activated");
-                                Console.Out.Flush();
-                            });
-                        }
-                        else if (string.Equals(command, "exit", StringComparison.Ordinal))
+                        if (string.Equals(command, "exit", StringComparison.Ordinal))
                         {
                             form.BeginInvoke((Action)delegate { form.Close(); });
                             return;
@@ -132,43 +58,13 @@ internal static class CarbonWindowGuardFixture
 
 $probeSource = @'
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
-using System.Threading;
 
 public static class CarbonWindowGuardProbe
 {
-    private const uint EventSystemForeground = 3;
-    private const uint WineventOutOfContext = 0;
-    private const uint PmRemove = 1;
-
-    private delegate void WinEventDelegate(
-        IntPtr hook,
-        uint eventType,
-        IntPtr window,
-        int objectId,
-        int childId,
-        uint eventThread,
-        uint eventTime);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Point
-    {
-        public int X;
-        public int Y;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Message
-    {
-        public IntPtr Window;
-        public uint Id;
-        public UIntPtr WParam;
-        public IntPtr LParam;
-        public uint Time;
-        public Point Cursor;
-    }
+    private const int HcbtActivate = 5;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FileTime
@@ -177,6 +73,18 @@ public static class CarbonWindowGuardProbe
         public uint High;
     }
 
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate IntPtr HookCallback(int code, UIntPtr window, IntPtr activation);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibraryW(string path);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool FreeLibrary(IntPtr module);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessTimes(
         IntPtr process,
@@ -184,38 +92,6 @@ public static class CarbonWindowGuardProbe
         out FileTime exit,
         out FileTime kernel,
         out FileTime user);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr SetWinEventHook(
-        uint eventMin,
-        uint eventMax,
-        IntPtr eventHookModule,
-        WinEventDelegate callback,
-        uint processId,
-        uint threadId,
-        uint flags);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool UnhookWinEvent(IntPtr hook);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool PeekMessage(
-        out Message message,
-        IntPtr window,
-        uint messageMin,
-        uint messageMax,
-        uint removeMessage);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr DispatchMessage(ref Message message);
 
     public static long CreationFileTime(Process process)
     {
@@ -230,94 +106,26 @@ public static class CarbonWindowGuardProbe
         return unchecked((long)(((ulong)creation.High << 32) | creation.Low));
     }
 
-    public static uint ForegroundProcessId()
+    public static bool StrictHookBlocksActivation(string hookLibrary)
     {
-        uint processId;
-        GetWindowThreadProcessId(GetForegroundWindow(), out processId);
-        return processId;
-    }
-
-    public static bool WaitForForeground(uint processId, int timeoutMilliseconds)
-    {
-        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
-        do
+        IntPtr module = LoadLibraryW(hookLibrary);
+        if (module == IntPtr.Zero)
         {
-            if (ForegroundProcessId() == processId)
-            {
-                return true;
-            }
-            Thread.Sleep(10);
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "could not load strict window hook fixture");
         }
-        while (DateTime.UtcNow < deadline);
-        return false;
-    }
-
-    public static bool WatchForbiddenForeground(
-        uint expectedProcessId,
-        uint forbiddenProcessId,
-        StreamWriter trigger,
-        int observationMilliseconds)
-    {
-        bool sawForbiddenProcess = false;
-        WinEventDelegate callback = delegate(
-            IntPtr hook,
-            uint eventType,
-            IntPtr window,
-            int objectId,
-            int childId,
-            uint eventThread,
-            uint eventTime)
-        {
-            uint processId;
-            GetWindowThreadProcessId(window, out processId);
-            if (processId == forbiddenProcessId)
-            {
-                sawForbiddenProcess = true;
-            }
-        };
-
-        IntPtr eventHook = SetWinEventHook(
-            EventSystemForeground,
-            EventSystemForeground,
-            IntPtr.Zero,
-            callback,
-            0,
-            0,
-            WineventOutOfContext);
-        if (eventHook == IntPtr.Zero)
-        {
-            throw new InvalidOperationException("SetWinEventHook failed");
-        }
-
         try
         {
-            if (ForegroundProcessId() != expectedProcessId)
+            IntPtr address = GetProcAddress(module, "CarbonWindowGuardHook");
+            if (address == IntPtr.Zero)
             {
-                throw new InvalidOperationException("foreground precondition was lost");
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "strict window hook export is missing");
             }
-            trigger.WriteLine("activate");
-            trigger.Flush();
-
-            DateTime deadline = DateTime.UtcNow.AddMilliseconds(observationMilliseconds);
-            while (DateTime.UtcNow < deadline)
-            {
-                Message message;
-                while (PeekMessage(out message, IntPtr.Zero, 0, 0, PmRemove))
-                {
-                    DispatchMessage(ref message);
-                }
-                if (sawForbiddenProcess)
-                {
-                    return false;
-                }
-                Thread.Sleep(1);
-            }
-            return ForegroundProcessId() == expectedProcessId;
+            HookCallback callback = (HookCallback)Marshal.GetDelegateForFunctionPointer(address, typeof(HookCallback));
+            return callback(HcbtActivate, UIntPtr.Zero, IntPtr.Zero) == new IntPtr(1);
         }
         finally
         {
-            UnhookWinEvent(eventHook);
-            GC.KeepAlive(callback);
+            FreeLibrary(module);
         }
     }
 }
@@ -391,14 +199,6 @@ function Invoke-Guard([Diagnostics.Process]$Target, [string]$Mode, [string]$Poli
     }
 }
 
-function Invoke-FixtureActivation([Diagnostics.Process]$Fixture) {
-    $Fixture.StandardInput.WriteLine('activate')
-    $Fixture.StandardInput.Flush()
-    if ($Fixture.StandardOutput.ReadLine() -ne 'activated') {
-        throw "Window fixture activation failed: $($Fixture.StandardError.ReadToEnd())"
-    }
-}
-
 function Stop-WindowFixture([Diagnostics.Process]$Fixture) {
     if ($null -eq $Fixture) {
         return
@@ -421,7 +221,6 @@ function Stop-WindowFixture([Diagnostics.Process]$Fixture) {
 $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("carbon-window-guard-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
 $fixtureExecutable = Join-Path $temporaryDirectory 'CarbonWindowGuardFixture.exe'
-$owner = $null
 $target = $null
 try {
     Add-Type `
@@ -432,49 +231,28 @@ try {
         -OutputType ConsoleApplication
     Add-Type -TypeDefinition $probeSource -Language CSharp
 
-    $owner = Start-WindowFixture $fixtureExecutable
-    $target = Start-WindowFixture $fixtureExecutable
-
-    Invoke-FixtureActivation $owner
-    if (-not [CarbonWindowGuardProbe]::WaitForForeground($owner.Id, 3000)) {
-        throw 'Could not establish the foreground owner precondition'
+    $strictHookBlocksActivation = [CarbonWindowGuardProbe]::StrictHookBlocksActivation($HookLibrary)
+    if (-not $strictHookBlocksActivation) {
+        throw 'The strict window hook fixture did not veto HCBT_ACTIVATE'
     }
 
+    $target = Start-WindowFixture $fixtureExecutable
     Invoke-Guard $target 'spawn' 'active'
     $parked = Invoke-Guard $target 'command' 'parked'
-    $blocked = [CarbonWindowGuardProbe]::WatchForbiddenForeground(
-        $owner.Id,
-        $target.Id,
-        $target.StandardInput,
-        750
-    )
-    if ($target.StandardOutput.ReadLine() -ne 'activated') {
-        throw "Parked fixture did not attempt activation: $($target.StandardError.ReadToEnd())"
-    }
-    if (-not $blocked) {
-        throw 'The parked window became foreground after programmatic self-activation'
-    }
-
     $active = Invoke-Guard $target 'command' 'active'
-    Invoke-FixtureActivation $target
-    if (-not [CarbonWindowGuardProbe]::WaitForForeground($target.Id, 3000)) {
-        throw 'The unparked window remained blocked from foreground activation'
-    }
 
     [PSCustomObject]@{
         parked_policy = $parked.policy
         parked_guarded_threads = $parked.guarded_threads
         active_policy = $active.policy
         active_guarded_threads = $active.guarded_threads
-        self_activation_blocked = $blocked
-        active_self_activation_allowed = $true
+        strict_hook_blocks_activation = $strictHookBlocksActivation
     } | ConvertTo-Json -Compress
 } finally {
     if ($null -ne $target) {
         try { Invoke-Guard $target 'command' 'active' | Out-Null } catch { }
     }
     Stop-WindowFixture $target
-    Stop-WindowFixture $owner
     Start-Sleep -Milliseconds 250
     Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }

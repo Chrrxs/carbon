@@ -189,6 +189,40 @@ public sealed class CarbonSuspendedProcessFixture : IDisposable
 
 Add-Type -TypeDefinition $source -Language CSharp
 $target = [CarbonSuspendedProcessFixture]::Start()
+$targetProcessId = $target.ProcessId
+$targetCreationFileTime = $target.CreationFileTime
+
+function Wait-AudioGuardExit([uint32]$ProcessId, [int64]$CreationFileTime) {
+    $mutexName = "Local\CarbonStudioAudio-v4-$ProcessId-$CreationFileTime"
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $singleton = $null
+        try {
+            try {
+                $singleton = [Threading.Mutex]::OpenExisting($mutexName)
+            } catch [Threading.WaitHandleCannotBeOpenedException] {
+                return
+            }
+
+            $acquired = $false
+            try {
+                $acquired = $singleton.WaitOne(100)
+            } catch [Threading.AbandonedMutexException] {
+                $acquired = $true
+            }
+            if ($acquired) {
+                $singleton.ReleaseMutex()
+                return
+            }
+        } finally {
+            if ($null -ne $singleton) {
+                $singleton.Dispose()
+            }
+        }
+    }
+    throw "Audio guard did not exit after suspended fixture PID $ProcessId stopped"
+}
+
 try {
     $encodedExecutable = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($target.ExecutablePath))
     $commonArguments = @(
@@ -258,5 +292,9 @@ try {
     }
     $response
 } finally {
-    $target.Dispose()
+    try {
+        $target.Dispose()
+    } finally {
+        Wait-AudioGuardExit $targetProcessId $targetCreationFileTime
+    }
 }
