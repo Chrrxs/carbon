@@ -455,14 +455,38 @@ impl McpClient {
 				response_path.display()
 			)
 		})?;
+		ensure!(
+			envelope.get("isError").and_then(Value::as_bool) != Some(true),
+			"MCP tool {name} reported an error"
+		);
+		let has_call_tool_result_fields =
+			envelope.get("content").is_some() || envelope.get("structuredContent").is_some();
 		let content = envelope
 			.get("content")
-			.and_then(Value::as_array)
-			.context("MCP response contained no content array")?;
-		let mut result = None;
+			.map(|value| {
+				value
+					.as_array()
+					.context("MCP response contained an invalid content field")
+			})
+			.transpose()?;
+		let mut result = envelope
+			.get("structuredContent")
+			.filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+			.cloned();
+		if !has_call_tool_result_fields {
+			ensure!(
+				envelope.as_object().is_some_and(|object| !object.is_empty()),
+				"MCP response contained no structured JSON result"
+			);
+			result = Some(envelope.clone());
+		}
+		ensure!(
+			result.is_some() || content.is_some(),
+			"MCP response contained no structured JSON result"
+		);
 		let mut text_items = Vec::new();
 		let mut attachments = Vec::new();
-		for (index, item) in content.iter().enumerate() {
+		for (index, item) in content.into_iter().flatten().enumerate() {
 			match item.get("type").and_then(Value::as_str) {
 				Some("text") => {
 					let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
@@ -513,7 +537,98 @@ impl McpClient {
 		if let Some(error) = result.get("error").filter(|value| !value.is_null()) {
 			bail!("MCP tool {name} reported error: {error}");
 		}
+		if name == "get_connected_instances" {
+			self.hydrate_connected_instances(&client, &mut result, artifact_stem, &mut attachments)?;
+		}
 		Ok(McpResponse { result, attachments })
+	}
+
+	fn hydrate_connected_instances(
+		&self,
+		client: &Client,
+		result: &mut Value,
+		artifact_stem: &str,
+		attachments: &mut Vec<String>,
+	) -> Result<()> {
+		let Some(compact_instances) = result.get("instances").and_then(Value::as_array).cloned() else {
+			return Ok(());
+		};
+		if compact_instances.is_empty()
+			|| !compact_instances.iter().all(|instance| {
+				instance.get("id").and_then(Value::as_str).is_some()
+					&& instance.get("name").and_then(Value::as_str).is_some()
+					&& instance.get("roles").and_then(Value::as_array).is_some()
+					&& instance.get("instanceId").is_none()
+			}) {
+			return Ok(());
+		}
+
+		let health_url = format!("{}/health", self.base_url.trim_end_matches('/'));
+		let mut request = client.get(&health_url).header("Accept", "application/json");
+		if let Some(token) = &self.auth_token {
+			request = request.header("X-MCP-Auth", token);
+		}
+		let response = request
+			.send()
+			.with_context(|| format!("could not read Roblox Studio MCP health at {health_url}"))?;
+		let status = response.status();
+		let bytes = response.bytes()?;
+		let health_path = self
+			.attachment_dir
+			.join(format!("{}-mcp-health.json", sanitize(artifact_stem)));
+		fs::write(&health_path, &bytes)
+			.with_context(|| format!("failed to retain MCP health evidence at {}", health_path.display()))?;
+		attachments.push(display_path(&health_path));
+		ensure!(
+			status.is_success(),
+			"Roblox Studio MCP health returned HTTP {status}; evidence: {}",
+			health_path.display()
+		);
+		let health: Value = serde_json::from_slice(&bytes).with_context(|| {
+			format!(
+				"Roblox Studio MCP health returned invalid JSON; evidence: {}",
+				health_path.display()
+			)
+		})?;
+		ensure!(
+			health.get("status").and_then(Value::as_str) == Some("ok")
+				&& health.get("service").and_then(Value::as_str) == Some("robloxstudio-mcp"),
+			"Roblox Studio MCP health did not identify a ready broker; evidence: {}",
+			health_path.display()
+		);
+		let detailed_instances = health
+			.get("instances")
+			.and_then(Value::as_array)
+			.context("Roblox Studio MCP health contained no instances array")?;
+		let mut hydrated = Vec::new();
+		for compact in compact_instances {
+			let instance_id = compact.get("id").and_then(Value::as_str).unwrap();
+			let data_model_name = compact.get("name").and_then(Value::as_str).unwrap();
+			for role in compact
+				.get("roles")
+				.and_then(Value::as_array)
+				.into_iter()
+				.flatten()
+				.filter_map(Value::as_str)
+			{
+				if let Some(detailed) = detailed_instances.iter().find(|instance| {
+					instance.get("instanceId").and_then(Value::as_str) == Some(instance_id)
+						&& instance.get("role").and_then(Value::as_str) == Some(role)
+				}) {
+					hydrated.push(detailed.clone());
+				} else {
+					let mut projected = compact.clone();
+					if let Some(object) = projected.as_object_mut() {
+						object.insert("instanceId".to_owned(), Value::String(instance_id.to_owned()));
+						object.insert("dataModelName".to_owned(), Value::String(data_model_name.to_owned()));
+						object.insert("role".to_owned(), Value::String(role.to_owned()));
+					}
+					hydrated.push(projected);
+				}
+			}
+		}
+		result["instances"] = Value::Array(hydrated);
+		Ok(())
 	}
 }
 
@@ -578,12 +693,112 @@ impl RuntimeAdapter for ScriptedRuntime {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::net::TcpListener;
+	use std::net::{TcpListener, TcpStream};
 
 	fn temporary_directory(label: &str) -> PathBuf {
 		let path = std::env::temp_dir().join(format!("carbon-qualify-{label}-{}", uuid::Uuid::new_v4()));
 		fs::create_dir_all(&path).unwrap();
 		path
+	}
+
+	fn write_json_response(mut stream: TcpStream, body: &Value) {
+		let body = serde_json::to_vec(body).unwrap();
+		write!(
+			stream,
+			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+			body.len()
+		)
+		.unwrap();
+		stream.write_all(&body).unwrap();
+	}
+
+	#[test]
+	fn direct_structured_mcp_responses_are_accepted() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let expected = json!({"placeId": 123});
+		let server_expected = expected.clone();
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			let mut request = [0_u8; 4096];
+			let _ = stream.read(&mut request).unwrap();
+			write_json_response(stream, &server_expected);
+		});
+
+		let root = temporary_directory("mcp-direct-structured");
+		let client = McpClient::new(&format!("http://{address}"), root.clone()).unwrap();
+		let response = client
+			.tool("get_place_info", json!({}), Duration::from_secs(2), "direct-mcp")
+			.unwrap();
+		server.join().unwrap();
+
+		assert_eq!(response.result, expected);
+		assert!(response.attachments.is_empty());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn compact_connected_instances_are_hydrated_from_health() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let compact = json!({
+			"instances": [{
+				"id": "anon:qualification-compact",
+				"name": "CarbonQualification.rbxl",
+				"roles": ["edit"],
+			}],
+		});
+		let detailed = json!({
+			"instanceId": "anon:qualification-compact",
+			"role": "edit",
+			"dataModelName": "CarbonQualification.rbxl",
+			"versionMismatch": false,
+		});
+		let server_detailed = detailed.clone();
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			let mut request = [0_u8; 4096];
+			let _ = stream.read(&mut request).unwrap();
+			write_json_response(stream, &compact);
+
+			listener.set_nonblocking(true).unwrap();
+			let deadline = Instant::now() + Duration::from_millis(500);
+			while Instant::now() < deadline {
+				match listener.accept() {
+					Ok((mut stream, _)) => {
+						let _ = stream.read(&mut request).unwrap();
+						write_json_response(
+							stream,
+							&json!({
+								"status": "ok",
+								"service": "robloxstudio-mcp",
+								"instances": [server_detailed],
+							}),
+						);
+						return;
+					}
+					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+						thread::sleep(Duration::from_millis(10));
+					}
+					Err(error) => panic!("health request failed: {error}"),
+				}
+			}
+		});
+
+		let root = temporary_directory("mcp-compact-instances");
+		let client = McpClient::new(&format!("http://{address}"), root.clone()).unwrap();
+		let response = client
+			.tool(
+				"get_connected_instances",
+				json!({}),
+				Duration::from_secs(2),
+				"compact-instances",
+			)
+			.unwrap();
+		server.join().unwrap();
+
+		assert_eq!(response.result["instances"], json!([detailed]));
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]

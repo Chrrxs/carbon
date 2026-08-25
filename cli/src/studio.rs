@@ -625,21 +625,44 @@ fn mcp_tool(endpoint: &str, auth_token: Option<&str>, payload: &Value, timeout: 
 		status.is_success(),
 		"robloxstudio-mcp lifecycle request returned HTTP {status}"
 	);
+	parse_mcp_lifecycle_response(&body)
+}
+
+fn parse_mcp_lifecycle_response(body: &[u8]) -> Result<Value> {
 	let envelope: Value =
-		serde_json::from_slice(&body).context("robloxstudio-mcp lifecycle response was invalid JSON")?;
-	let result = envelope
-		.get("content")
-		.and_then(Value::as_array)
-		.into_iter()
-		.flatten()
-		.filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-		.filter_map(|item| item.get("text").and_then(Value::as_str))
-		.find_map(|text| serde_json::from_str::<Value>(text).ok())
-		.context("robloxstudio-mcp lifecycle response contained no JSON result")?;
+		serde_json::from_slice(body).context("robloxstudio-mcp lifecycle response was invalid JSON")?;
 	ensure!(
-		envelope.get("isError").and_then(Value::as_bool) != Some(true)
-			&& result.get("error").is_none_or(Value::is_null)
-			&& result.get("success").and_then(Value::as_bool) != Some(false),
+		envelope.get("isError").and_then(Value::as_bool) != Some(true),
+		"robloxstudio-mcp rejected the lifecycle request"
+	);
+
+	let is_call_tool_result = envelope.get("content").is_some() || envelope.get("structuredContent").is_some();
+	let result = if is_call_tool_result {
+		envelope
+			.get("structuredContent")
+			.filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+			.cloned()
+			.or_else(|| {
+				envelope
+					.get("content")
+					.and_then(Value::as_array)
+					.into_iter()
+					.flatten()
+					.filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+					.filter_map(|item| item.get("text").and_then(Value::as_str))
+					.filter_map(|text| serde_json::from_str::<Value>(text).ok())
+					.find(|value| value.is_object())
+			})
+			.context("robloxstudio-mcp lifecycle response contained no JSON result")?
+	} else {
+		envelope
+	};
+	ensure!(
+		result.as_object().is_some_and(|object| !object.is_empty()),
+		"robloxstudio-mcp lifecycle response contained no JSON result"
+	);
+	ensure!(
+		result.get("error").is_none_or(Value::is_null) && result.get("success").and_then(Value::as_bool) != Some(false),
 		"robloxstudio-mcp rejected the lifecycle request"
 	);
 	Ok(result)
@@ -2288,11 +2311,8 @@ mod tests {
 		}
 	}
 
-	fn write_json_result(mut stream: TcpStream, result: Value) {
-		let body = serde_json::to_vec(&json!({
-			"content": [{"type": "text", "text": result.to_string()}],
-		}))
-		.unwrap();
+	fn write_json_body(mut stream: TcpStream, body: Value) {
+		let body = serde_json::to_vec(&body).unwrap();
 		write!(
 			stream,
 			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2300,6 +2320,15 @@ mod tests {
 		)
 		.unwrap();
 		stream.write_all(&body).unwrap();
+	}
+
+	fn write_json_result(stream: TcpStream, result: Value) {
+		write_json_body(
+			stream,
+			json!({
+				"content": [{"type": "text", "text": result.to_string()}],
+			}),
+		);
 	}
 
 	fn write_json_error(mut stream: TcpStream, status: &str) {
@@ -2358,6 +2387,81 @@ mod tests {
 			.unwrap()
 			.remove("process_started_at_file_time");
 		assert!(managed_launch_identity(&no_creation_identity).is_err());
+	}
+
+	#[test]
+	fn mcp_tool_accepts_direct_structured_lifecycle_response() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let endpoint = format!("http://{}/mcp/manage_instance", listener.local_addr().unwrap());
+		let expected = json!({
+			"launch_id": "launch-carbon-direct",
+			"managed": true,
+			"state": "launching",
+		});
+		let server_expected = expected.clone();
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			read_json_request(&mut stream);
+			write_json_body(stream, server_expected);
+		});
+
+		let result = mcp_tool(
+			&endpoint,
+			None,
+			&json!({"action": "status", "launch_id": "launch-carbon-direct"}),
+			MCP_LIFECYCLE_TIMEOUT,
+		);
+		server.join().unwrap();
+
+		assert_eq!(result.unwrap(), expected);
+	}
+
+	#[test]
+	fn lifecycle_response_parser_accepts_legacy_call_tool_result_text_projection() {
+		let expected = json!({
+			"launch_id": "launch-carbon-legacy",
+			"managed": true,
+			"state": "launching",
+		});
+		let body = serde_json::to_vec(&json!({
+			"content": [{"type": "text", "text": expected.to_string()}],
+		}))
+		.unwrap();
+
+		assert_eq!(parse_mcp_lifecycle_response(&body).unwrap(), expected);
+	}
+
+	#[test]
+	fn lifecycle_response_parser_rejects_malformed_and_error_results() {
+		let invalid_json = parse_mcp_lifecycle_response(b"not-json").unwrap_err();
+		assert!(format!("{invalid_json:#}").contains("lifecycle response was invalid JSON"));
+
+		for malformed in [
+			json!([]),
+			json!({}),
+			json!({"content": []}),
+			json!({"content": [{"type": "text", "text": "not-json"}]}),
+		] {
+			let body = serde_json::to_vec(&malformed).unwrap();
+			let error = parse_mcp_lifecycle_response(&body).unwrap_err();
+			assert!(format!("{error:#}").contains("lifecycle response contained no JSON result"));
+		}
+
+		for rejected in [
+			json!({"error": "direct lifecycle failure"}),
+			json!({"success": false}),
+			json!({
+				"isError": true,
+				"content": [{"type": "text", "text": r#"{"launch_id":"launch-carbon-error"}"#}],
+			}),
+			json!({
+				"content": [{"type": "text", "text": r#"{"error":"legacy lifecycle failure"}"#}],
+			}),
+		] {
+			let body = serde_json::to_vec(&rejected).unwrap();
+			let error = parse_mcp_lifecycle_response(&body).unwrap_err();
+			assert!(format!("{error:#}").contains("robloxstudio-mcp rejected the lifecycle request"));
+		}
 	}
 
 	#[test]
