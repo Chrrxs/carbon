@@ -553,15 +553,42 @@ impl McpClient {
 		let Some(compact_instances) = result.get("instances").and_then(Value::as_array).cloned() else {
 			return Ok(());
 		};
-		if compact_instances.is_empty()
-			|| !compact_instances.iter().all(|instance| {
-				instance.get("id").and_then(Value::as_str).is_some()
-					&& instance.get("name").and_then(Value::as_str).is_some()
-					&& instance.get("roles").and_then(Value::as_array).is_some()
-					&& instance.get("instanceId").is_none()
-			}) {
+		if compact_instances.is_empty() {
 			return Ok(());
 		}
+		let compact_instances = compact_instances
+			.into_iter()
+			.map(|instance| {
+				if instance.get("instanceId").is_some() {
+					return None;
+				}
+				let instance_id = instance.get("id").and_then(Value::as_str)?.to_owned();
+				let data_model_name = instance.get("name").and_then(Value::as_str).map(str::to_owned);
+				if data_model_name.is_none() && instance.get("placeName").and_then(Value::as_str).is_none() {
+					return None;
+				}
+				let roles = if let Some(roles) = instance.get("roles").and_then(Value::as_array) {
+					roles
+						.iter()
+						.map(|role| role.as_str().map(str::to_owned))
+						.collect::<Option<Vec<_>>>()?
+				} else {
+					instance
+						.get("peers")
+						.and_then(Value::as_object)?
+						.keys()
+						.cloned()
+						.collect()
+				};
+				if roles.is_empty() {
+					return None;
+				}
+				Some((instance, instance_id, data_model_name, roles))
+			})
+			.collect::<Option<Vec<_>>>();
+		let Some(compact_instances) = compact_instances else {
+			return Ok(());
+		};
 
 		let health_url = format!("{}/health", self.base_url.trim_end_matches('/'));
 		let mut request = client.get(&health_url).header("Accept", "application/json");
@@ -596,32 +623,58 @@ impl McpClient {
 			"Roblox Studio MCP health did not identify a ready broker; evidence: {}",
 			health_path.display()
 		);
-		let detailed_instances = health
+		let health_instances = health
 			.get("instances")
 			.and_then(Value::as_array)
 			.context("Roblox Studio MCP health contained no instances array")?;
+		let mut detailed_instances = Vec::new();
+		for instance in health_instances {
+			if instance.get("instanceId").and_then(Value::as_str).is_some() {
+				detailed_instances.push(instance);
+			}
+			if let Some(peers) = instance.get("peers").and_then(Value::as_array) {
+				detailed_instances.extend(peers);
+			}
+		}
+
 		let mut hydrated = Vec::new();
-		for compact in compact_instances {
-			let instance_id = compact.get("id").and_then(Value::as_str).unwrap();
-			let data_model_name = compact.get("name").and_then(Value::as_str).unwrap();
-			for role in compact
-				.get("roles")
-				.and_then(Value::as_array)
-				.into_iter()
-				.flatten()
-				.filter_map(Value::as_str)
-			{
-				if let Some(detailed) = detailed_instances.iter().find(|instance| {
-					instance.get("instanceId").and_then(Value::as_str) == Some(instance_id)
-						&& instance.get("role").and_then(Value::as_str) == Some(role)
+		for (compact, instance_id, data_model_name, roles) in compact_instances {
+			for role in roles {
+				if let Some(detailed) = detailed_instances.iter().copied().find(|instance| {
+					instance.get("instanceId").and_then(Value::as_str) == Some(instance_id.as_str())
+						&& instance.get("role").and_then(Value::as_str) == Some(role.as_str())
 				}) {
-					hydrated.push(detailed.clone());
+					let mut detailed = detailed.clone();
+					if detailed.get("versionMismatch").is_none() {
+						let version_mismatch = match (
+							detailed.get("pluginVersion").and_then(Value::as_str),
+							detailed.get("serverVersion").and_then(Value::as_str),
+						) {
+							(Some(plugin_version), Some(server_version)) => Some(plugin_version != server_version),
+							_ => None,
+						};
+						if let Some(version_mismatch) = version_mismatch {
+							detailed["versionMismatch"] = Value::Bool(version_mismatch);
+						}
+					}
+					hydrated.push(detailed);
 				} else {
+					let peer_id = compact
+						.get("peers")
+						.and_then(Value::as_object)
+						.and_then(|peers| peers.get(&role))
+						.and_then(Value::as_str)
+						.map(str::to_owned);
 					let mut projected = compact.clone();
 					if let Some(object) = projected.as_object_mut() {
-						object.insert("instanceId".to_owned(), Value::String(instance_id.to_owned()));
-						object.insert("dataModelName".to_owned(), Value::String(data_model_name.to_owned()));
-						object.insert("role".to_owned(), Value::String(role.to_owned()));
+						object.insert("instanceId".to_owned(), Value::String(instance_id.clone()));
+						if let Some(data_model_name) = &data_model_name {
+							object.insert("dataModelName".to_owned(), Value::String(data_model_name.clone()));
+						}
+						object.insert("role".to_owned(), Value::String(role));
+						if let Some(peer_id) = peer_id {
+							object.insert("peerId".to_owned(), Value::String(peer_id));
+						}
 					}
 					hydrated.push(projected);
 				}
@@ -801,6 +854,163 @@ mod tests {
 		fs::remove_dir_all(root).unwrap();
 	}
 
+	#[test]
+	fn peer_map_connected_instances_are_hydrated_from_nested_health() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let compact = json!({
+			"instances": [{
+				"id": "instance:qualification-peer-map",
+				"placeId": 0,
+				"placeName": "CarbonQualification.rbxl",
+				"peers": {
+					"edit": "peer:qualification-edit",
+				},
+			}],
+			"multiplayerGroups": [],
+		});
+		let detailed = json!({
+			"instanceId": "instance:qualification-peer-map",
+			"role": "edit",
+			"placeId": 0,
+			"placeName": "CarbonQualification.rbxl",
+			"dataModelName": "CarbonQualification.rbxl",
+			"isRunning": false,
+			"pluginVersion": "3.1.0",
+			"pluginVariant": "main",
+			"serverVersion": "3.1.0",
+			"lastActivity": 1_788_477_988_254_u64,
+			"connectedAt": 1_788_477_478_130_u64,
+		});
+		let expected = json!({
+			"instanceId": "instance:qualification-peer-map",
+			"role": "edit",
+			"placeId": 0,
+			"placeName": "CarbonQualification.rbxl",
+			"dataModelName": "CarbonQualification.rbxl",
+			"isRunning": false,
+			"pluginVersion": "3.1.0",
+			"pluginVariant": "main",
+			"serverVersion": "3.1.0",
+			"versionMismatch": false,
+			"lastActivity": 1_788_477_988_254_u64,
+			"connectedAt": 1_788_477_478_130_u64,
+		});
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			let mut request = [0_u8; 4096];
+			let _ = stream.read(&mut request).unwrap();
+			write_json_response(stream, &compact);
+
+			listener.set_nonblocking(true).unwrap();
+			let deadline = Instant::now() + Duration::from_millis(500);
+			while Instant::now() < deadline {
+				match listener.accept() {
+					Ok((mut stream, _)) => {
+						let _ = stream.read(&mut request).unwrap();
+						write_json_response(
+							stream,
+							&json!({
+								"status": "ok",
+								"service": "robloxstudio-mcp",
+								"instances": [{
+									"id": "instance:qualification-peer-map",
+									"placeId": 0,
+									"placeName": "CarbonQualification.rbxl",
+									"peers": [detailed],
+								}],
+							}),
+						);
+						return;
+					}
+					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+						thread::sleep(Duration::from_millis(10));
+					}
+					Err(error) => panic!("health request failed: {error}"),
+				}
+			}
+		});
+
+		let root = temporary_directory("mcp-peer-map-instances");
+		let client = McpClient::new(&format!("http://{address}"), root.clone()).unwrap();
+		let response = client
+			.tool(
+				"get_connected_instances",
+				json!({}),
+				Duration::from_secs(2),
+				"peer-map-instances",
+			)
+			.unwrap();
+		server.join().unwrap();
+
+		assert_eq!(response.result["instances"], json!([expected]));
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn peer_map_fallback_does_not_invent_a_data_model_name() {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let compact = json!({
+			"instances": [{
+				"id": "instance:qualification-disconnected",
+				"placeId": 123,
+				"placeName": "Published Place Name",
+				"peers": {
+					"edit": "peer:qualification-disconnected",
+				},
+			}],
+			"multiplayerGroups": [],
+		});
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().unwrap();
+			let mut request = [0_u8; 4096];
+			let _ = stream.read(&mut request).unwrap();
+			write_json_response(stream, &compact);
+
+			listener.set_nonblocking(true).unwrap();
+			let deadline = Instant::now() + Duration::from_millis(500);
+			while Instant::now() < deadline {
+				match listener.accept() {
+					Ok((mut stream, _)) => {
+						let _ = stream.read(&mut request).unwrap();
+						write_json_response(
+							stream,
+							&json!({
+								"status": "ok",
+								"service": "robloxstudio-mcp",
+								"instances": [],
+							}),
+						);
+						return;
+					}
+					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+						thread::sleep(Duration::from_millis(10));
+					}
+					Err(error) => panic!("health request failed: {error}"),
+				}
+			}
+		});
+
+		let root = temporary_directory("mcp-peer-map-fallback");
+		let client = McpClient::new(&format!("http://{address}"), root.clone()).unwrap();
+		let response = client
+			.tool(
+				"get_connected_instances",
+				json!({}),
+				Duration::from_secs(2),
+				"peer-map-fallback",
+			)
+			.unwrap();
+		server.join().unwrap();
+
+		let projected = &response.result["instances"][0];
+		assert_eq!(projected["instanceId"], "instance:qualification-disconnected");
+		assert_eq!(projected["role"], "edit");
+		assert_eq!(projected["placeName"], "Published Place Name");
+		assert!(projected.get("dataModelName").is_none());
+		fs::remove_dir_all(root).unwrap();
+	}
 	#[test]
 	fn failed_mcp_responses_are_retained_as_evidence() {
 		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
