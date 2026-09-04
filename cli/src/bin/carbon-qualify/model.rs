@@ -621,13 +621,16 @@ mod tests {
 					"tool": "get_connected_instances",
 					"select": {
 						"pointer": "/instances",
-						"checks": [{
-							"pointer": "/dataModelName",
-							"op": "equals",
-							"value": "qualification-1"
-						}]
+						"checks": [
+							{
+								"pointer": "/placeName",
+								"op": "equals",
+								"value": "qualification-1"
+							},
+							{"pointer": "/peers/edit", "op": "exists"}
+						]
 					},
-					"capture": {"instance": "/instanceId"}
+					"capture": {"instance": "/id"}
 				}]
 			}]
 		}))
@@ -641,6 +644,34 @@ mod tests {
 			.unwrap()
 			.join("qualification/suites/carbon-release.json");
 		serde_json::from_slice(&std::fs::read(suite_path).unwrap()).unwrap()
+	}
+
+	#[test]
+	fn release_suite_uses_current_mcp_instance_contract() {
+		let suite = release_suite();
+		let connection = suite["scenarios"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|scenario| scenario["name"] == "managed-studio-auto-recovery-capture")
+			.unwrap()["steps"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|step| step["name"] == "wait-for-studio-connection")
+			.expect("release suite is missing Studio connection discovery");
+
+		assert_eq!(
+			connection["select"],
+			serde_json::json!({
+				"pointer": "/instances",
+				"checks": [
+					{"pointer": "/placeName", "op": "equals", "value": "${studio_data_model}"},
+					{"pointer": "/peers/edit", "op": "exists"},
+				],
+			})
+		);
+		assert_eq!(connection["capture"], serde_json::json!({"studio_instance": "/id"}));
 	}
 
 	#[test]

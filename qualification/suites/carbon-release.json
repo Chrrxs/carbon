@@ -137,13 +137,12 @@
           "select": {
             "pointer": "/instances",
             "checks": [
-              {"pointer": "/dataModelName", "op": "equals", "value": "${studio_data_model}"},
-              {"pointer": "/role", "op": "equals", "value": "edit"},
-              {"pointer": "/versionMismatch", "op": "equals", "value": false}
+              {"pointer": "/placeName", "op": "equals", "value": "${studio_data_model}"},
+              {"pointer": "/peers/edit", "op": "exists"}
             ]
           },
           "capture": {
-            "studio_instance": "/instanceId"
+            "studio_instance": "/id"
           }
         },
         {

@@ -629,37 +629,14 @@ fn mcp_tool(endpoint: &str, auth_token: Option<&str>, payload: &Value, timeout: 
 }
 
 fn parse_mcp_lifecycle_response(body: &[u8]) -> Result<Value> {
-	let envelope: Value =
-		serde_json::from_slice(body).context("robloxstudio-mcp lifecycle response was invalid JSON")?;
-	ensure!(
-		envelope.get("isError").and_then(Value::as_bool) != Some(true),
-		"robloxstudio-mcp rejected the lifecycle request"
-	);
-
-	let is_call_tool_result = envelope.get("content").is_some() || envelope.get("structuredContent").is_some();
-	let result = if is_call_tool_result {
-		envelope
-			.get("structuredContent")
-			.filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
-			.cloned()
-			.or_else(|| {
-				envelope
-					.get("content")
-					.and_then(Value::as_array)
-					.into_iter()
-					.flatten()
-					.filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-					.filter_map(|item| item.get("text").and_then(Value::as_str))
-					.filter_map(|text| serde_json::from_str::<Value>(text).ok())
-					.find(|value| value.is_object())
-			})
-			.context("robloxstudio-mcp lifecycle response contained no JSON result")?
-	} else {
-		envelope
-	};
+	let result: Value = serde_json::from_slice(body).context("robloxstudio-mcp lifecycle response was invalid JSON")?;
 	ensure!(
 		result.as_object().is_some_and(|object| !object.is_empty()),
-		"robloxstudio-mcp lifecycle response contained no JSON result"
+		"robloxstudio-mcp lifecycle response contained no direct structured JSON result"
+	);
+	ensure!(
+		result.get("content").is_none() && result.get("structuredContent").is_none() && result.get("isError").is_none(),
+		"robloxstudio-mcp lifecycle response used an unsupported protocol envelope"
 	);
 	ensure!(
 		result.get("error").is_none_or(Value::is_null) && result.get("success").and_then(Value::as_bool) != Some(false),
@@ -2323,12 +2300,7 @@ mod tests {
 	}
 
 	fn write_json_result(stream: TcpStream, result: Value) {
-		write_json_body(
-			stream,
-			json!({
-				"content": [{"type": "text", "text": result.to_string()}],
-			}),
-		);
+		write_json_body(stream, result);
 	}
 
 	fn write_json_error(mut stream: TcpStream, status: &str) {
@@ -2417,47 +2389,27 @@ mod tests {
 	}
 
 	#[test]
-	fn lifecycle_response_parser_accepts_legacy_call_tool_result_text_projection() {
-		let expected = json!({
-			"launch_id": "launch-carbon-legacy",
-			"managed": true,
-			"state": "launching",
-		});
-		let body = serde_json::to_vec(&json!({
-			"content": [{"type": "text", "text": expected.to_string()}],
-		}))
-		.unwrap();
-
-		assert_eq!(parse_mcp_lifecycle_response(&body).unwrap(), expected);
-	}
-
-	#[test]
-	fn lifecycle_response_parser_rejects_malformed_and_error_results() {
+	fn lifecycle_response_parser_rejects_non_direct_and_error_results() {
 		let invalid_json = parse_mcp_lifecycle_response(b"not-json").unwrap_err();
 		assert!(format!("{invalid_json:#}").contains("lifecycle response was invalid JSON"));
 
-		for malformed in [
-			json!([]),
-			json!({}),
-			json!({"content": []}),
-			json!({"content": [{"type": "text", "text": "not-json"}]}),
-		] {
+		for malformed in [json!([]), json!({})] {
 			let body = serde_json::to_vec(&malformed).unwrap();
 			let error = parse_mcp_lifecycle_response(&body).unwrap_err();
-			assert!(format!("{error:#}").contains("lifecycle response contained no JSON result"));
+			assert!(format!("{error:#}").contains("contained no direct structured JSON result"));
 		}
 
-		for rejected in [
-			json!({"error": "direct lifecycle failure"}),
-			json!({"success": false}),
-			json!({
-				"isError": true,
-				"content": [{"type": "text", "text": r#"{"launch_id":"launch-carbon-error"}"#}],
-			}),
-			json!({
-				"content": [{"type": "text", "text": r#"{"error":"legacy lifecycle failure"}"#}],
-			}),
+		for envelope in [
+			json!({"content": []}),
+			json!({"structuredContent": {"launch_id": "launch-carbon-envelope"}}),
+			json!({"isError": true}),
 		] {
+			let body = serde_json::to_vec(&envelope).unwrap();
+			let error = parse_mcp_lifecycle_response(&body).unwrap_err();
+			assert!(format!("{error:#}").contains("unsupported protocol envelope"));
+		}
+
+		for rejected in [json!({"error": "direct lifecycle failure"}), json!({"success": false})] {
 			let body = serde_json::to_vec(&rejected).unwrap();
 			let error = parse_mcp_lifecycle_response(&body).unwrap_err();
 			assert!(format!("{error:#}").contains("robloxstudio-mcp rejected the lifecycle request"));

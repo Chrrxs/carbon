@@ -948,7 +948,7 @@ mod tests {
 					"name": "connect",
 					"kind": "mcp",
 					"tool": "get_connected_instances",
-					"capture": {"instance": "/instances/0/instanceId"}
+					"capture": {"instance": "/instances/0/id"}
 				},
 				{
 					"name": "probe",
@@ -961,7 +961,7 @@ mod tests {
 		);
 		let mut runtime = ScriptedRuntime::new(vec![
 			Ok(Observation::Mcp {
-				result: json!({"instances": [{"instanceId": "studio-1"}]}),
+				result: json!({"instances": [{"id": "studio-1"}]}),
 				artifacts: vec![],
 			}),
 			Ok(Observation::Mcp {
@@ -1022,11 +1022,11 @@ mod tests {
 					"select": {
 						"pointer": "/instances",
 						"checks": [
-							{"pointer": "/dataModelName", "op": "equals", "value": "${studio_name}"},
-							{"pointer": "/role", "op": "equals", "value": "edit"}
+							{"pointer": "/placeName", "op": "equals", "value": "${studio_name}"},
+							{"pointer": "/peers/edit", "op": "exists"}
 						]
 					},
-					"capture": {"instance": "/instanceId"}
+					"capture": {"instance": "/id"}
 				},
 				{
 					"name": "probe",
@@ -1040,8 +1040,8 @@ mod tests {
 		let mut runtime = ScriptedRuntime::new(vec![
 			Ok(Observation::Mcp {
 				result: json!({"instances": [
-					{"instanceId": "other", "dataModelName": "other-worktree", "role": "edit"},
-					{"instanceId": "mine", "dataModelName": "qualification-7", "role": "edit"}
+					{"id": "other", "placeName": "other-worktree", "peers": {"edit": "peer-other"}},
+					{"id": "mine", "placeName": "qualification-7", "peers": {"edit": "peer-mine"}}
 				]}),
 				artifacts: vec![],
 			}),
