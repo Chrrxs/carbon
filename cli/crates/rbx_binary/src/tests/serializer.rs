@@ -410,6 +410,64 @@ fn strict_decoder_rejects_unknown_property_type() {
 	assert!(error.to_string().contains("unknown property type ID 0xfe"));
 }
 
+/// Roblox Studio 0.741 began serializing `Terrain.VoxelGridAssetContentMap`
+/// with binary type 0x23 (`AssetContentMap`), even when the map is empty.
+fn studio_0741_asset_content_map_model(payload: &[u8]) -> Vec<u8> {
+	let tree = WeakDom::new(
+		InstanceBuilder::new("Folder")
+			.with_child(InstanceBuilder::new("Terrain").with_property("VoxelGridAssetContentMap", "replaced below")),
+	);
+	let mut buffer = Vec::new();
+	to_writer(&mut buffer, &tree, tree.root().children()).unwrap();
+	mutate_property_chunk(&buffer, "VoxelGridAssetContentMap", |data, type_offset| {
+		data.truncate(type_offset);
+		data.push(0x23);
+		data.extend_from_slice(payload);
+	})
+}
+
+#[test]
+fn studio_0741_empty_asset_content_map_strictly_decodes_as_its_default() {
+	// Byte-for-byte what Studio 0.741 writes for the empty map of a place's Terrain.
+	let model = studio_0741_asset_content_map_model(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+	let decoded = Deserializer::new(test_reflection_database())
+		.strict(true)
+		.deserialize(model.as_slice())
+		.expect("strict decoding rejected Studio 0.741's empty AssetContentMap");
+	let terrain = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+	assert_eq!(terrain.class.as_str(), "Terrain");
+	assert!(!terrain.properties.contains_key(&Ustr::from("VoxelGridAssetContentMap")));
+}
+
+#[test]
+fn studio_0741_populated_asset_content_map_is_rejected_by_strict_decoding() {
+	let mut payload = vec![0x02];
+	payload.extend_from_slice(&1u64.to_le_bytes());
+	payload.extend_from_slice(&4u32.to_le_bytes());
+	payload.extend_from_slice(b"grid");
+	payload.push(0);
+	let model = studio_0741_asset_content_map_model(&payload);
+
+	let error = Deserializer::new(test_reflection_database())
+		.strict(true)
+		.deserialize(model.as_slice())
+		.unwrap_err();
+	assert!(
+		error
+			.to_string()
+			.contains("Terrain.VoxelGridAssetContentMap: only empty AssetContentMap values"),
+		"{}",
+		error
+	);
+
+	let decoded = Deserializer::new(test_reflection_database())
+		.deserialize(model.as_slice())
+		.expect("compatibility decoding should keep skipping unsupported values");
+	let terrain = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+	assert!(!terrain.properties.contains_key(&Ustr::from("VoxelGridAssetContentMap")));
+}
+
 #[test]
 fn strict_decoder_rejects_property_chunks_without_a_type_byte() {
 	let tree = WeakDom::new(InstanceBuilder::new("Folder").with_property("WILL_NEVER_EXIST", "preserve me"));

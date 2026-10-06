@@ -186,6 +186,24 @@ fn deliver_streamed_properties(instance: &mut Instance, sink: &mut dyn DecodeSin
 	Ok(())
 }
 
+/// Binary type ID of Roblox's `AssetContentMap`, which Studio 0.741 began
+/// serializing for `Terrain.VoxelGridAssetContentMap` (rojo-rbx/rbx-dom#610).
+/// rbx_dom_weak has no variant for it, so it is not a [`Type`].
+const ASSET_CONTENT_MAP_TYPE_ID: u8 = 0x23;
+
+/// Studio writes an empty map on a place's single Terrain as `02` followed by
+/// eight zero bytes: one zero little-endian u64 entry count per instance.
+/// That is the property's engine default, so omitting it loses nothing. Any
+/// other payload may hold entries that cannot be represented without loss.
+fn is_empty_asset_content_map_column(payload: &[u8], instance_count: usize) -> bool {
+	match payload.split_first() {
+		Some((0x02, counts)) => {
+			instance_count.checked_mul(8) == Some(counts.len()) && counts.iter().all(|&byte| byte == 0)
+		}
+		_ => false,
+	}
+}
+
 /// Properties may be serialized under different names or types than
 /// they ultimately should have in the DOM. CanonicalProperty
 /// represents the "proper" name and type of a property, and possibly
@@ -497,12 +515,28 @@ impl<'db, 'sink, R: Read> DeserializerState<'db, 'sink, R> {
 
 		let binary_type: Type = match binary_type_byte.try_into() {
 			Ok(ty) => ty,
+			Err(_)
+				if binary_type_byte == ASSET_CONTENT_MAP_TYPE_ID
+					&& is_empty_asset_content_map_column(chunk, type_info.referents.len()) =>
+			{
+				log::trace!(
+					"Omitting default empty AssetContentMap property {}.{}",
+					type_info.type_name,
+					prop_name
+				);
+				return Ok(());
+			}
 			Err(_) => {
 				if self.deserializer.strict {
 					return Err(InnerError::StrictProperty {
 						type_name: type_info.type_name.to_string(),
 						prop_name,
-						reason: format!("unknown property type ID {binary_type_byte:#04x}"),
+						reason: if binary_type_byte == ASSET_CONTENT_MAP_TYPE_ID {
+							"only empty AssetContentMap values (binary type 0x23) can be decoded without loss"
+								.to_owned()
+						} else {
+							format!("unknown property type ID {binary_type_byte:#04x}")
+						},
 					});
 				}
 				if self.unknown_type_ids.insert(binary_type_byte) {

@@ -61,8 +61,6 @@ for _, pair in
 	{
 		{ "Chat", "LoadDefaultChat" },
 		{ "HttpService", "HttpEnabled" },
-		{ "Lighting", "LightingStyle" },
-		{ "Lighting", "PrioritizeLightingQuality" },
 		{ "MeshPart", "HasJointOffset" },
 		{ "MeshPart", "HasSkinnedMesh" },
 		{ "MeshPart", "JointOffset" },
@@ -86,6 +84,18 @@ do
 	assert(
 		table.find(ProtectedProperties.forClass(database, pair[1]), pair[2]) ~= nil,
 		`{pair[1]}.{pair[2]} must remain a protected serialized-property candidate`
+	)
+end
+
+-- Studio 0.741 opened these persistent Lighting settings to plugin writes
+-- (Write security None behind the PluginOrOpenCloud capability), so they now
+-- synchronize as ordinary writable properties instead of being materialized.
+for _, propertyName in { "LightingStyle", "PrioritizeLightingQuality" } do
+	local property = database.Classes.Lighting.Properties[propertyName]
+	assert(property.Scriptability == "ReadWrite", `Lighting.{propertyName} must be writable by plugins`)
+	assert(
+		table.find(ProtectedProperties.forClass(database, "Lighting"), propertyName) == nil,
+		`Lighting.{propertyName} must synchronize as a writable property`
 	)
 end
 
