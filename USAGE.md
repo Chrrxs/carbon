@@ -140,9 +140,19 @@ After Carbon successfully validates an exact-session Studio auto-recovery and
 commits it atomically, it atomically moves that consumed `.rbxl` into the
 `.carbon-consumed` directory beside Roblox's AutoSaves. This keeps consumed
 Carbon recoveries out of Studio's recovery scan while preserving the original
-bytes. Carbon does not archive manual saves, rejected recoveries, unknown
-files, or evidence from a failed capture; an archive failure leaves the source
-in place and emits a warning.
+bytes. Only the 20 most recent archived recoveries are kept; older ones are
+deleted after each archive because their contents are already committed.
+Carbon does not archive manual saves, rejected recoveries, unknown files, or
+evidence from a failed capture; an archive failure leaves the source in place
+and emits a warning.
+
+Builds are cached in the user cache directory (`carbon/builds/v1`). The cache
+keeps the most recently used builds within 2 GiB and evicts the rest.
+
+While a project is built or served, Carbon stages composed source in a
+`.carbon-composite-*` directory beside the project file. Each one has a sibling
+`.lock` file held by the process that owns it, so a composite left behind by a
+crashed or killed process is removed the next time Carbon stages that project.
 
 Managed `serve` requires a loopback `robloxstudio-mcp` that advertises lifecycle
 protocol v3 with exact process identity. The default MCP URL is

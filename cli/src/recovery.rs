@@ -15,6 +15,9 @@ const STABLE_POLLS: usize = 2;
 const MODIFIED_TIME_SLOP: Duration = Duration::from_secs(2);
 const AUTOSAVES_OVERRIDE: &str = "CARBON_STUDIO_AUTOSAVES_DIR";
 const CONSUMED_RECOVERY_DIRECTORY: &str = ".carbon-consumed";
+/// Committed captures already live in the project; only the most recent
+/// originals are kept as evidence for diagnosing a bad capture.
+const CONSUMED_RECOVERY_RETENTION: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryFingerprint {
@@ -186,7 +189,44 @@ pub(crate) fn quarantine_consumed_recovery(kind: RecoveryKind, path: &Path) -> R
 			destination.display()
 		)
 	})?;
+	if let Err(error) = prune_consumed_recoveries(&archive, CONSUMED_RECOVERY_RETENTION, &destination) {
+		log::warn!(
+			"Could not prune the consumed Studio recovery archive {}: {error:#}",
+			archive.display()
+		);
+	}
 	Ok(Some(destination))
+}
+
+/// Delete all but the `keep` most recently written archived recoveries. Only
+/// Carbon's own `.consumed` archives are considered, and `newest` always stays.
+fn prune_consumed_recoveries(archive: &Path, keep: usize, newest: &Path) -> Result<usize> {
+	let mut archived = Vec::new();
+	for entry in fs::read_dir(archive)? {
+		let entry = entry?;
+		let path = entry.path();
+		if path == newest || path.extension().and_then(|extension| extension.to_str()) != Some("consumed") {
+			continue;
+		}
+		match entry.metadata() {
+			Ok(metadata) if metadata.is_file() => {
+				archived.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), path));
+			}
+			_ => {}
+		}
+	}
+	archived.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+	let mut removed = 0;
+	for (_, path) in archived.into_iter().skip(keep.saturating_sub(1)) {
+		match fs::remove_file(&path) {
+			Ok(()) => removed += 1,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => {
+				return Err(error).with_context(|| format!("failed to delete {}", path.display()));
+			}
+		}
+	}
+	Ok(removed)
 }
 
 pub(crate) fn autosaves_dir() -> Result<PathBuf> {
@@ -529,6 +569,44 @@ mod tests {
 			Some("consumed")
 		);
 		assert!(inventory(&directory).unwrap().is_empty());
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn bounded_consumed_recovery_archive_keeps_only_the_newest_captures() {
+		let directory = std::env::temp_dir().join(format!("carbon-consumed-retention-{}", uuid::Uuid::new_v4()));
+		let archive = directory.join(CONSUMED_RECOVERY_DIRECTORY);
+		fs::create_dir_all(&archive).unwrap();
+		let epoch = SystemTime::now() - Duration::from_secs(3600);
+		let mut older = Vec::new();
+		for index in 0..(CONSUMED_RECOVERY_RETENTION + 5) {
+			let path = archive.join(format!("{index:02}-Place_AutoRecovery_0.rbxl.consumed"));
+			fs::write(&path, b"older capture").unwrap();
+			fs::File::options()
+				.write(true)
+				.open(&path)
+				.unwrap()
+				.set_modified(epoch + Duration::from_secs(index as u64))
+				.unwrap();
+			older.push(path);
+		}
+		let unrelated = archive.join("notes.txt");
+		fs::write(&unrelated, b"not Carbon's").unwrap();
+		let source = directory.join("Place_AutoRecovery_0.rbxl");
+		fs::write(&source, b"newest capture").unwrap();
+
+		let archived = quarantine_consumed_recovery(RecoveryKind::StudioAutoRecovery, &source)
+			.unwrap()
+			.unwrap();
+
+		assert_eq!(fs::read(&archived).unwrap(), b"newest capture");
+		assert!(unrelated.is_file(), "pruning removed a file Carbon did not archive");
+		let survivors = older.iter().filter(|path| path.exists()).count();
+		assert_eq!(survivors, CONSUMED_RECOVERY_RETENTION - 1);
+		assert!(
+			older[..6].iter().all(|path| !path.exists()),
+			"the oldest captures were retained"
+		);
 		fs::remove_dir_all(directory).unwrap();
 	}
 

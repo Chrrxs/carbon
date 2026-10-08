@@ -929,7 +929,7 @@ impl Core {
 		let paths = std::mem::take(&mut *self.ephemeral_paths.lock().unwrap());
 		for path in paths {
 			let result = if path.is_dir() {
-				std::fs::remove_dir_all(&path)
+				crate::composite::remove(&path)
 			} else if path.exists() {
 				std::fs::remove_file(&path)
 			} else {

@@ -32,6 +32,31 @@ change_receipt_path() {
 	printf '%s/receipts/%s.json\n' "$(change_state_root)" "$1"
 }
 
+# Remove qualification runs that no receipt references. Receipted evidence backs
+# merge and release verification and is always kept; unreceipted runs younger
+# than CHANGE_RUN_PRUNE_MINUTES may still be in progress in another worktree.
+prune_unreceipted_change_runs() {
+	local state_root
+	local referenced
+	local run
+	local removed=0
+	state_root="$(change_state_root)"
+	[[ -d "${state_root}/runs" ]] || return 0
+	referenced="$(
+		find "${state_root}/receipts" -maxdepth 1 -name '*.json' -type f -exec \
+			grep -h -o -E 'runs/change-[A-Za-z0-9]+' {} + 2>/dev/null | sort -u || true
+	)"
+	while IFS= read -r -d '' run; do
+		grep -qxF "runs/$(basename "$run")" <<< "$referenced" && continue
+		rm -rf -- "$run"
+		removed=$((removed + 1))
+	done < <(
+		find "${state_root}/runs" -mindepth 1 -maxdepth 1 -type d -name 'change-*' \
+			-mmin "+${CHANGE_RUN_PRUNE_MINUTES:-1440}" -print0
+	)
+	((removed == 0)) || echo "Pruned ${removed} unreceipted qualification runs"
+}
+
 change_plan_fingerprint() {
 	printf '%s\0' "${CHANGE_REQUIRED_PHASES[@]}" | sha256sum | cut -d ' ' -f 1
 }

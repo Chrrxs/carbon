@@ -247,4 +247,16 @@ git -C "$merge_repo" commit -qm 'advance main'
 expect_failure "${root}/diverged.out" env CARBON_CHANGE_STATE_DIR="$state" "${merge_repo}/scripts/change" merge diverged
 grep -q 'not a fast-forward' "${root}/diverged.out" || die "merge did not reject a divergent branch"
 
+prune_state="${root}/prune-state"
+mkdir -p "${prune_state}/runs/change-receipted" "${prune_state}/runs/change-abandoned" \
+	"${prune_state}/runs/change-inflight" "${prune_state}/receipts"
+printf '{"report":{"path":"%s/runs/change-receipted/evidence/report.json"}}\n' "$prune_state" \
+	> "${prune_state}/receipts/fingerprint.json"
+touch -d '2 days ago' "${prune_state}/runs/change-receipted" "${prune_state}/runs/change-abandoned"
+CARBON_CHANGE_STATE_DIR="$prune_state" prune_unreceipted_change_runs > "${root}/prune.out"
+[[ ! -e "${prune_state}/runs/change-abandoned" ]] || die "an abandoned unreceipted run was not pruned"
+[[ -d "${prune_state}/runs/change-receipted" ]] || die "a run backing a receipt was pruned"
+[[ -d "${prune_state}/runs/change-inflight" ]] || die "a possibly in-progress run was pruned"
+grep -q 'Pruned 1 unreceipted' "${root}/prune.out" || die "pruning did not report what it removed"
+
 echo "PASS: red records, full-tree receipts, and qualified fast-forward merges are enforced"

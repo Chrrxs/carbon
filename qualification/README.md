@@ -77,8 +77,10 @@ The opaque launch ID is retained separately as lifecycle evidence and is never
 used as a Studio tool-routing ID.
 
 Evidence and the passing receipt remain below
-`${XDG_STATE_HOME:-$HOME/.local/state}/carbon/qualification`. Commit without
-editing, then merge from clean `main` with:
+`${XDG_STATE_HOME:-$HOME/.local/state}/carbon/qualification`. Each qualification
+first deletes runs older than a day that no receipt references; receipted
+evidence is always kept. Commit without editing, then merge from clean `main`
+with:
 
 ```sh
 ./scripts/change merge <branch>

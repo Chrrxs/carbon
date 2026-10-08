@@ -160,7 +160,7 @@ impl ServeCleanupPaths {
 	fn clean(&self) {
 		let _ = fs::remove_file(&self.build);
 		for composite in self.composites.lock().clone() {
-			let _ = fs::remove_dir_all(composite);
+			let _ = crate::composite::remove(&composite);
 		}
 	}
 }
@@ -338,12 +338,15 @@ impl Serve {
 
 		let build_path = temporary_build_path()?;
 		let cleanup_paths = ServeCleanupPaths::new(build_path.clone(), PathBuf::new());
-		persist_served_studio_domain(&project_path, &cleanup_paths)?;
+		if let Err(error) = persist_served_studio_domain(&project_path, &cleanup_paths) {
+			cleanup_paths.clean();
+			return Err(error);
+		}
 		crate::carbon_info!("Building managed place from {}", project_path.to_string().bold());
 		let report = match build_managed_place(&project_path, &build_path, &contract) {
 			Ok(report) => report,
 			Err(error) => {
-				let _ = fs::remove_file(&build_path);
+				cleanup_paths.clean();
 				return Err(error).context("failed to build disposable managed place");
 			}
 		};
@@ -354,9 +357,15 @@ impl Serve {
 		);
 		crate::carbon_info!("Launching Roblox Studio");
 		let studio_dir = &util::get_reflection_snapshot().studio_dir;
-		let managed_studio = launch_disposable_managed_place(&build_path, || {
+		let managed_studio = match launch_disposable_managed_place(&build_path, || {
 			studio::launch_managed(build_path.clone(), studio_dir, &studio_desktop)
-		})?;
+		}) {
+			Ok(managed_studio) => managed_studio,
+			Err(error) => {
+				cleanup_paths.clean();
+				return Err(error);
+			}
+		};
 		let studio_process_id = managed_studio.process_id();
 		crate::carbon_info!(
 			"Waiting for Roblox Studio to connect on {} (launch ID: {}, Studio PID {}, lifecycle: {})",

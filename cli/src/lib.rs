@@ -5,6 +5,7 @@ use rbx_dom_weak::{types::Variant, UstrMap};
 pub(crate) mod artifact_resolution;
 pub mod artifact_store;
 pub mod cli;
+pub(crate) mod composite;
 pub mod config;
 pub mod constants;
 pub mod core;

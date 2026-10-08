@@ -616,11 +616,7 @@ fn materialize_for_build(project_path: &Path, exact_generation: bool) -> Result<
 	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs, &mapped_roots);
 	let tree = Tree::new(snapshot);
 	let composite = if exact_generation {
-		let directory = project_path
-			.parent()
-			.unwrap_or_else(|| Path::new("."))
-			.join(format!(".carbon-composite-{}", Uuid::new_v4().simple()));
-		fs::create_dir_all(&directory)?;
+		let directory = crate::composite::create(project_path.parent().unwrap_or_else(|| Path::new(".")))?;
 		let manifest_path = directory.join("state.carbon");
 		let staged = (|| -> Result<BuildComposite> {
 			artifact_store::extract_tree(&tree, project.name.clone(), &manifest_path)
@@ -636,7 +632,7 @@ fn materialize_for_build(project_path: &Path, exact_generation: bool) -> Result<
 			})
 		})();
 		if staged.is_err() {
-			let _ = fs::remove_dir_all(&directory);
+			let _ = crate::composite::remove(&directory);
 		}
 		Some(staged?)
 	} else {
@@ -706,6 +702,65 @@ fn build_cache_root(project_path: &Path) -> Option<PathBuf> {
 #[cfg(not(test))]
 fn build_cache_root(_project_path: &Path) -> Option<PathBuf> {
 	directories::BaseDirs::new().map(|base| base.cache_dir().join("carbon/builds/v1"))
+}
+
+/// Builds are cheap to regenerate, so the shared cache keeps only the most
+/// recently used ones within this budget.
+const BUILD_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Record that a cache entry was used so eviction keeps it longest.
+fn touch_build_cache_entry(metadata_path: &Path) {
+	let _ = File::options()
+		.write(true)
+		.open(metadata_path)
+		.and_then(|file| file.set_modified(std::time::SystemTime::now()));
+}
+
+/// Delete least recently used build and layer entries until the cache fits
+/// `budget` bytes. `keep`, the entry that was just stored, is never evicted.
+fn evict_build_cache(root: &Path, budget: u64, keep: &Path) -> Result<usize> {
+	let layers = root.join("layers");
+	let mut entries = Vec::new();
+	for parent in [root, layers.as_path()] {
+		let Ok(children) = fs::read_dir(parent) else {
+			continue;
+		};
+		for child in children.flatten() {
+			let path = child.path();
+			if path == layers || !child.file_type().is_ok_and(|kind| kind.is_dir()) {
+				continue;
+			}
+			let mut bytes = 0_u64;
+			let mut used = std::time::SystemTime::UNIX_EPOCH;
+			for file in fs::read_dir(&path).into_iter().flatten().flatten() {
+				if let Ok(metadata) = file.metadata() {
+					bytes = bytes.saturating_add(metadata.len());
+					used = used.max(metadata.modified().unwrap_or(used));
+				}
+			}
+			entries.push((used, bytes, path));
+		}
+	}
+	let mut total = entries.iter().fold(0_u64, |total, entry| total.saturating_add(entry.1));
+	entries.sort_by_key(|entry| entry.0);
+	let mut removed = 0;
+	for (_, bytes, path) in entries {
+		if total <= budget {
+			break;
+		}
+		if path == keep {
+			continue;
+		}
+		match fs::remove_dir_all(&path) {
+			Ok(()) => {
+				total = total.saturating_sub(bytes);
+				removed += 1;
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => return Err(error).with_context(|| format!("failed to evict {}", path.display())),
+		}
+	}
+	Ok(removed)
 }
 
 fn hash_build_cache_field(hasher: &mut blake3::Hasher, name: &str, value: &[u8]) {
@@ -866,6 +921,7 @@ fn stage_cached_build(project_path: &Path, key: &str, output: &Path) -> Option<(
 			let _ = fs::remove_file(&staged);
 			return Err(error);
 		}
+		touch_build_cache_entry(&metadata_path);
 		Ok(Some((staged, metadata.report)))
 	}
 
@@ -900,7 +956,9 @@ fn store_cached_build(project_path: &Path, key: &str, output: &Path, report: &Co
 	}
 
 	if let Some(root) = build_cache_root(project_path) {
-		let _ = store(&root, key, output, report);
+		if store(&root, key, output, report).is_ok() {
+			let _ = evict_build_cache(&root, BUILD_CACHE_BUDGET_BYTES, &root.join(key));
+		}
 	}
 }
 
@@ -972,6 +1030,7 @@ fn stage_cached_source_layer(
 			let _ = fs::remove_file(&staged);
 			return Err(error);
 		}
+		touch_build_cache_entry(&metadata_path);
 		Ok(Some((staged, metadata.report)))
 	}
 
@@ -1040,7 +1099,9 @@ fn store_cached_source_layer(
 	}
 
 	if let Some(root) = build_cache_root(project_path) {
-		let _ = store(&root, key, source, positions, output, report);
+		if store(&root, key, source, positions, output, report).is_ok() {
+			let _ = evict_build_cache(&root, BUILD_CACHE_BUDGET_BYTES, &root.join("layers").join(key));
+		}
 	}
 }
 
@@ -1247,22 +1308,18 @@ fn materialize_mode(project_path: &Path, allow_transitions: bool) -> Result<Mate
 		mapped_traversal,
 		..
 	} = evaluation;
-	let directory = project_path
-		.parent()
-		.unwrap_or_else(|| Path::new("."))
-		.join(format!(".carbon-composite-{}", Uuid::new_v4().simple()));
-	fs::create_dir_all(&directory)?;
+	let directory = crate::composite::create(project_path.parent().unwrap_or_else(|| Path::new(".")))?;
+	let guard = crate::composite::Guard::new(directory.clone());
 	let manifest_path = directory.join("state.carbon");
-	if let Err(error) = artifact_store::extract_snapshot(snapshot.clone(), project.name.clone(), &manifest_path) {
-		let _ = fs::remove_dir_all(&directory);
-		return Err(error).context("failed to stage composed hybrid source");
-	}
+	artifact_store::extract_snapshot(snapshot.clone(), project.name.clone(), &manifest_path)
+		.context("failed to stage composed hybrid source")?;
 	let route_tree = artifact_store::load_tree(&manifest_path)?.tree;
 	let (mapped_refs, mapped_roots) = refs_for_routes(&route_tree, &barrier_routes)?;
 	let routing_refs = routing_refs(&route_tree, &mapped_roots)?;
 	validate_no_cross_domain_references(&snapshot, &mapped_refs)?;
 	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs, &mapped_roots);
 	let mapped_watch_roots = mapped_traversal.watch_roots.into_iter().collect();
+	let directory = guard.keep();
 	Ok(MaterializedProject {
 		name: project.name,
 		directory,
@@ -1355,6 +1412,10 @@ pub fn compile(project_path: &Path, output: &Path, worktree: Option<&WorktreeCon
 		return result;
 	}
 	let mut materialized = materialize_for_build(project_path, worktree.is_some())?;
+	let composite_guard = materialized
+		.composite
+		.as_ref()
+		.map(|composite| crate::composite::Guard::new(composite.directory.clone()));
 	let output_name = output
 		.file_name()
 		.and_then(|name| name.to_str())
@@ -1410,11 +1471,7 @@ pub fn compile(project_path: &Path, output: &Path, worktree: Option<&WorktreeCon
 		Ok((report, positions))
 	});
 	let _ = fs::remove_file(&staged_output);
-	let cleanup = materialized
-		.composite
-		.as_ref()
-		.map(|composite| fs::remove_dir_all(&composite.directory))
-		.unwrap_or(Ok(()));
+	let cleanup = composite_guard.map(crate::composite::Guard::release).unwrap_or(Ok(()));
 	let result = match (result, cleanup) {
 		(Ok(compiled), Ok(())) => Ok(compiled),
 		(Ok(_), Err(error)) => Err(error).context("failed to clean composed source staging"),
@@ -1445,6 +1502,7 @@ pub fn write_sourcemap(project_path: &Path, output: &Path) -> Result<u64> {
 	let mut traversal = MappedTraversal::default();
 	collect_project_script_paths(&project.tree, root, &mut Vec::new(), &mut paths, &mut traversal)?;
 	let materialized = materialize(project_path)?;
+	let composite_guard = crate::composite::Guard::new(materialized.directory.clone());
 	let temporary = materialized.directory.join("sourcemap.json");
 	let count = artifact_store::write_sourcemap(&materialized.manifest_path, &temporary)?;
 	let mut value: Value = serde_json::from_slice(&fs::read(&temporary)?)?;
@@ -1473,7 +1531,7 @@ pub fn write_sourcemap(project_path: &Path, output: &Path) -> Result<u64> {
 		.unwrap_or_else(|| project_path.to_owned());
 	rewrite(&mut value, &mut Vec::new(), &paths, &root_file);
 	write_json(output, &value)?;
-	fs::remove_dir_all(materialized.directory)?;
+	composite_guard.release()?;
 	Ok(count)
 }
 
@@ -4685,7 +4743,7 @@ pub fn capture_saved_place(project_path: &Path, input: &Path, cancelled: &dyn Fn
 		drop(promote_capture_domains(&promotion)?);
 		Ok(CaptureReport { generation })
 	})();
-	let _ = fs::remove_dir_all(temporary_composite);
+	let _ = crate::composite::remove(&temporary_composite);
 	result
 }
 
@@ -6912,6 +6970,43 @@ mod tests {
 			projected_realization_generation(renamed, Vec::new()).unwrap(),
 			"authored hierarchy changes must alter project realization generation"
 		);
+	}
+
+	#[test]
+	fn bounded_build_cache_evicts_least_recently_used_entries_over_budget() {
+		let root = temp("bounded-build-cache");
+		let epoch = SystemTime::now() - std::time::Duration::from_secs(3600);
+		let entry = |relative: &str, age_rank: u64| {
+			let directory = root.join(relative);
+			fs::create_dir_all(&directory).unwrap();
+			fs::write(directory.join("output.rbxl"), vec![0_u8; 100]).unwrap();
+			let metadata = directory.join("metadata.json");
+			fs::write(&metadata, b"{}").unwrap();
+			for file in ["output.rbxl", "metadata.json"] {
+				File::options()
+					.write(true)
+					.open(directory.join(file))
+					.unwrap()
+					.set_modified(epoch + std::time::Duration::from_secs(age_rank))
+					.unwrap();
+			}
+			directory
+		};
+		let oldest = entry("oldest", 0);
+		let old_layer = entry("layers/old-layer", 1);
+		let kept_despite_age = entry("just-stored", 2);
+		let recent = entry("recent", 3);
+		let recent_layer = entry("layers/recent-layer", 4);
+
+		// Five 102-byte entries against a 210-byte budget: the three oldest must
+		// go, but the entry that was just stored is skipped in favour of the next.
+		let removed = evict_build_cache(&root, 210, &kept_despite_age).unwrap();
+
+		assert_eq!(removed, 3);
+		assert!(!oldest.exists() && !old_layer.exists() && !recent.exists());
+		assert!(kept_despite_age.is_dir() && recent_layer.is_dir());
+		assert!(root.join("layers").is_dir());
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[test]

@@ -173,6 +173,7 @@ qualify_tree() {
 
 	state_root="$(change_state_root)"
 	mkdir -p "${state_root}/runs" "${state_root}/receipts"
+	prune_unreceipted_change_runs
 	run_dir="$(mktemp -d "${state_root}/runs/change-XXXXXXXX")"
 	evidence="${run_dir}/evidence"
 	phase_evidence="${evidence}/phases"
