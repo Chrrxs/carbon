@@ -305,7 +305,8 @@ pub(crate) fn inventory(directory: &Path) -> Result<HashMap<PathBuf, RecoveryFin
 	for entry in fs::read_dir(directory)
 		.with_context(|| format!("failed to read Studio auto-recovery directory {}", directory.display()))?
 	{
-		let entry = entry?;
+		let entry =
+			entry.with_context(|| format!("failed to list Studio auto-recovery directory {}", directory.display()))?;
 		let path = entry.path();
 		if !is_recovery_place(&path) {
 			continue;
@@ -314,9 +315,13 @@ pub(crate) fn inventory(directory: &Path) -> Result<HashMap<PathBuf, RecoveryFin
 			Ok(metadata) if metadata.is_file() => metadata,
 			Ok(_) => continue,
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-			Err(error) => return Err(error.into()),
+			Err(error) => {
+				return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+			}
 		};
-		files.insert(path, RecoveryFingerprint::from_metadata(&metadata)?);
+		let fingerprint = RecoveryFingerprint::from_metadata(&metadata)
+			.with_context(|| format!("failed to read the modification time of {}", path.display()))?;
+		files.insert(path, fingerprint);
 	}
 	Ok(files)
 }
@@ -326,15 +331,14 @@ fn inventory_file(path: &Path) -> Result<HashMap<PathBuf, RecoveryFingerprint>> 
 		Ok(metadata) if metadata.is_file() => metadata,
 		Ok(_) => return Ok(HashMap::new()),
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-		Err(error) => return Err(error.into()),
+		Err(error) => return Err(error).with_context(|| format!("failed to inspect {}", path.display())),
 	};
 	if !is_recovery_place(path) {
 		return Ok(HashMap::new());
 	}
-	Ok(HashMap::from([(
-		path.to_owned(),
-		RecoveryFingerprint::from_metadata(&metadata)?,
-	)]))
+	let fingerprint = RecoveryFingerprint::from_metadata(&metadata)
+		.with_context(|| format!("failed to read the modification time of {}", path.display()))?;
+	Ok(HashMap::from([(path.to_owned(), fingerprint)]))
 }
 
 /// Wait for either a new recovery file or a preexisting file which the caller
@@ -362,7 +366,9 @@ pub(crate) fn wait_for_recovery<T>(
 		);
 		let mut candidates = Vec::new();
 		for source in sources {
-			let current = source.inventory()?;
+			let current = source
+				.inventory()
+				.with_context(|| format!("failed to scan {} for Studio recovery", source.description()))?;
 			candidates.extend(current.into_iter().filter_map(|(path, fingerprint)| {
 				let key = (source.kind, path.clone());
 				if !is_recovery_place(&path) || fingerprint.len == 0 || rejected.get(&key) == Some(&fingerprint) {
@@ -393,7 +399,9 @@ pub(crate) fn wait_for_recovery<T>(
 			if entry.1 < STABLE_POLLS {
 				continue;
 			}
-			match accept(&path, freshness)? {
+			match accept(&path, freshness)
+				.with_context(|| format!("failed to evaluate recovery candidate {}", path.display()))?
+			{
 				RecoveryAcceptance::Accept(value) => return Ok((kind, path, value)),
 				RecoveryAcceptance::Reject => {
 					rejected.insert(key.clone(), fingerprint);
@@ -606,6 +614,36 @@ mod tests {
 		assert!(
 			older[..6].iter().all(|path| !path.exists()),
 			"the oldest captures were retained"
+		);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn capture_scan_errors_name_the_scan_and_the_failing_file() {
+		let directory = std::env::temp_dir().join(format!("carbon-scan-context-{}", uuid::Uuid::new_v4()));
+		let parent = directory.join("served");
+		fs::create_dir_all(&parent).unwrap();
+		let served = parent.join("served.rbxl");
+		let sources = vec![RecoverySource::served_place(served.clone()).unwrap()];
+		// Replacing the parent with a file makes the next stat fail with ENOTDIR,
+		// an OS error other than NotFound, like the unexplained ENOMEM seen live.
+		fs::remove_dir(&parent).unwrap();
+		fs::write(&parent, b"not a directory").unwrap();
+
+		let error = wait_for_recovery(
+			&sources,
+			SystemTime::now(),
+			Duration::from_secs(1),
+			|| false,
+			|_, _| Ok(RecoveryAcceptance::Accept(())),
+		)
+		.unwrap_err();
+		let message = format!("{error:#}");
+
+		assert!(message.contains("failed to scan"), "{message}");
+		assert!(
+			message.contains(&format!("failed to inspect {}", served.display())),
+			"{message}"
 		);
 		fs::remove_dir_all(directory).unwrap();
 	}

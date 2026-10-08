@@ -1334,10 +1334,14 @@ impl Core {
 				return Ok(status);
 			}
 		}
-		let autosaves = crate::recovery::autosaves_dir()?;
-		let mut sources = vec![crate::recovery::RecoverySource::studio_auto_recovery(autosaves)?];
+		let autosaves = crate::recovery::autosaves_dir().context("failed to locate Studio auto-recovery")?;
+		let mut sources = vec![crate::recovery::RecoverySource::studio_auto_recovery(autosaves)
+			.context("failed to record the Studio auto-recovery baseline")?];
 		if let Some(path) = self.served_place_path.lock().unwrap().clone() {
-			sources.push(crate::recovery::RecoverySource::served_place(path)?);
+			sources.push(
+				crate::recovery::RecoverySource::served_place(path)
+					.context("failed to record the served place baseline")?,
+			);
 		}
 		let started_at = SystemTime::now();
 		self.begin_manifest_capture_internal(
@@ -1455,7 +1459,8 @@ impl Core {
 		// routing ancestors. Recovery reconciliation also needs the Studio-owned
 		// complement (for example authored constraint transforms and explicit
 		// default-valued properties), so read the complete canonical artifact.
-		let canonical = load_manifest_capture_canonical(&self.manifest_path)?;
+		let canonical = load_manifest_capture_canonical(&self.manifest_path)
+			.context("failed to load the canonical manifest before capture")?;
 		let expected = artifact_store::WorktreeContract {
 			endpoint: String::new(),
 			project: self.name.clone(),
@@ -1492,7 +1497,8 @@ impl Core {
 					Err(error) => Err(error),
 				}
 			},
-		)?;
+		)
+		.context("failed while waiting for Studio auto-recovery")?;
 		let recovered_tree = recovered.tree;
 		let captured_studio_change_generation = recovered.studio_change_generation;
 		let capture_label = capture_kind.label();
@@ -1510,13 +1516,15 @@ impl Core {
 			},
 			thread::sleep,
 			|| project_sync_started.elapsed() >= PROJECT_SYNC_WAIT_TIMEOUT,
-		)?;
+		)
+		.context("failed while waiting for project source to settle")?;
 		let cancelled = || phase.load(Ordering::Acquire) == CAPTURE_CANCELLED;
 		ensure!(
 			self.source_generation() == source_generation,
 			"served source changed during Capture Manifest"
 		);
-		let metadata = artifact_store::validated_artifact_receipt(&self.manifest_path)?
+		let metadata = artifact_store::validated_artifact_receipt(&self.manifest_path)
+			.context("failed to validate the current manifest receipt")?
 			.metadata()
 			.clone();
 		self.update_manifest_capture_message(request_id, "Staging the recovered Studio place")?;
@@ -1528,38 +1536,47 @@ impl Core {
 			&policy.mapped_refs,
 			&self.manifest_path,
 			&cancelled,
-		)?;
-		let projected_tree = artifact_store::load_projected_live(
-			staged_composite.artifact(),
-			&policy.mapped_refs,
-			&policy.routing_refs,
-		)?
-		.tree;
-		let staged_studio = project::stage_captured_studio_domain(&policy, &staged_composite, &cancelled)?;
-		let promotion = project::prepare_capture_promotion(staged_composite, staged_studio)?;
+		)
+		.context("failed to stage the recovered Studio place")?;
+		let projected_tree =
+			artifact_store::load_projected_live(staged_composite.artifact(), &policy.mapped_refs, &policy.routing_refs)
+				.context("failed to project the staged capture")?
+				.tree;
+		let staged_studio = project::stage_captured_studio_domain(&policy, &staged_composite, &cancelled)
+			.context("failed to stage the captured Studio domain")?;
+		let promotion = project::prepare_capture_promotion(staged_composite, staged_studio)
+			.context("failed to prepare the capture promotion")?;
 		ensure!(
-			self.exact_project_realization_generation()? == project_realization_generation,
+			self.exact_project_realization_generation()
+				.context("failed to recheck the project realization before commit")?
+				== project_realization_generation,
 			"filesystem mapping realization changed during Capture Manifest; retry after project source settles"
 		);
 		self.update_manifest_capture_message(request_id, "Committing the recovered manifest atomically")?;
-		let generation = self.writer.commit_prepared_capture(
-			projected_tree,
-			promotion,
-			phase,
-			source_generation,
-			CapturePrecommitAttestation {
-				project_path: policy.project_path.clone(),
-				project_document: policy.project_document.clone(),
-				previous_projected,
-				mapped_refs: policy.mapped_refs.clone(),
-				project_generation: project_realization_generation,
-			},
-		)?;
-		let contract = self.encode_current_managed_hierarchy()?;
+		let generation = self
+			.writer
+			.commit_prepared_capture(
+				projected_tree,
+				promotion,
+				phase,
+				source_generation,
+				CapturePrecommitAttestation {
+					project_path: policy.project_path.clone(),
+					project_document: policy.project_document.clone(),
+					previous_projected,
+					mapped_refs: policy.mapped_refs.clone(),
+					project_generation: project_realization_generation,
+				},
+			)
+			.context("failed to commit the captured manifest")?;
+		let contract = self
+			.encode_current_managed_hierarchy()
+			.context("failed to encode the managed hierarchy after capture")?;
 		let projected_source_ids = contract.source_ids.clone();
 		install_managed_hierarchy_contract(&self.managed_hierarchy, contract);
 		self.source_reader
-			.install_projected_state(projected_source_ids, generation.clone())?;
+			.install_projected_state(projected_source_ids, generation.clone())
+			.context("failed to install the projected state after capture")?;
 		*self.last_successful_capture_generation.lock().unwrap() = Some(generation.clone());
 		self.studio_change_state.lock().unwrap().last_captured_generation = captured_studio_change_generation;
 		let archive_notice = match crate::recovery::quarantine_consumed_recovery(capture_kind, &capture_path) {
