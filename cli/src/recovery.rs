@@ -2,12 +2,14 @@ use std::{
 	collections::HashMap,
 	fs::{self, Metadata},
 	path::{Path, PathBuf},
-	process::Command,
 	thread,
 	time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{ensure, Context, Result};
+
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 pub(crate) const CAPTURE_TIMEOUT: Duration = Duration::from_secs(6 * 60);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -256,6 +258,11 @@ pub(crate) fn autosaves_dir() -> Result<PathBuf> {
 
 	#[cfg(target_os = "linux")]
 	{
+		if let Some(host) = crate::studio::wine_host()? {
+			return Ok(host
+				.local_app_data(AUTOSAVES_OVERRIDE)?
+				.join("Roblox/RobloxStudio/AutoSaves"));
+		}
 		ensure!(
 			std::env::var_os("WSL_DISTRO_NAME").is_some(),
 			"Roblox Studio auto-recovery capture is supported on Linux only through WSL"

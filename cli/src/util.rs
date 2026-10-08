@@ -1168,6 +1168,25 @@ fn windows_path(path: &std::path::Path) -> Result<std::ffi::OsString> {
 
 #[cfg(target_os = "linux")]
 fn generate_api_dump(studio_info: &studio::StudioInfo, output_path: &std::path::Path) -> Result<()> {
+	if let Some(host) = studio::wine_host()? {
+		// Launching through the identity-checked path proves the launcher exec'd
+		// Studio in place, so stopping it cannot leave a respawned Studio behind.
+		let arguments = [
+			std::ffi::OsString::from("--fullApi"),
+			crate::studio_wine::wine_path(output_path)?.into(),
+		];
+		let mut studio = host.spawn(&studio_info.executable, &arguments).with_context(|| {
+			format!(
+				"failed to launch Studio at {} through Wine",
+				studio_info.executable.display()
+			)
+		})?;
+		let waited = wait_for_api_dump(output_path, || studio.exited());
+		let stopped = studio.stop().context("failed to stop Studio after FullAPI extraction");
+		waited?;
+		stopped?;
+		return ensure_complete_api_dump(output_path);
+	}
 	let (studio, output) = (windows_path(&studio_info.executable)?, windows_path(output_path)?);
 	let mut command = crate::studio::powershell_command()?;
 	command
@@ -1195,9 +1214,7 @@ fn generate_api_dump(studio_info: &studio::StudioInfo, output_path: &std::path::
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn generate_api_dump(studio_info: &studio::StudioInfo, output_path: &std::path::Path) -> Result<()> {
-	use std::time::{Duration, Instant};
-
-	let mut child = Command::new(&studio_info.executable)
+	let child = Command::new(&studio_info.executable)
 		.arg("--fullApi")
 		.arg(output_path)
 		.stdin(std::process::Stdio::null())
@@ -1205,8 +1222,30 @@ fn generate_api_dump(studio_info: &studio::StudioInfo, output_path: &std::path::
 		.stderr(std::process::Stdio::null())
 		.spawn()
 		.with_context(|| format!("failed to launch Studio at {}", studio_info.executable.display()))?;
+	capture_api_dump(child, output_path)
+}
+
+/// Wait for a complete FullAPI dump from a directly spawned Studio, then stop it.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn capture_api_dump(mut child: std::process::Child, output_path: &std::path::Path) -> Result<()> {
 	#[cfg(target_os = "windows")]
 	let process_id = child.id();
+	let waited = wait_for_api_dump(output_path, || Ok(child.try_wait()?.is_some()));
+	#[cfg(target_os = "windows")]
+	let _ = Command::new("taskkill.exe")
+		.args(["/F", "/T", "/PID", &process_id.to_string()])
+		.output();
+	let _ = child.kill();
+	let _ = child.wait();
+	waited?;
+	ensure_complete_api_dump(output_path)
+}
+
+/// Poll until Studio's FullAPI dump is complete and stable, Studio exits, or the
+/// export times out.
+fn wait_for_api_dump(output_path: &std::path::Path, mut exited: impl FnMut() -> Result<bool>) -> Result<()> {
+	use std::time::{Duration, Instant};
+
 	let deadline = Instant::now() + Duration::from_secs(45);
 	let mut last_length = 0;
 	let mut stable_polls = 0;
@@ -1222,17 +1261,15 @@ fn generate_api_dump(studio_info: &studio::StudioInfo, output_path: &std::path::
 				break;
 			}
 		}
-		if child.try_wait()?.is_some() {
+		if exited()? {
 			break;
 		}
 		std::thread::sleep(Duration::from_millis(100));
 	}
-	#[cfg(target_os = "windows")]
-	let _ = Command::new("taskkill.exe")
-		.args(["/F", "/T", "/PID", &process_id.to_string()])
-		.output();
-	let _ = child.kill();
-	let _ = child.wait();
+	Ok(())
+}
+
+fn ensure_complete_api_dump(output_path: &std::path::Path) -> Result<()> {
 	ensure!(
 		output_path.is_file() && read_api_dump(output_path).is_ok(),
 		"Studio produced no complete FullAPI dump"

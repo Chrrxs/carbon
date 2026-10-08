@@ -26,6 +26,8 @@ mod source_wire;
 pub mod studio;
 pub(crate) mod studio_plugin;
 pub mod studio_windows;
+#[cfg(target_os = "linux")]
+pub(crate) mod studio_wine;
 pub mod util;
 
 /// Global type for snapshot and instance properties

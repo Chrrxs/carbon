@@ -46,11 +46,16 @@ impl McpLifecycle {
 		Self { endpoint, auth_token }
 	}
 
-	fn launch(&self, path: &Path, studio_executable: &str) -> Result<ManagedLaunch> {
+	fn launch(
+		&self,
+		path: &Path,
+		studio_executable: &str,
+		process_environment: Option<&Value>,
+	) -> Result<ManagedLaunch> {
 		let result = mcp_tool(
 			&self.endpoint,
 			self.auth_token.as_deref(),
-			&mcp_launch_request(path, studio_executable),
+			&mcp_launch_request(path, studio_executable, process_environment),
 			MCP_LAUNCH_TIMEOUT,
 		)
 		.context("robloxstudio-mcp could not launch managed Roblox Studio")?;
@@ -109,12 +114,40 @@ fn discover_mcp_lifecycle() -> Result<McpLifecycle> {
 		.context("robloxstudio-mcp health request failed")?
 		.json()
 		.context("robloxstudio-mcp health returned invalid JSON")?;
+	#[cfg(target_os = "linux")]
+	if wine_host()?.is_some() {
+		ensure_wine_broker(&health)
+			.with_context(|| format!("robloxstudio-mcp at {base_url} cannot launch Studio under Wine"))?;
+	}
 	let endpoint = mcp_lifecycle_endpoint(&base_url, &health).with_context(|| {
 		format!(
 			"robloxstudio-mcp at {base_url} does not advertise lifecycle protocol {MCP_PROTOCOL_VERSION} with exact process identity"
 		)
 	})?;
 	Ok(McpLifecycle::new(endpoint, load_mcp_auth_token()))
+}
+
+/// On a Wine host the broker must launch Studio through its own Wine
+/// launcher; any other launcher would ignore Carbon's Wine prefix.
+#[cfg(target_os = "linux")]
+fn ensure_wine_broker(health: &Value) -> Result<()> {
+	const WINE_LAUNCHER: &str = "wine-retained";
+	let identity = health.pointer("/capabilities/studioLifecycle/processIdentity");
+	let launcher = identity
+		.and_then(|identity| identity.get("launcher"))
+		.and_then(Value::as_str);
+	if launcher == Some(WINE_LAUNCHER) {
+		return Ok(());
+	}
+	let reason = identity
+		.and_then(|identity| identity.get("reason"))
+		.and_then(Value::as_str)
+		.map(|reason| format!(" ({reason})"))
+		.unwrap_or_default();
+	anyhow::bail!(
+		"a Linux Wine host requires the broker's {WINE_LAUNCHER:?} Studio launcher, but it advertises {}{reason}",
+		launcher.map_or_else(|| "none".to_owned(), |launcher| format!("{launcher:?}"))
+	)
 }
 
 fn mcp_health_url(base_url: &str) -> Result<String> {
@@ -564,15 +597,28 @@ fn ensure_plugin() -> Result<studio_plugin::Installation> {
 	Ok(installation)
 }
 
-fn mcp_launch_request(path: &Path, studio_executable: &str) -> Value {
-	json!({
+fn mcp_launch_request(path: &Path, studio_executable: &str, process_environment: Option<&Value>) -> Value {
+	let mut request = json!({
 		"action": "launch",
 		"source": "local_file",
 		"local_place_file": path,
 		"studio_executable": studio_executable,
 		"require_process_identity": true,
 		"wait_for_connection": false,
-	})
+	});
+	if let Some(process_environment) = process_environment {
+		request["process_environment"] = process_environment.clone();
+	}
+	request
+}
+
+/// Environment the broker must apply so Studio runs in Carbon's host context.
+fn studio_process_environment() -> Result<Option<Value>> {
+	#[cfg(target_os = "linux")]
+	if wine_host()?.is_some() {
+		return crate::studio_wine::process_environment(|name| std::env::var_os(name)).map(Some);
+	}
+	Ok(None)
 }
 
 fn managed_launch_identity(result: &Value) -> Result<(String, u32, u64)> {
@@ -645,7 +691,7 @@ fn parse_mcp_lifecycle_response(body: &[u8]) -> Result<Value> {
 	Ok(result)
 }
 
-fn parse_version(raw: &str) -> Result<(String, [u32; 4])> {
+pub(crate) fn parse_version(raw: &str) -> Result<(String, [u32; 4])> {
 	let sanitized = raw.replace(", ", ".").replace(',', ".").replace(' ', "");
 	let parts = sanitized.split('.').collect::<Vec<_>>();
 	ensure!(
@@ -685,13 +731,48 @@ fn windows_file_version(path: &str) -> Result<String> {
 	Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+/// The Linux Wine host, active only outside WSL when
+/// `ROBLOX_STUDIO_WINE_LAUNCHER` is set; an unusable launcher is an error.
+#[cfg(target_os = "linux")]
+pub(crate) fn wine_host() -> Result<Option<&'static crate::studio_wine::WineHost>> {
+	crate::studio_wine::WineHost::current()
+}
+
+fn studio_info_at(executable: PathBuf, raw_version: &str) -> Result<StudioInfo> {
+	let (version_text, version_components) = parse_version(raw_version)?;
+	let build_id = executable
+		.parent()
+		.and_then(Path::file_name)
+		.and_then(|name| name.to_str())
+		.unwrap_or("custom")
+		.to_owned();
+	Ok(StudioInfo {
+		executable,
+		version_text,
+		version_components,
+		build_id,
+	})
+}
+
 pub fn get_studio_info() -> Result<StudioInfo> {
-	if let Some(executable) = std::env::var_os("ROBLOX_STUDIO_EXE").map(PathBuf::from) {
+	let configured = std::env::var_os("ROBLOX_STUDIO_EXE").map(PathBuf::from);
+	if let Some(executable) = configured.as_ref() {
 		ensure!(
 			executable.is_file(),
 			"ROBLOX_STUDIO_EXE does not exist: {}",
 			executable.display()
 		);
+	}
+	#[cfg(target_os = "linux")]
+	if let Some(host) = wine_host()? {
+		let executable = match configured {
+			Some(executable) => executable,
+			None => host.installed_studio()?,
+		};
+		let raw_version = crate::studio_wine::studio_file_version(&executable)?;
+		return studio_info_at(executable, &raw_version);
+	}
+	if let Some(executable) = configured {
 		#[cfg(target_os = "linux")]
 		let native = windows_path(&executable, "Roblox Studio executable")?;
 		#[cfg(not(target_os = "linux"))]
@@ -700,19 +781,7 @@ pub fn get_studio_info() -> Result<StudioInfo> {
 		let raw_version = windows_file_version(&native)?;
 		#[cfg(target_os = "macos")]
 		let raw_version = macos_studio_version(&executable)?;
-		let (version_text, version_components) = parse_version(&raw_version)?;
-		let build_id = executable
-			.parent()
-			.and_then(Path::file_name)
-			.and_then(|name| name.to_str())
-			.unwrap_or("custom")
-			.to_owned();
-		return Ok(StudioInfo {
-			executable,
-			version_text,
-			version_components,
-			build_id,
-		});
+		return studio_info_at(executable, &raw_version);
 	}
 
 	#[cfg(target_os = "linux")]
@@ -828,6 +897,9 @@ fn windows_path(path: &Path, description: &str) -> Result<String> {
 fn broker_studio_executable(studio: &StudioInfo) -> Result<String> {
 	#[cfg(target_os = "linux")]
 	{
+		if wine_host()?.is_some() {
+			return Ok(studio.executable.to_string_lossy().into_owned());
+		}
 		windows_path(&studio.executable, "Roblox Studio executable")
 	}
 	#[cfg(not(target_os = "linux"))]
@@ -1774,8 +1846,33 @@ pub(crate) fn suppress_studio_attention(processes: &[StudioProcessIdentity]) -> 
 	}
 }
 
+#[cfg(target_os = "linux")]
+fn wine_launch_process(
+	host: &crate::studio_wine::WineHost,
+	path: Option<&Path>,
+	studio: &StudioInfo,
+) -> Result<(u32, String, u64)> {
+	let mut arguments = Vec::new();
+	if let Some(path) = path {
+		let place =
+			fs::canonicalize(path).with_context(|| format!("Studio place does not exist: {}", path.display()))?;
+		arguments.extend(["--task", "EditFile", "--localPlaceFile"].map(std::ffi::OsString::from));
+		arguments.push(crate::studio_wine::wine_path(&place)?.into());
+	}
+	let (process_id, creation_filetime) = host.launch(&studio.executable, &arguments)?;
+	Ok((
+		process_id,
+		studio.executable.to_string_lossy().into_owned(),
+		creation_filetime,
+	))
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn launch_process(path: Option<&Path>, studio: &StudioInfo) -> Result<(u32, String, u64)> {
+	#[cfg(target_os = "linux")]
+	if let Some(host) = wine_host()? {
+		return wine_launch_process(host, path, studio);
+	}
 	#[cfg(target_os = "linux")]
 	let executable = windows_path(&studio.executable, "Roblox Studio executable")?;
 	#[cfg(target_os = "windows")]
@@ -1877,8 +1974,9 @@ pub fn launch_managed(path: PathBuf, _studio_dir: &Path, desktop_name: &str) -> 
 	let installation = ensure_plugin()?;
 	let studio = get_studio_info()?;
 	let studio_executable = broker_studio_executable(&studio)?;
+	let process_environment = studio_process_environment()?;
 	let lifecycle = discover_mcp_lifecycle()?;
-	let launch = lifecycle.launch(&path, &studio_executable)?;
+	let launch = lifecycle.launch(&path, &studio_executable, process_environment.as_ref())?;
 	if desktop.is_some() {
 		let process = StudioProcessIdentity {
 			process_id: launch.process_id,
@@ -1931,6 +2029,10 @@ if ($process.StartTime.ToUniversalTime().ToFileTimeUtc() -ne {creation_filetime}
 }
 
 fn terminate_process(process_id: u32, executable: &str, creation_filetime: u64) -> Result<()> {
+	#[cfg(target_os = "linux")]
+	if wine_host()?.is_some() {
+		return crate::studio_wine::terminate(process_id, creation_filetime);
+	}
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
 		let script = format!(
@@ -1962,6 +2064,10 @@ fn terminate_process(process_id: u32, executable: &str, creation_filetime: u64) 
 }
 
 pub fn wait_for_exit(process_id: u32) -> Result<()> {
+	#[cfg(target_os = "linux")]
+	if wine_host()?.is_some() {
+		return crate::studio_wine::wait_for_exit(process_id);
+	}
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	{
 		let script = format!(
@@ -2113,6 +2219,10 @@ pub fn focus_process(
 	}
 	#[cfg(target_os = "linux")]
 	{
+		ensure!(
+			wine_host()?.is_none(),
+			"focusing a Roblox Studio window is unsupported on a Linux Wine host"
+		);
 		let validation = validate_process_script(process_id, studio_executable, creation_filetime);
 		let script = wsl_focus_script(process_id, &validation, restore_previous);
 		let output = powershell_command()?
@@ -2171,6 +2281,9 @@ pub fn is_running(title: Option<String>) -> Result<bool> {
 	}
 	#[cfg(target_os = "linux")]
 	{
+		if wine_host()?.is_some() {
+			return crate::studio_wine::is_running();
+		}
 		let output = powershell_command()?
 			.args([
 				"-NoProfile",
@@ -2228,6 +2341,10 @@ pub fn focus(title: Option<String>) -> Result<()> {
 	}
 	#[cfg(target_os = "linux")]
 	{
+		ensure!(
+			wine_host()?.is_none(),
+			"focusing a Roblox Studio window is unsupported on a Linux Wine host"
+		);
 		anyhow::bail!("focus by window title is unavailable on WSL; use carbon focus with a managed session");
 	}
 	#[allow(unreachable_code)]
@@ -2238,6 +2355,10 @@ pub fn focus(title: Option<String>) -> Result<()> {
 pub(crate) fn powershell_command() -> Result<Command> {
 	#[cfg(target_os = "linux")]
 	{
+		ensure!(
+			wine_host()?.is_none(),
+			"this Roblox Studio operation needs Windows PowerShell and is unsupported on a Linux Wine host"
+		);
 		ensure!(
 			std::env::var_os("WSL_DISTRO_NAME").is_some(),
 			"PowerShell interoperability requires WSL"
@@ -2316,7 +2437,11 @@ mod tests {
 
 	#[test]
 	fn managed_launch_requires_broker_process_identity_before_connection() {
-		let request = mcp_launch_request(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe");
+		let request = mcp_launch_request(
+			Path::new("/tmp/carbon-managed.rbxl"),
+			r"C:\Roblox\RobloxStudioBeta.exe",
+			None,
+		);
 
 		assert_eq!(
 			request,
@@ -2329,6 +2454,92 @@ mod tests {
 				"wait_for_connection": false,
 			})
 		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn wine_host_launch_request_forwards_the_studio_prefix_environment() {
+		let variables = [
+			("WINEPREFIX", "/home/carbon/.wine-studio"),
+			("DISPLAY", ":1"),
+			("XAUTHORITY", "/run/user/1000/xauth"),
+			("WAYLAND_DISPLAY", "wayland-0"),
+			("XDG_RUNTIME_DIR", "/run/user/1000"),
+			("HOME", "/home/carbon"),
+		];
+		let lookup = |name: &str| {
+			variables
+				.iter()
+				.find(|(variable, _)| *variable == name)
+				.map(|(_, value)| std::ffi::OsString::from(value))
+		};
+		let environment = crate::studio_wine::process_environment(lookup).unwrap();
+		let request = mcp_launch_request(
+			Path::new("/tmp/carbon-managed.rbxl"),
+			"/home/carbon/.wine-studio/drive_c/Roblox/RobloxStudioBeta.exe",
+			Some(&environment),
+		);
+
+		assert_eq!(
+			request,
+			json!({
+				"action": "launch",
+				"source": "local_file",
+				"local_place_file": "/tmp/carbon-managed.rbxl",
+				"studio_executable": "/home/carbon/.wine-studio/drive_c/Roblox/RobloxStudioBeta.exe",
+				"require_process_identity": true,
+				"wait_for_connection": false,
+				"process_environment": {
+					"set": {
+						"WINEPREFIX": "/home/carbon/.wine-studio",
+						"DISPLAY": ":1",
+						"XAUTHORITY": "/run/user/1000/xauth",
+						"WAYLAND_DISPLAY": "wayland-0",
+						"XDG_RUNTIME_DIR": "/run/user/1000",
+					},
+				},
+			})
+		);
+
+		let headless = crate::studio_wine::process_environment(|name: &str| {
+			(name == "WINEPREFIX").then(|| std::ffi::OsString::from("/home/carbon/.wine-studio"))
+		})
+		.unwrap();
+		assert_eq!(headless, json!({"set": {"WINEPREFIX": "/home/carbon/.wine-studio"}}));
+		let error = crate::studio_wine::process_environment(|_: &str| None).unwrap_err();
+		assert!(format!("{error:#}").contains("WINEPREFIX"));
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn wine_host_requires_the_broker_wine_launcher() {
+		let health = |process_identity: Value| {
+			json!({
+				"capabilities": {
+					"studioLifecycle": {
+						"protocolVersion": 3,
+						"endpoint": "/mcp/manage_instance",
+						"processIdentity": process_identity,
+					},
+				},
+			})
+		};
+		ensure_wine_broker(&health(json!({"supported": true, "launcher": "wine-retained"}))).unwrap();
+
+		let unavailable = ensure_wine_broker(&health(json!({
+			"supported": false,
+			"launcher": "unavailable",
+			"reason": "ROBLOX_STUDIO_WINE_LAUNCHER (/opt/studio-wine) is not an executable file.",
+		})))
+		.unwrap_err();
+		let message = format!("{unavailable:#}");
+		assert!(message.contains("wine-retained"), "{message}");
+		assert!(message.contains("/opt/studio-wine"), "{message}");
+
+		let windows =
+			ensure_wine_broker(&health(json!({"supported": true, "launcher": "wsl-windows-retained"}))).unwrap_err();
+		assert!(format!("{windows:#}").contains("wsl-windows-retained"));
+		assert!(ensure_wine_broker(&json!({"status": "ok"})).is_err());
 	}
 
 	#[test]
@@ -2463,7 +2674,11 @@ mod tests {
 
 		let lifecycle = McpLifecycle::new(endpoint, None);
 		let launch = lifecycle
-			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.launch(
+				Path::new("/tmp/carbon-managed.rbxl"),
+				r"C:\Roblox\RobloxStudioBeta.exe",
+				None,
+			)
 			.unwrap();
 		launch.authorize().unwrap();
 		launch.complete().unwrap();
@@ -2553,7 +2768,11 @@ mod tests {
 
 		let lifecycle = McpLifecycle::new(endpoint, None);
 		let launch = lifecycle
-			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.launch(
+				Path::new("/tmp/carbon-managed.rbxl"),
+				r"C:\Roblox\RobloxStudioBeta.exe",
+				None,
+			)
 			.unwrap();
 		let error = authorize_managed_launch(&launch).unwrap_err();
 		assert!(format!("{error:#}").contains("authorization failed"));
@@ -2615,7 +2834,11 @@ mod tests {
 
 		let lifecycle = McpLifecycle::new(endpoint, None);
 		let launch = lifecycle
-			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.launch(
+				Path::new("/tmp/carbon-managed.rbxl"),
+				r"C:\Roblox\RobloxStudioBeta.exe",
+				None,
+			)
 			.unwrap();
 		let error = complete_managed_launch(&launch).unwrap_err();
 		assert!(format!("{error:#}").contains("ownership completion failed"));
@@ -2684,7 +2907,11 @@ mod tests {
 
 		let lifecycle = McpLifecycle::new(endpoint, None);
 		let launch = lifecycle
-			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.launch(
+				Path::new("/tmp/carbon-managed.rbxl"),
+				r"C:\Roblox\RobloxStudioBeta.exe",
+				None,
+			)
 			.unwrap();
 		let error = associate_managed_launch(&launch).unwrap_err();
 		assert!(format!("{error:#}").contains("association failed"));
@@ -2750,7 +2977,11 @@ mod tests {
 
 		let lifecycle = McpLifecycle::new(endpoint, None);
 		assert!(lifecycle
-			.launch(Path::new("/tmp/carbon-managed.rbxl"), r"C:\Roblox\RobloxStudioBeta.exe")
+			.launch(
+				Path::new("/tmp/carbon-managed.rbxl"),
+				r"C:\Roblox\RobloxStudioBeta.exe",
+				None
+			)
 			.is_err());
 		server.join().unwrap();
 

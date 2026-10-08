@@ -12,7 +12,8 @@ fresh Studio auto-recovery saves continuously capture Studio-owned changes.
 
 > [!IMPORTANT]
 > Carbon is pre-1.0. It supports Roblox Studio on x86_64 Windows, either
-> natively or through WSL2. The project format can change before 1.0.
+> natively or through WSL2, and the Windows Studio build under Wine on native
+> Linux. The project format can change before 1.0.
 
 ## Source ownership
 
@@ -75,9 +76,11 @@ See [Usage and project format](USAGE.md) for the full mapping and capture rules.
 
 ## System requirements
 
-- Windows 10 or 11 on an x86_64 machine
-- Roblox Studio on Windows
-- Carbon CLI on native Windows or WSL2
+- Windows 10 or 11 on an x86_64 machine, or native Linux (x86_64 or ARM64)
+  running the Windows Studio build under Wine
+- Roblox Studio on Windows, or in a Wine prefix on Linux
+- Carbon CLI on native Windows, WSL2, or native Linux for the Wine host (ARM64
+  builds from source), as described in [Linux with Wine](USAGE.md#linux-with-wine)
 - `robloxstudio-mcp` running on loopback with Studio lifecycle protocol v3 and
   exact process identity enabled
 - [Rokit](https://github.com/rojo-rbx/rokit) in the CLI environment

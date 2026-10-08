@@ -189,6 +189,49 @@ and proves that topology with a transition-bound capture. Filesystem edits
 beneath a mapping reconcile authoritatively, while Studio edits beneath a
 mapping never write back to source.
 
+## Linux with Wine
+
+On native Linux (not WSL), Carbon drives the Windows Studio build running under
+Wine when `ROBLOX_STUDIO_WINE_LAUNCHER` is set. WSL keeps its existing
+behavior. Wine host mode uses:
+
+- `ROBLOX_STUDIO_WINE_LAUNCHER`: executable launcher invoked as
+  `<launcher> <RobloxStudioBeta.exe Unix path> <Studio arguments...>`. It
+  prepares the Wine environment and must finish with
+  `exec wine "$@"` (or an equivalent in-place `exec`) so Studio keeps the
+  launcher's PID. Launchers that re-spawn Studio, such as `proton run`, are
+  rejected after 30 seconds. A value that does not name an executable file is
+  an error rather than a fallback to WSL.
+- `WINEPREFIX`: absolute path of the prefix. Managed `serve` forwards it, and
+  `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` when set, to
+  the broker as the launch's `process_environment`.
+- `ROBLOX_STUDIO_EXE` (optional): Unix path of `RobloxStudioBeta.exe`. Without
+  it Carbon uses the most recently written
+  `Roblox/Versions/*/RobloxStudioBeta.exe` in the prefix profile's
+  `LOCALAPPDATA`, so Studio's own updates are picked up. Carbon reads the
+  version from the executable's version resource.
+- A `robloxstudio-mcp` build whose health reports its `wine-retained` Studio
+  launcher. Managed `serve` refuses any other broker launcher and shows the
+  broker's reason.
+
+Carbon finds Studio's `LOCALAPPDATA` at
+`$WINEPREFIX/drive_c/users/<user>/AppData/Local`, using the one profile other
+than `Public` (Proton's `$USER` symlink to `steamuser` counts once). Zero or
+several profiles fail with the override to set: `MCP_PLUGINS_DIR` for the
+plugin, `CARBON_STUDIO_AUTOSAVES_DIR` for auto-recovery, and
+`ROBLOX_STUDIO_EXE` for Studio. Path arguments passed to Studio use Wine's `Z:`
+drive. Process identity is the Linux PID plus its start time; Carbon accepts a
+broker-reported start time within two seconds. Stopping Studio uses a pidfd,
+which needs Linux 5.3 or newer.
+
+`studio_desktop` parking, desktop routing, audio and window guards, `carbon
+focus`, and `carbon park` need Windows and fail with a clear error on a Wine
+host. Commands that need reflection use `CARBON_REFLECTION_API_DUMP` and
+`CARBON_REFLECTION_VERSION` when both are set; otherwise Carbon runs Studio's
+`--fullApi` export through the launcher and stops that exact Studio afterwards.
+
+Release builds are x86_64 only. On ARM64 Linux, build the CLI from source.
+
 ## Canonical files
 
 - `*.carbon.json` contains a strict Rojo-shaped mapping tree.
@@ -220,7 +263,8 @@ place's embedded Carbon project identity must match the explicit project.
 
 Studio auto-recovery must be enabled. On Windows Carbon watches
 `%LOCALAPPDATA%\Roblox\RobloxStudio\AutoSaves`; from WSL it watches the same
-Windows directory through `wslpath`. Tests and custom environments may set
+Windows directory through `wslpath`, and on a Wine host it watches that
+directory inside `WINEPREFIX`. Tests and custom environments may set
 `CARBON_STUDIO_AUTOSAVES_DIR` to an explicit directory. Only new or changed
 `.rbxl` files created after the active automatic wait began are eligible. Each
 wait is bounded to six minutes and then restarts while the serve session remains

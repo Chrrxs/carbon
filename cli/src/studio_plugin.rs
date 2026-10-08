@@ -75,6 +75,9 @@ fn plugins_directory() -> Result<PathBuf> {
 
 	#[cfg(target_os = "linux")]
 	{
+		if let Some(host) = crate::studio::wine_host()? {
+			return Ok(host.local_app_data(PLUGINS_DIR_ENV)?.join("Roblox/Plugins"));
+		}
 		ensure!(
 			env::var_os("WSL_DISTRO_NAME").is_some(),
 			"automatic Carbon Studio plugin installation on Linux requires WSL or {PLUGINS_DIR_ENV}"
