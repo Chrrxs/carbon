@@ -32,6 +32,37 @@ change_receipt_path() {
 	printf '%s/receipts/%s.json\n' "$(change_state_root)" "$1"
 }
 
+# Remove receipts that no longer qualify anything a workflow command can use.
+# A receipt is kept while its tree is the tip of a branch, remote-tracking
+# branch, or tag in REPO (merge, release, and update-release look these up), or
+# while it is younger than CHANGE_RECEIPT_RETENTION_DAYS, which covers qualified
+# trees not yet committed and clones that share this state directory. The
+# evidence of a removed receipt is then pruned as unreceipted.
+prune_stale_change_receipts() {
+	local repo="$1"
+	local state_root
+	local live=""
+	local object
+	local tree
+	local receipt
+	local removed=0
+	state_root="$(change_state_root)"
+	[[ -d "${state_root}/receipts" ]] || return 0
+	while IFS= read -r object; do
+		tree="$(git -C "$repo" rev-parse --verify --quiet "${object}^{tree}")" || continue
+		live+="$(printf '%s\n' "$tree" | sha256sum | cut -d ' ' -f 1)"$'\n'
+	done < <(git -C "$repo" for-each-ref --format='%(objectname)' refs/heads refs/remotes refs/tags)
+	while IFS= read -r -d '' receipt; do
+		grep -qxF "$(basename "$receipt" .json)" <<< "$live" && continue
+		rm -f -- "$receipt"
+		removed=$((removed + 1))
+	done < <(
+		find "${state_root}/receipts" -maxdepth 1 -type f -name '*.json' \
+			-mtime "+${CHANGE_RECEIPT_RETENTION_DAYS:-14}" -print0
+	)
+	((removed == 0)) || echo "Pruned ${removed} superseded qualification receipts"
+}
+
 # Remove qualification runs that no receipt references. Receipted evidence backs
 # merge and release verification and is always kept; unreceipted runs younger
 # than CHANGE_RUN_PRUNE_MINUTES may still be in progress in another worktree.

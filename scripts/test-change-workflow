@@ -259,4 +259,26 @@ CARBON_CHANGE_STATE_DIR="$prune_state" prune_unreceipted_change_runs > "${root}/
 [[ -d "${prune_state}/runs/change-inflight" ]] || die "a possibly in-progress run was pruned"
 grep -q 'Pruned 1 unreceipted' "${root}/prune.out" || die "pruning did not report what it removed"
 
+declare -F prune_stale_change_receipts > /dev/null || die "superseded qualification receipts are never pruned"
+receipt_state="${root}/receipt-state"
+mkdir -p "${receipt_state}/receipts" "${receipt_state}/runs/change-branch" "${receipt_state}/runs/change-stale"
+branch_fingerprint="$(revision_tree_fingerprint "$merge_repo" main)"
+stale_fingerprint="$(printf 'superseded tree\n' | sha256sum | cut -d ' ' -f 1)"
+young_fingerprint="$(printf 'recently qualified tree\n' | sha256sum | cut -d ' ' -f 1)"
+for receipt in branch:"$branch_fingerprint" stale:"$stale_fingerprint" young:"$young_fingerprint"; do
+	printf '{"report":{"path":"%s/runs/change-%s/evidence/report.json"}}\n' "$receipt_state" "${receipt%%:*}" \
+		> "${receipt_state}/receipts/${receipt#*:}.json"
+done
+touch -d '30 days ago' "${receipt_state}/receipts/${branch_fingerprint}.json" \
+	"${receipt_state}/receipts/${stale_fingerprint}.json" "${receipt_state}/runs/change-branch" \
+	"${receipt_state}/runs/change-stale"
+CARBON_CHANGE_STATE_DIR="$receipt_state" prune_stale_change_receipts "$merge_repo" > "${root}/receipts.out"
+CARBON_CHANGE_STATE_DIR="$receipt_state" prune_unreceipted_change_runs >> "${root}/receipts.out"
+[[ ! -e "${receipt_state}/receipts/${stale_fingerprint}.json" ]] || die "a superseded old receipt was kept"
+[[ ! -e "${receipt_state}/runs/change-stale" ]] || die "the superseded receipt's evidence was kept"
+[[ -f "${receipt_state}/receipts/${branch_fingerprint}.json" ]] || die "a receipt for a branch tip was pruned"
+[[ -d "${receipt_state}/runs/change-branch" ]] || die "evidence for a branch-tip receipt was pruned"
+[[ -f "${receipt_state}/receipts/${young_fingerprint}.json" ]] || die "a recent receipt was pruned"
+grep -q 'Pruned 1 superseded' "${root}/receipts.out" || die "receipt pruning did not report what it removed"
+
 echo "PASS: red records, full-tree receipts, and qualified fast-forward merges are enforced"

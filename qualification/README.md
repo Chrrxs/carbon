@@ -78,9 +78,9 @@ used as a Studio tool-routing ID.
 
 Evidence and the passing receipt remain below
 `${XDG_STATE_HOME:-$HOME/.local/state}/carbon/qualification`. Each qualification
-first deletes runs older than a day that no receipt references; receipted
-evidence is always kept. Commit without editing, then merge from clean `main`
-with:
+first deletes receipts older than 14 days whose tree is not the tip of a branch,
+remote-tracking branch, or tag, then runs older than a day that no remaining
+receipt references. Commit without editing, then merge from clean `main` with:
 
 ```sh
 ./scripts/change merge <branch>
