@@ -82,8 +82,8 @@ pub use crate::{
 	deserializer::{DecodeSink, DecodedArena, DecodedInstance, DecodedStructure, Deserializer, Error as DecodeError},
 	rewriter::{rewrite_script_sources, rewrite_workspace_attributes, ScriptSourcePatch},
 	serializer::{
-		CompressionType, Error as EncodeError, InstanceSource, InstanceView, SerializationReport,
-		SerializedInstancePosition, Serializer, StreamingSerializer,
+		fallback_default_value, CompressionType, Error as EncodeError, InstanceSource, InstanceView,
+		SerializationReport, SerializedInstancePosition, Serializer, StreamingSerializer,
 	},
 };
 

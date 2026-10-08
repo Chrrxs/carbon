@@ -1693,7 +1693,11 @@ fn full_name_for(source: &dyn InstanceSource, subject_ref: Ref) -> String {
 
 	name
 }
-fn fallback_default_value(rbx_type: VariantType) -> Option<&'static Variant> {
+
+/// The value the serializer writes for an instance that lacks a property its
+/// class group carries, when the reflection database has no default for it.
+/// Decoding cannot tell this padding apart from an explicit value.
+pub fn fallback_default_value(rbx_type: VariantType) -> Option<&'static Variant> {
 	use std::sync::LazyLock;
 	static DEFAULT_STRING: Variant = Variant::String(String::new());
 	static DEFAULT_BINARYSTRING: Variant = Variant::BinaryString(BinaryString::new());

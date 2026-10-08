@@ -321,7 +321,15 @@ fn mapped_property_maps_equal(class: &str, left: &UstrMap<Variant>, right: &Ustr
 }
 
 fn mapped_property_equal(class: &str, name: &str, left: Option<&Variant>, right: Option<&Variant>) -> bool {
-	let default = reflection_default(class, name);
+	// A binary artifact pads each instance with every property its class group
+	// carries, so an absent property decodes as the class default. Without a
+	// reflection default that padding is the serializer's type default, which
+	// is what lets new engine-only properties such as SerializedOverrides reach
+	// file-mapped instances that never had them.
+	let default = reflection_default(class, name).or_else(|| {
+		left.or(right)
+			.and_then(|value| rbx_binary::fallback_default_value(value.ty()))
+	});
 	let left = left.or(default);
 	let right = right.or(default);
 	match (left, right) {
@@ -2231,27 +2239,90 @@ fn is_capture_identity_only_property(property: &str) -> bool {
 }
 
 fn projected_realization_changes_pending(changes: &Changes, mapped_refs: &HashSet<Ref>) -> bool {
-	if !changes.additions.is_empty() || !changes.removals.is_empty() {
-		return true;
+	!changes.additions.is_empty()
+		|| !changes.removals.is_empty()
+		|| changes
+			.updates
+			.iter()
+			.any(|update| projected_realization_update_pending(update, mapped_refs))
+}
+
+fn projected_realization_update_pending(update: &UpdatedSnapshot, mapped_refs: &HashSet<Ref>) -> bool {
+	!mapped_refs.contains(&update.id)
+		|| update.parent.is_some()
+		|| update.name.is_some()
+		|| update.raw_name.is_some()
+		|| update.class.is_some()
+		|| update
+			.properties
+			.as_ref()
+			.is_some_and(|properties| !properties.is_empty())
+		|| update.removed_properties.is_empty()
+		|| update.removed_properties.iter().any(|property| {
+			!matches!(
+				property.as_str(),
+				"Capabilities" | "LinkedSource" | "Sandboxed" | "SourceAssetId"
+			)
+		})
+}
+
+/// Name what keeps a projected realization pending, so a capture that times
+/// out waiting for synchronization reports which instances and properties
+/// never settled.
+fn describe_pending_realization(changes: &Changes, previous: &Snapshot, mapped_refs: &HashSet<Ref>) -> String {
+	const EXAMPLES: usize = 3;
+	let nodes = flatten_snapshot(previous);
+	let label = |id: &Ref| {
+		nodes.get(id).map_or_else(
+			|| format!("instance {id}"),
+			|node| format!("{} '{}'", node.snapshot.class, node.snapshot.name),
+		)
+	};
+	let pending_updates = changes
+		.updates
+		.iter()
+		.filter(|update| projected_realization_update_pending(update, mapped_refs))
+		.collect::<Vec<_>>();
+	let mut examples = changes
+		.additions
+		.iter()
+		.map(|addition| format!("added {} '{}'", addition.class, addition.name))
+		.chain(changes.removals.iter().map(|id| format!("removed {}", label(id))))
+		.chain(pending_updates.iter().map(|update| {
+			let mut fields = Vec::new();
+			if !mapped_refs.contains(&update.id) {
+				fields.push("not file-mapped".to_owned());
+			}
+			if update.parent.is_some() {
+				fields.push("parent".to_owned());
+			}
+			if update.name.is_some() || update.raw_name.is_some() {
+				fields.push("name".to_owned());
+			}
+			if update.class.is_some() {
+				fields.push("class".to_owned());
+			}
+			if let Some(properties) = &update.properties {
+				let mut names = properties.keys().map(|name| name.as_str()).collect::<Vec<_>>();
+				names.sort_unstable();
+				fields.extend(names.into_iter().map(|name| format!("set {name}")));
+			}
+			fields.extend(update.removed_properties.iter().map(|name| format!("removed {name}")));
+			format!("{}: {}", label(&update.id), fields.join(", "))
+		}));
+	let shown = examples.by_ref().take(EXAMPLES).collect::<Vec<_>>();
+	let hidden = examples.count();
+	let mut summary = format!(
+		"{} additions, {} removals, {} updates; {}",
+		changes.additions.len(),
+		changes.removals.len(),
+		pending_updates.len(),
+		shown.join("; ")
+	);
+	if hidden > 0 {
+		summary.push_str(&format!("; and {hidden} more"));
 	}
-	changes.updates.iter().any(|update| {
-		!mapped_refs.contains(&update.id)
-			|| update.parent.is_some()
-			|| update.name.is_some()
-			|| update.raw_name.is_some()
-			|| update.class.is_some()
-			|| update
-				.properties
-				.as_ref()
-				.is_some_and(|properties| !properties.is_empty())
-			|| update.removed_properties.is_empty()
-			|| update.removed_properties.iter().any(|property| {
-				!matches!(
-					property.as_str(),
-					"Capabilities" | "LinkedSource" | "Sandboxed" | "SourceAssetId"
-				)
-			})
-	})
+	summary
 }
 
 /// Re-evaluate frozen filesystem mappings against the small hierarchy retained
@@ -2300,14 +2371,18 @@ pub(crate) fn reevaluate_projected_frozen_tracked(
 	))
 }
 
-#[derive(Debug)]
-pub(crate) struct ProjectSynchronizationPending;
+#[derive(Debug, Default)]
+pub(crate) struct ProjectSynchronizationPending {
+	detail: Option<String>,
+}
 
 impl std::fmt::Display for ProjectSynchronizationPending {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		formatter.write_str(
-			"filesystem mapping realization has pending changes; wait for project synchronization before Capture Manifest",
-		)
+		formatter.write_str("filesystem mapping realization has pending changes")?;
+		if let Some(detail) = &self.detail {
+			write!(formatter, " ({detail})")?;
+		}
+		formatter.write_str("; wait for project synchronization before Capture Manifest")
 	}
 }
 
@@ -2323,7 +2398,10 @@ pub(crate) fn exact_projected_realization_generation(
 		reevaluate_projected_frozen(project_path, frozen_project_document, previous_projected, mapped_refs)?;
 	let changes = diff_snapshots(previous_projected, &candidate)?;
 	if projected_realization_changes_pending(&changes, mapped_refs) {
-		return Err(ProjectSynchronizationPending.into());
+		return Err(ProjectSynchronizationPending {
+			detail: Some(describe_pending_realization(&changes, previous_projected, mapped_refs)),
+		}
+		.into());
 	}
 	projected_realization_generation(candidate, routes)
 }
@@ -7754,6 +7832,118 @@ mod tests {
 
 		changes.updates[0].removed_properties.push(Ustr::from("Archivable"));
 		assert!(projected_realization_changes_pending(&changes, &HashSet::from([id])));
+	}
+
+	#[test]
+	fn snapshot_diff_treats_unreflected_artifact_padding_as_absent() {
+		let id = Ref::new();
+		let script = |properties: UstrMap<Variant>| {
+			Snapshot::new()
+				.with_id(id)
+				.with_name("Script")
+				.with_class("ModuleScript")
+				.with_properties(properties)
+		};
+		let overrides = |value: &[u8]| {
+			UstrMap::from_iter([(
+				Ustr::from("SerializedOverrides"),
+				Variant::BinaryString(value.to_vec().into()),
+			)])
+		};
+		let file = script(UstrMap::default());
+
+		let padded = diff_snapshots(&script(overrides(b"")), &file).unwrap();
+		assert!(padded.is_empty(), "padding removal was reported: {padded:?}");
+		assert!(!projected_realization_changes_pending(&padded, &HashSet::from([id])));
+
+		let authored = diff_snapshots(&script(overrides(b"state")), &file).unwrap();
+		assert_eq!(authored.updates.len(), 1);
+		assert_eq!(
+			authored.updates[0].removed_properties,
+			vec![Ustr::from("SerializedOverrides")]
+		);
+	}
+
+	#[test]
+	fn projected_realization_settles_when_studio_scripts_carry_unreflected_engine_state() {
+		let root = temp("projected-unreflected-padding");
+		fs::create_dir_all(&root).unwrap();
+		let project_path = root.join("game.carbon.json");
+		initialize(&project_path, "Game".to_owned()).unwrap();
+		let materialized = materialize(&project_path).unwrap();
+		let policy = live_policy(&project_path, &materialized);
+		let overrides = Ustr::from("SerializedOverrides");
+
+		// Studio now saves SerializedOverrides on every instance. Captures keep it
+		// on Studio-owned scripts, and the binary artifact then pads every
+		// file-mapped script in the same class group with an empty value.
+		let mut composite = materialized.snapshot.clone();
+		let replicated = composite
+			.children
+			.iter_mut()
+			.find(|child| child.class.as_str() == "ReplicatedStorage")
+			.unwrap();
+		replicated.children.push(
+			Snapshot::new()
+				.with_id(Ref::new())
+				.with_name("StudioOwned")
+				.with_class("ModuleScript")
+				.with_properties(UstrMap::from_iter([
+					(Ustr::from("Source"), Variant::String("return nil\n".to_owned())),
+					(overrides, Variant::BinaryString(b"".to_vec().into())),
+				])),
+		);
+		let artifact = root.join("composite.carbon");
+		artifact_store::extract_snapshot(composite, "Game".to_owned(), &artifact).unwrap();
+		let projected =
+			artifact_store::load_projected_live(&artifact, &policy.mapped_refs, &policy.routing_refs).unwrap();
+		let previous = snapshot_from_tree(&projected.tree).unwrap();
+		fn padded_scripts(snapshot: &Snapshot, overrides: Ustr) -> usize {
+			usize::from(snapshot.class.as_str() == "ModuleScript" && snapshot.properties.contains_key(&overrides))
+				+ snapshot
+					.children
+					.iter()
+					.map(|child| padded_scripts(child, overrides))
+					.sum::<usize>()
+		}
+		assert!(
+			padded_scripts(&previous, overrides) > 0,
+			"fixture no longer pads file-mapped scripts through the artifact"
+		);
+
+		exact_projected_realization_generation(&project_path, &policy.project_document, &previous, &policy.mapped_refs)
+			.expect("artifact padding must not leave the realization pending");
+		fs::remove_dir_all(materialized.directory).unwrap();
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn pending_realization_error_names_the_unsettled_instance() {
+		let (project_root, composite_root, policy, _) = capture_promotion_fixture("capture-pending-detail");
+		let projected =
+			artifact_store::load_projected_live(&policy.composite_manifest, &policy.mapped_refs, &policy.routing_refs)
+				.unwrap();
+		let previous = snapshot_from_tree(&projected.tree).unwrap();
+		fs::write(
+			project_root.join("src/ReplicatedStorage/Shared/Example.luau"),
+			"return 'changed'\n",
+		)
+		.unwrap();
+		let error = exact_projected_realization_generation(
+			&policy.project_path,
+			&policy.project_document,
+			&previous,
+			&policy.mapped_refs,
+		)
+		.unwrap_err();
+		assert!(error.downcast_ref::<ProjectSynchronizationPending>().is_some());
+		let message = error.to_string();
+		assert!(
+			message.contains("ModuleScript 'Example': set Source"),
+			"pending detail omitted the instance: {message}"
+		);
+		fs::remove_dir_all(project_root).unwrap();
+		fs::remove_dir_all(composite_root).unwrap();
 	}
 
 	#[test]

@@ -6,7 +6,12 @@ Every feature follows one state machine:
 RED RECORDED -> IMPLEMENT -> QUALIFIED TREE -> COMMIT SAME TREE -> FF-ONLY MERGE
 ```
 
-The only interface is `./scripts/change`.
+The only interface for merging is `./scripts/change`.
+
+Qualification is the merge gate into `main`, not a prerequisite for trying a
+change. While a feature is in progress, build and run an unqualified binary
+from the feature worktree (see [Local unqualified builds](#local-unqualified-builds)).
+Run `./scripts/change qualify` only when the tree is ready to merge.
 
 ## 1. Create a feature worktree
 
@@ -37,9 +42,30 @@ output. Do this before implementing the behavior.
 Make the production change. Iterate with the focused test until it passes.
 Do not remove or weaken the regression test that established red.
 
-## 4. Qualify the complete tree
+### Local unqualified builds
 
-Run one command:
+To try the change against a real project or Studio session before merging,
+build a release binary from the feature worktree. Release builds embed the
+Studio plugin, so build that first with the same version:
+
+```bash
+export CARBON_BUILD_VERSION="$(./scripts/build-version)"
+./scripts/build-studio-plugin target/local/Carbon.rbxm
+CARBON_STUDIO_PLUGIN_BUNDLE="$PWD/target/local/Carbon.rbxm" \
+	cargo build --locked --release --bin carbon
+./target/release/carbon --version
+```
+
+Run it by path, for example `./target/release/carbon serve game.carbon.json`.
+The binary is unqualified: it needs no receipt and produces none, and it never
+replaces the installed CLI. Only `./scripts/update-release` updates the
+installed CLI and plugin, and it accepts only qualified artifacts. Build and
+test like this as often as you need; qualification does not run here.
+
+## 4. Qualify the complete tree before merging
+
+Qualify once the feature is finished and ready to merge into `main`. Run one
+command:
 
 ```bash
 ./scripts/change qualify

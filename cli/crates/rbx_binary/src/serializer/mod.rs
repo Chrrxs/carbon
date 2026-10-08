@@ -14,7 +14,7 @@ use rbx_reflection::ReflectionDatabase;
 
 use self::state::SerializerState;
 
-pub use self::error::Error;
+pub use self::{error::Error, state::fallback_default_value};
 
 /// Logical payload counts and columns produced by one serialization.
 #[derive(Clone, Debug, Default)]

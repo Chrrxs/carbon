@@ -259,7 +259,7 @@ mod manifest_capture_retry_tests {
 			|| {
 				checks += 1;
 				if checks < 3 {
-					return Err(project::ProjectSynchronizationPending.into());
+					return Err(project::ProjectSynchronizationPending::default().into());
 				}
 				Ok("synchronized")
 			},
@@ -276,7 +276,7 @@ mod manifest_capture_retry_tests {
 	fn pending_project_realization_wait_is_bounded() {
 		let waits = std::cell::Cell::new(0);
 		let error = wait_for_project_synchronization::<(), _, _, _>(
-			|| Err(project::ProjectSynchronizationPending.into()),
+			|| Err(project::ProjectSynchronizationPending::default().into()),
 			|_| waits.set(waits.get() + 1),
 			|| waits.get() >= 1,
 		)
