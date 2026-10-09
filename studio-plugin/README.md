@@ -2,7 +2,7 @@
 
 Filesystem-authoritative Roblox development with explicit place capture.
 
-The Carbon Studio plugin connects one Studio session to a `carbon serve` process. It live-syncs only the Folder/script mappings established when the server started. After reconciliation, Studio-owned state outside mappings is captured continuously from Studio auto-recovery saves.
+The Carbon Studio plugin connects one Studio session to a `carbon serve` process. It live-syncs only the Folder/script mappings established when the server started. After reconciliation, Studio-owned state outside mappings is captured continuously from Studio auto-recovery saves and on demand from Studio quick saves.
 
 The plugin requires a matching Carbon CLI build. Release CLIs embed that exact plugin and automatically install it before `carbon serve` or `carbon studio` launches Studio, replacing a missing or byte-different local copy.
 
@@ -36,7 +36,7 @@ The plugin does not write Studio changes into mapped files or project mappings.
 
 ## Capture Manifest
 
-`serve` continuously waits for the next Studio auto-recovery save and atomically commits each verified result. **Capture Manifest** waits for the currently active automatic capture cycle and displays its progress.
+`serve` continuously waits for the next Studio auto-recovery save and atomically commits each verified result. **Capture Manifest** joins the active capture and asks Studio for an immediate quick save: the plugin starts a `StudioTestService` Server & Clients test, whose Start Server action first writes the complete edit DataModel with Studio's own place serializer. `serve` stops that test server, and a test server it could not stop ends itself through this plugin.
 
 To import a place saved manually through Studio's **File > Save to File** command, use:
 
@@ -51,9 +51,9 @@ Automatic capture verifies the exact project, worktree, and Studio session. Offl
 - ambiguous manifest identity reconciliation; and
 - persistent state Carbon cannot represent safely.
 
-Manifest-owned `Ref` properties may target any mapped instance. Capture restores filesystem-authoritative mapped roots before committing the Studio-owned complement, so Studio drift beneath a mapping never writes back to source. `carbon stop` and the first Ctrl+C in the serve terminal both wait for the next auto-recovery or a manual save over the temporary served `.rbxl`, whichever arrives first.
+Manifest-owned `Ref` properties may target any mapped instance. Capture restores filesystem-authoritative mapped roots before committing the Studio-owned complement, so Studio drift beneath a mapping never writes back to source. `carbon stop`, the first Ctrl+C in the serve terminal, and project reloads always request a fresh quick save when Studio can make one and commit only that save, even when Studio reports no change. Only when Studio cannot quick-save do they fall back to the next auto-recovery or a manual save over the temporary served `.rbxl`.
 
-Studio auto-recovery must be enabled. For managed `serve`, Carbon installs the
+Studio auto-recovery must be enabled; it remains the background capture and the fallback when Studio cannot quick-save, such as during a playtest. For managed `serve`, Carbon installs the
 matching plugin before authorizing an exact-process `robloxstudio-mcp` launch;
 the broker remains lifecycle owner through final instance association and
 shutdown. Carbon does not inject native code or modify Studio binaries.

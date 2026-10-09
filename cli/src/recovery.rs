@@ -16,6 +16,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STABLE_POLLS: usize = 2;
 const MODIFIED_TIME_SLOP: Duration = Duration::from_secs(2);
 const AUTOSAVES_OVERRIDE: &str = "CARBON_STUDIO_AUTOSAVES_DIR";
+const QUICK_SAVE_OVERRIDE: &str = "CARBON_STUDIO_QUICK_SAVE_FILE";
+/// Studio's Start Server action writes the edit DataModel here before it
+/// launches the local test server.
+const QUICK_SAVE_FILE_NAME: &str = "server.rbxl";
 const CONSUMED_RECOVERY_DIRECTORY: &str = ".carbon-consumed";
 /// Committed captures already live in the project; only the most recent
 /// originals are kept as evidence for diagnosing a bad capture.
@@ -31,6 +35,7 @@ pub(crate) struct RecoveryFingerprint {
 pub(crate) enum RecoveryKind {
 	StudioAutoRecovery,
 	ServedPlace,
+	StudioQuickSave,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +55,7 @@ impl RecoveryKind {
 		match self {
 			Self::StudioAutoRecovery => "Studio auto-recovery",
 			Self::ServedPlace => "manually saved temporary place",
+			Self::StudioQuickSave => "Studio quick save",
 		}
 	}
 }
@@ -82,6 +88,16 @@ impl RecoverySource {
 		Ok(Self {
 			kind: RecoveryKind::ServedPlace,
 			location: RecoveryLocation::File(path),
+			baseline,
+		})
+	}
+
+	/// Carbon's private staging directory for copies of Studio quick saves.
+	pub(crate) fn studio_quick_save(directory: PathBuf) -> Result<Self> {
+		let baseline = inventory(&directory)?;
+		Ok(Self {
+			kind: RecoveryKind::StudioQuickSave,
+			location: RecoveryLocation::Directory(directory),
 			baseline,
 		})
 	}
@@ -145,9 +161,22 @@ pub(crate) fn is_recovery_place(path: &Path) -> bool {
 /// Move exact-session Studio recovery evidence out of Roblox's scan directory
 /// only after the caller has committed it successfully. The archive remains on
 /// the same volume so the move is atomic; any failure leaves the source intact.
+/// A committed quick save is Carbon's private staged copy and is discarded.
 pub(crate) fn quarantine_consumed_recovery(kind: RecoveryKind, path: &Path) -> Result<Option<PathBuf>> {
-	if kind != RecoveryKind::StudioAutoRecovery {
-		return Ok(None);
+	match kind {
+		RecoveryKind::StudioAutoRecovery => {}
+		RecoveryKind::ServedPlace => return Ok(None),
+		RecoveryKind::StudioQuickSave => {
+			match fs::remove_file(path) {
+				Ok(()) => {}
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+				Err(error) => {
+					return Err(error)
+						.with_context(|| format!("failed to discard the staged Studio quick save {}", path.display()));
+				}
+			}
+			return Ok(None);
+		}
 	}
 	ensure!(
 		is_recovery_place(path),
@@ -242,12 +271,6 @@ pub(crate) fn autosaves_dir() -> Result<PathBuf> {
 		return Ok(path);
 	}
 
-	#[cfg(target_os = "windows")]
-	{
-		let local = std::env::var_os("LOCALAPPDATA").context("Windows LOCALAPPDATA is unavailable")?;
-		return Ok(PathBuf::from(local).join("Roblox/RobloxStudio/AutoSaves"));
-	}
-
 	#[cfg(target_os = "macos")]
 	{
 		let home = directories::BaseDirs::new().context("macOS home directory is unavailable")?;
@@ -256,16 +279,57 @@ pub(crate) fn autosaves_dir() -> Result<PathBuf> {
 			.join("Library/Application Support/Roblox/RobloxStudio/AutoSaves"));
 	}
 
+	#[cfg(any(target_os = "windows", target_os = "linux"))]
+	{
+		studio_local_app_data_path(
+			"Roblox/RobloxStudio/AutoSaves",
+			AUTOSAVES_OVERRIDE,
+			"auto-recovery capture",
+		)
+	}
+
+	#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+	anyhow::bail!("Roblox Studio auto-recovery capture is unsupported on this platform")
+}
+
+/// The place file Studio writes before it starts a local Server & Clients test.
+pub(crate) fn studio_quick_save_file() -> Result<PathBuf> {
+	if let Some(path) = std::env::var_os(QUICK_SAVE_OVERRIDE) {
+		return Ok(PathBuf::from(path));
+	}
+
+	#[cfg(any(target_os = "windows", target_os = "linux"))]
+	{
+		studio_local_app_data_path(
+			&format!("Roblox/{QUICK_SAVE_FILE_NAME}"),
+			QUICK_SAVE_OVERRIDE,
+			"quick save",
+		)
+	}
+
+	#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+	anyhow::bail!("Roblox Studio quick save is unsupported on this platform")
+}
+
+/// Resolve `relative` below the Windows LOCALAPPDATA that Studio uses on this
+/// host: native Windows, the Windows profile from WSL, or a Wine prefix.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn studio_local_app_data_path(relative: &str, override_env: &str, purpose: &str) -> Result<PathBuf> {
+	#[cfg(target_os = "windows")]
+	{
+		let _ = (override_env, purpose);
+		let local = std::env::var_os("LOCALAPPDATA").context("Windows LOCALAPPDATA is unavailable")?;
+		Ok(PathBuf::from(local).join(relative))
+	}
+
 	#[cfg(target_os = "linux")]
 	{
 		if let Some(host) = crate::studio::wine_host()? {
-			return Ok(host
-				.local_app_data(AUTOSAVES_OVERRIDE)?
-				.join("Roblox/RobloxStudio/AutoSaves"));
+			return Ok(host.local_app_data(override_env)?.join(relative));
 		}
 		ensure!(
 			std::env::var_os("WSL_DISTRO_NAME").is_some(),
-			"Roblox Studio auto-recovery capture is supported on Linux only through WSL"
+			"Roblox Studio {purpose} is supported on Linux only through WSL"
 		);
 		let output = Command::new("powershell.exe")
 			.args([
@@ -275,28 +339,25 @@ pub(crate) fn autosaves_dir() -> Result<PathBuf> {
 				"[Environment]::GetFolderPath('LocalApplicationData')",
 			])
 			.output()
-			.context("failed to resolve Windows LOCALAPPDATA for Studio auto-recovery")?;
+			.with_context(|| format!("failed to resolve Windows LOCALAPPDATA for Studio {purpose}"))?;
 		ensure!(
 			output.status.success(),
-			"PowerShell could not resolve Windows LOCALAPPDATA for Studio auto-recovery"
+			"PowerShell could not resolve Windows LOCALAPPDATA for Studio {purpose}"
 		);
 		let local = String::from_utf8(output.stdout)?.trim().to_owned();
 		ensure!(!local.is_empty(), "Windows LOCALAPPDATA is empty");
-		let windows = Path::new(&local).join("Roblox/RobloxStudio/AutoSaves");
+		let windows = Path::new(&local).join(relative);
 		let translated = Command::new("wslpath")
 			.arg("-u")
 			.arg(&windows)
 			.output()
-			.context("failed to translate the Studio auto-recovery directory into WSL")?;
+			.with_context(|| format!("failed to translate the Studio {purpose} path into WSL"))?;
 		ensure!(
 			translated.status.success(),
-			"wslpath could not translate the Studio auto-recovery directory"
+			"wslpath could not translate the Studio {purpose} path"
 		);
 		Ok(PathBuf::from(String::from_utf8(translated.stdout)?.trim()))
 	}
-
-	#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-	anyhow::bail!("Roblox Studio auto-recovery capture is unsupported on this platform")
 }
 
 pub(crate) fn inventory(directory: &Path) -> Result<HashMap<PathBuf, RecoveryFingerprint>> {

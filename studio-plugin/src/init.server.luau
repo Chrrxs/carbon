@@ -3,6 +3,13 @@ local RuntimeServices = require(script.RuntimeServices)
 local RunService = RuntimeServices.get("RunService") :: RunService
 
 if RunService:IsRunning() then
+	if RunService:IsServer() then
+		-- A local test server started for a Carbon quick save has no further use;
+		-- the edit Studio's save already exists.
+		local QuickSave = require(script.QuickSave)
+		local StudioTestService = RuntimeServices.get("StudioTestService")
+		task.spawn(QuickSave.endCaptureTest, StudioTestService)
+	end
 	return
 end
 

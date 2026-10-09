@@ -55,7 +55,7 @@ carbon park --port 8000
 # Import a manually saved binary place directly into a project.
 carbon capture game.carbon.json manually-saved.rbxl
 
-# Wait for the next auto-recovery capture, then stop serve and Studio.
+# Capture Studio through an immediate quick save, then stop serve and Studio.
 carbon stop 'anon:550e8400-e29b-41d4-a716-446655440000'
 
 # Compare binary parity.
@@ -144,7 +144,10 @@ bytes. Only the 20 most recent archived recoveries are kept; older ones are
 deleted after each archive because their contents are already committed.
 Carbon does not archive manual saves, rejected recoveries, unknown files, or
 evidence from a failed capture; an archive failure leaves the source in place
-and emits a warning.
+and emits a warning. Quick saves are staged as private copies in a
+`carbon-quick-save-*` temporary directory; a committed copy is deleted, the
+directory is removed when the serve session ends, and Studio's own
+`server.rbxl` is left for Studio to overwrite.
 
 Builds are cached in the user cache directory (`carbon/builds/v1`). The cache
 keeps the most recently used builds within 2 GiB and evicts the rest.
@@ -218,11 +221,15 @@ Carbon finds Studio's `LOCALAPPDATA` at
 `$WINEPREFIX/drive_c/users/<user>/AppData/Local`, using the one profile other
 than `Public` (Proton's `$USER` symlink to `steamuser` counts once). Zero or
 several profiles fail with the override to set: `MCP_PLUGINS_DIR` for the
-plugin, `CARBON_STUDIO_AUTOSAVES_DIR` for auto-recovery, and
-`ROBLOX_STUDIO_EXE` for Studio. Path arguments passed to Studio use Wine's `Z:`
-drive. Process identity is the Linux PID plus its start time; Carbon accepts a
+plugin, `CARBON_STUDIO_AUTOSAVES_DIR` for auto-recovery,
+`CARBON_STUDIO_QUICK_SAVE_FILE` for quick saves, and `ROBLOX_STUDIO_EXE` for
+Studio. Path arguments passed to Studio use Wine's `Z:` drive. Process
+identity is the Linux PID plus its start time; Carbon accepts a
 broker-reported start time within two seconds. Stopping Studio uses a pidfd,
-which needs Linux 5.3 or newer.
+which needs Linux 5.3 or newer. Wine detaches child processes from their Linux
+parent, so a quick-save test server is identified by its `StartServer` or
+`StartClient` task, the served place it was launched from, and a start time
+after the save.
 
 `studio_desktop` parking, desktop routing, audio and window guards, `carbon
 focus`, and `carbon park` need Windows and fail with a clear error on a Wine
@@ -256,16 +263,37 @@ session, its filesystem-authoritative mapped roots are restored, and the new
 Studio artifact is promoted atomically. Carbon immediately starts waiting for
 the following recovery after a successful commit.
 
+Explicit captures do not wait for Studio's auto-recovery interval. `carbon
+stop`, Ctrl+C, project reloads, and captures the plugin requests ask Studio
+for a quick save instead. The plugin calls
+`StudioTestService:ExecuteMultiplayerTestAsync`. Before Studio launches the
+local test server, its Start Server action writes the complete edit DataModel
+to `%LOCALAPPDATA%\Roblox\server.rbxl` with Studio's own place serializer, the
+same bytes an auto-recovery file would contain. Carbon waits for that file,
+stops the test server and any test clients the exact managed Studio started
+for it, and stages a private copy for the same verification and commit path.
+A test server Carbon could not stop ends itself through the Carbon plugin. A
+quick save normally completes within a second or two.
+
+Quick saves need a managed `serve` session. Every Studio on a host writes the
+same `server.rbxl`, so Carbon serializes quick saves across sessions with
+`~/.carbon/studio-quick-save.lock`, and the session identity embedded in each
+save rejects a file from any other Studio. Studio cannot start the test while a
+playtest is running; Carbon then falls back to the next auto-recovery file.
+
 `carbon capture game.carbon.json manually-saved.rbxl` is the explicit offline
 path. It validates and commits that existing binary place immediately without
 requiring an instance ID, port, running server, or connected Studio. The
 place's embedded Carbon project identity must match the explicit project.
 
-Studio auto-recovery must be enabled. On Windows Carbon watches
+Studio auto-recovery must stay enabled as the background capture and the
+fallback for explicit captures. Studio's default five-minute interval is
+sufficient; Carbon does not change it. On Windows Carbon watches
 `%LOCALAPPDATA%\Roblox\RobloxStudio\AutoSaves`; from WSL it watches the same
 Windows directory through `wslpath`, and on a Wine host it watches that
 directory inside `WINEPREFIX`. Tests and custom environments may set
-`CARBON_STUDIO_AUTOSAVES_DIR` to an explicit directory. Only new or changed
+`CARBON_STUDIO_AUTOSAVES_DIR` to an explicit directory and
+`CARBON_STUDIO_QUICK_SAVE_FILE` to the quick-save place. Only new or changed
 `.rbxl` files created after the active automatic wait began are eligible. Each
 wait is bounded to six minutes and then restarts while the serve session remains
 connected. A failed, cancelled, or timed-out attempt preserves the previous
@@ -275,10 +303,16 @@ Carbon blocks capture when persistent state cannot be represented safely,
 including scripts outside mappings and mapped-owned references to Studio-owned
 objects. Studio-owned references may target stable mapped identities.
 
-`carbon stop` races the next eligible auto-recovery against a manual save over
-the temporary `carbon-serve-*.rbxl` launch place, then asks
-`robloxstudio-mcp manage_instance` to close the exact launch as soon as either
-verified file arrives.
+`carbon stop` always quick-saves when it can and does not consult Studio's
+change marker for it, because edits that never start a ChangeHistory recording
+leave that marker unchanged. It waits for any quick save
+already in flight, requests a fresh one, and commits only that save, then asks
+`robloxstudio-mcp manage_instance` to close the exact launch. Project reloads
+capture the same way. Only when Studio cannot quick-save does `carbon stop`
+accept the first verified auto-recovery or manual save over the temporary
+`carbon-serve-*.rbxl` launch place, or keep the last capture when Studio
+reports no change, instead of waiting for an auto-recovery file Studio would
+never write.
 Pressing Ctrl+C in the `carbon serve` terminal follows the same default
 shutdown path. A second Ctrl+C forces cleanup.
 

@@ -62,12 +62,12 @@ The installed suite proves three release-critical slices:
    data directory.
 3. A broker-managed Studio session imports an explicit binary place through
    `carbon capture`, proves Carbon can focus it through the broker-final MCP
-   instance ID, authors a live change, then `carbon stop` waits for the
-   continuously monitored next auto-recovery file and a rebuild retains that
-   change.
+   instance ID, authors a live change, then `carbon stop` captures it through
+   a Studio quick save and a rebuild retains that change.
 
-The stop step has a 390-second harness timeout around Carbon's six-minute
-recovery deadline. No native code is loaded into Studio and no Studio binary is
+The stop step has a 120-second harness timeout; a quick save normally
+completes within seconds, and Carbon's six-minute auto-recovery deadline is the
+fallback the harness would not wait for. No native code is loaded into Studio and no Studio binary is
 modified.
 
 Concurrent worktrees lease separate Carbon ports and run state. Each run gives

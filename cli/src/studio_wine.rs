@@ -744,6 +744,51 @@ pub(crate) fn is_running() -> Result<bool> {
 	Ok(!ProcFs::system().studio_processes()?.is_empty())
 }
 
+/// Whether a NUL-separated argv is a Studio local test session (`-task
+/// StartServer` or `StartClient`) launched from the place `place_file_name`.
+fn is_quick_save_test_session(command_line: &[u8], place_file_name: &str) -> bool {
+	let place = place_file_name.to_ascii_lowercase();
+	if place.is_empty() {
+		return false;
+	}
+	let arguments = command_line
+		.split(|byte| *byte == 0)
+		.map(|argument| String::from_utf8_lossy(argument).to_ascii_lowercase())
+		.collect::<Vec<_>>();
+	let test_task = arguments.windows(2).any(|pair| {
+		pair[0].trim_start_matches('-') == "task" && matches!(pair[1].as_str(), "startserver" | "startclient")
+	});
+	test_task && arguments.iter().any(|argument| argument.contains(&place))
+}
+
+/// Stop the Studio test server and clients a quick save of `place_file_name`
+/// started at or after `since_filetime`. Wine detaches child processes from
+/// their Linux parent, so the task and launch place identify the session.
+pub(crate) fn stop_quick_save_test_sessions(place_file_name: &str, since_filetime: u64) -> Result<usize> {
+	stop_quick_save_test_sessions_with(ProcFs::system(), place_file_name, since_filetime)
+}
+
+fn stop_quick_save_test_sessions_with(proc: &ProcFs, place_file_name: &str, since_filetime: u64) -> Result<usize> {
+	let mut stopped = 0;
+	for process_id in proc.studio_processes()? {
+		let Some(identity) = proc.identity(process_id)? else {
+			continue;
+		};
+		if identity.creation_filetime.saturating_add(START_TIME_TOLERANCE) < since_filetime {
+			continue;
+		}
+		let Some(command_line) = proc.read_process_file(process_id, "cmdline")? else {
+			continue;
+		};
+		if !is_quick_save_test_session(&command_line, place_file_name) {
+			continue;
+		}
+		terminate_with(proc, process_id, identity.creation_filetime)?;
+		stopped += 1;
+	}
+	Ok(stopped)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1228,5 +1273,99 @@ mod tests {
 		let error = bash_launch(directory.path(), "exec sleep 30", Duration::from_millis(500)).unwrap_err();
 		assert!(format!("{error:#}").contains("did not exec"));
 		assert!(started.elapsed() < Duration::from_secs(5));
+	}
+
+	#[test]
+	fn quick_save_test_sessions_match_their_task_and_launch_place() {
+		let place = "carbon-serve-0123.rbxl";
+		assert!(is_quick_save_test_session(
+			b"C:\\Studio\\RobloxStudioBeta.exe\0-task\0StartServer\0-localProjectFile\0Z:/tmp/carbon-serve-0123.rbxl\0",
+			place
+		));
+		assert!(is_quick_save_test_session(
+			b"RobloxStudioBeta.exe\0-task\0StartClient\0-localProjectFile\0Z:\\tmp\\CARBON-SERVE-0123.RBXL\0",
+			place
+		));
+		assert!(!is_quick_save_test_session(
+			b"RobloxStudioBeta.exe\0--task\0EditFile\0--localPlaceFile\0Z:/tmp/carbon-serve-0123.rbxl\0",
+			place
+		));
+		assert!(!is_quick_save_test_session(
+			b"RobloxStudioBeta.exe\0-task\0StartServer\0-localProjectFile\0Z:/tmp/carbon-serve-9999.rbxl\0",
+			place
+		));
+		assert!(!is_quick_save_test_session(
+			b"RobloxStudioBeta.exe\0-task\0StartServer\0",
+			""
+		));
+	}
+
+	#[test]
+	fn quick_save_test_sessions_match_wine_rewritten_command_lines() {
+		// Wine 11 rewrites a CreateProcess child's argv to the Windows command
+		// line and pads the rest of the original argv area with NULs.
+		let mut command_line = [
+			r"C:\Program Files\Roblox\Versions\v1\RobloxStudioBeta.exe",
+			"-placeVersion",
+			"0",
+			"-task",
+			"StartServer",
+			"-localProjectFile",
+			"Z:/tmp/carbon-serve-0123abcd.rbxl",
+			"-placeId",
+			"0",
+		]
+		.join("\0")
+		.into_bytes();
+		command_line.extend([0; 64]);
+		assert!(is_studio_command_line(&command_line, STUDIO_EXECUTABLE_NAME));
+		assert!(is_quick_save_test_session(&command_line, "carbon-serve-0123abcd.rbxl"));
+		assert!(!is_quick_save_test_session(&command_line, "carbon-serve-ffffffff.rbxl"));
+	}
+
+	fn test_session(proc: &ProcFs, place: &str) -> (std::process::Child, ProcessIdentity) {
+		// `; true` keeps bash from exec'ing sleep, so the argv stays visible.
+		let mut child = Command::new("bash")
+			.arg0(format!("/carbon/{TEST_STUDIO}"))
+			.args([
+				"-c",
+				"sleep 10; true",
+				"-task",
+				"StartServer",
+				"-localProjectFile",
+				place,
+			])
+			.spawn()
+			.unwrap();
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while Instant::now() < deadline {
+			let identity = proc.identity(child.id()).unwrap().unwrap();
+			if identity.studio {
+				return (child, identity);
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+		child.kill().unwrap();
+		child.wait().unwrap();
+		panic!("test session never published its argv");
+	}
+
+	#[test]
+	fn quick_save_reaper_stops_only_new_sessions_for_the_served_place() {
+		let proc = ProcFs::new("/proc", TEST_STUDIO);
+		let place = format!("carbon-serve-{}.rbxl", uuid::Uuid::new_v4().simple());
+		let (mut other_place, _) = test_session(&proc, "/tmp/carbon-serve-other.rbxl");
+		let (mut session, identity) = test_session(&proc, &format!("/tmp/{place}"));
+
+		let future = identity.creation_filetime + 10 * FILETIME_TICKS_PER_SECOND;
+		assert_eq!(stop_quick_save_test_sessions_with(&proc, &place, future).unwrap(), 0);
+		assert_eq!(session.try_wait().unwrap(), None);
+
+		let stopped = stop_quick_save_test_sessions_with(&proc, &place, identity.creation_filetime).unwrap();
+		assert_eq!(stopped, 1);
+		assert!(session.wait().unwrap().code().is_none());
+		assert_eq!(other_place.try_wait().unwrap(), None);
+		other_place.kill().unwrap();
+		other_place.wait().unwrap();
 	}
 }

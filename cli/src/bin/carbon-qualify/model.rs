@@ -653,7 +653,7 @@ mod tests {
 			.as_array()
 			.unwrap()
 			.iter()
-			.find(|scenario| scenario["name"] == "managed-studio-auto-recovery-capture")
+			.find(|scenario| scenario["name"] == "managed-studio-quick-save-capture")
 			.unwrap()["steps"]
 			.as_array()
 			.unwrap()
@@ -675,7 +675,7 @@ mod tests {
 	}
 
 	#[test]
-	fn release_suite_exercises_auto_recovery_capture() {
+	fn release_suite_exercises_quick_save_capture() {
 		let suite = release_suite();
 		let deterministic = suite["scenarios"]
 			.as_array()
@@ -697,19 +697,21 @@ mod tests {
 			.as_array()
 			.unwrap()
 			.iter()
-			.find(|scenario| scenario["name"] == "managed-studio-auto-recovery-capture")
-			.expect("release suite is missing the auto-recovery scenario");
+			.find(|scenario| scenario["name"] == "managed-studio-quick-save-capture")
+			.expect("release suite is missing the quick-save scenario");
 		let steps = scenario["steps"].as_array().unwrap();
 		let capture = steps
 			.iter()
-			.find(|step| step["name"] == "stop-after-next-auto-recovery")
-			.expect("release suite is missing recovery-backed stop");
-		assert!(capture["timeout_seconds"].as_u64().unwrap() >= 390);
+			.find(|step| step["name"] == "stop-after-quick-save")
+			.expect("release suite is missing quick-save-backed stop");
+		// A stop bounded well below the six-minute auto-recovery wait can only
+		// pass through Studio's quick save.
+		assert!(capture["timeout_seconds"].as_u64().unwrap() <= 120);
 		assert!(capture["stderr_contains"]
 			.as_array()
 			.unwrap()
 			.iter()
-			.any(|value| value == "auto-recovery"));
+			.any(|value| value == "quick save"));
 		assert!(!capture["args"]
 			.as_array()
 			.unwrap()
@@ -758,7 +760,7 @@ mod tests {
 			.as_array()
 			.unwrap()
 			.iter()
-			.find(|scenario| scenario["name"] == "managed-studio-auto-recovery-capture")
+			.find(|scenario| scenario["name"] == "managed-studio-quick-save-capture")
 			.unwrap()["steps"]
 			.as_array()
 			.unwrap();
@@ -771,12 +773,12 @@ mod tests {
 		assert_eq!(assertion["path"], "${capture_rebuild_output}");
 		assert_eq!(
 			assertion["instance_path"],
-			serde_json::json!(["Workspace", "CarbonAutoRecoveryProbe"])
+			serde_json::json!(["Workspace", "CarbonQuickSaveProbe"])
 		);
 		assert_eq!(assertion["class"], "Part");
 		assert_eq!(assertion["properties"]["Anchored"], true);
 		assert_eq!(assertion["properties"]["Size"], serde_json::json!([7, 3, 5]));
-		assert_eq!(assertion["attributes"]["CapturedThroughAutoRecovery"], true);
+		assert_eq!(assertion["attributes"]["CapturedThroughQuickSave"], true);
 	}
 
 	#[test]

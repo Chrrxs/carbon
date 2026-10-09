@@ -69,7 +69,7 @@ impl SourceDetails {
 	pub fn new(name: String, root_refs: Vec<Ref>, is_place: bool) -> Self {
 		Self {
 			version: env!("CARBON_BUILD_VERSION").to_owned(),
-			protocol_version: 4,
+			protocol_version: 5,
 			name,
 			root_refs,
 			mapped_root_refs: Vec::new(),
@@ -128,7 +128,7 @@ mod tests {
 	fn source_details_publish_protocol_four_mapping_barriers() {
 		let mapped = vec![Ref::new(), Ref::new()];
 		let details = SourceDetails::new("Mapped".to_owned(), vec![], true).with_mapped_root_refs(mapped.clone());
-		assert_eq!(details.protocol_version, 4);
+		assert_eq!(details.protocol_version, 5);
 		assert_eq!(details.mapped_root_refs, mapped);
 	}
 

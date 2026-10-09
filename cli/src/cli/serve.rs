@@ -20,7 +20,7 @@ use crate::{
 	config::Config,
 	core::Core,
 	ext::PathExt,
-	project,
+	project, quick_save, recovery,
 	server::{self, Server},
 	sessions::{self, Session},
 	source, studio, util,
@@ -136,6 +136,7 @@ fn launch_disposable_managed_place<T>(build_path: &Path, launch: impl FnOnce() -
 struct ServeCleanupPaths {
 	build: PathBuf,
 	composites: Arc<Mutex<Vec<PathBuf>>>,
+	scratch: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl ServeCleanupPaths {
@@ -147,6 +148,7 @@ impl ServeCleanupPaths {
 			} else {
 				vec![composite]
 			})),
+			scratch: Arc::new(Mutex::new(Vec::new())),
 		}
 	}
 
@@ -157,10 +159,22 @@ impl ServeCleanupPaths {
 		}
 	}
 
+	/// A session-private directory, such as staged Studio quick saves, that
+	/// must not outlive serve even when a core is still referenced at exit.
+	fn register_scratch_directory(&self, directory: PathBuf) {
+		let mut scratch = self.scratch.lock();
+		if !scratch.contains(&directory) {
+			scratch.push(directory);
+		}
+	}
+
 	fn clean(&self) {
 		let _ = fs::remove_file(&self.build);
 		for composite in self.composites.lock().clone() {
 			let _ = crate::composite::remove(&composite);
+		}
+		for directory in self.scratch.lock().clone() {
+			let _ = fs::remove_dir_all(&directory);
 		}
 	}
 }
@@ -268,12 +282,34 @@ fn persist_served_studio_domain(project_path: &Path, cleanup_paths: &ServeCleanu
 	project::persist_studio_domain(&policy).context("failed to prune mapping barriers before serve startup")
 }
 
+/// Quick saves need the exact managed Studio process so Carbon can stop the
+/// local test server Studio starts after writing the save.
+fn studio_quick_save_host(
+	managed_studio: &studio::ManagedStudio,
+	build_path: &Path,
+) -> Result<quick_save::StudioQuickSaveHost> {
+	let quick_save_file = recovery::studio_quick_save_file().context("failed to locate the Studio quick-save file")?;
+	let lock_file = util::get_carbon_dir()?.join("studio-quick-save.lock");
+	let process = managed_studio.process_identity();
+	let place_file_name = build_path
+		.file_name()
+		.context("the managed place has no file name")?
+		.to_string_lossy()
+		.into_owned();
+	Ok(quick_save::StudioQuickSaveHost {
+		quick_save_file,
+		lock_file,
+		reaper: Arc::new(move |since| studio::stop_quick_save_test_sessions(&process, &place_file_name, since)),
+	})
+}
+
 fn prepare_served_core(
 	project_path: &Path,
 	worktree_id: &str,
 	session_token: &str,
 	control_sender: &server::ServeControlSender,
 	cleanup_paths: &ServeCleanupPaths,
+	quick_save: Option<&quick_save::StudioQuickSaveHost>,
 ) -> Result<Arc<Core>> {
 	let materialized = project::materialize(project_path).context("failed to materialize served project topology")?;
 	let project_name = materialized.name.clone();
@@ -287,6 +323,10 @@ fn prepare_served_core(
 	)?);
 	core.register_ephemeral_path(composite_directory);
 	core.register_served_place(cleanup_paths.build.clone());
+	if let Some(host) = quick_save {
+		let staging_dir = core.register_studio_quick_save(host.clone())?;
+		cleanup_paths.register_scratch_directory(staging_dir);
+	}
 	Ok(core)
 }
 
@@ -375,6 +415,15 @@ impl Serve {
 			managed_studio.owner()
 		);
 
+		let quick_save_host = match studio_quick_save_host(&managed_studio, &build_path) {
+			Ok(host) => Some(host),
+			Err(error) => {
+				crate::carbon_warn!(
+					"Studio quick saves are unavailable; captures wait for Studio auto-recovery: {error:#}"
+				);
+				None
+			}
+		};
 		let (control_sender, control_receiver) = server::serve_control_channel();
 		let mut core = match prepare_served_core(
 			&project_path,
@@ -382,6 +431,7 @@ impl Serve {
 			&session_token,
 			&control_sender,
 			&cleanup_paths,
+			quick_save_host.as_ref(),
 		) {
 			Ok(generation) => generation,
 			Err(error) => {
@@ -538,6 +588,7 @@ impl Serve {
 			let reload_session = session_token.clone();
 			let reload_control = control_sender.clone();
 			let reload_cleanup_paths = cleanup_paths.clone();
+			let reload_quick_save = quick_save_host.clone();
 			let active_server = Server::new(Arc::clone(&core), SERVE_HOST, port);
 			let reload_stop_requested = active_server.external_stop_signal();
 			let server_result = active_server.start_with_listener_control(
@@ -599,6 +650,7 @@ impl Serve {
 								&reload_session,
 								&reload_control,
 								&reload_cleanup_paths,
+								reload_quick_save.as_ref(),
 							) {
 								Ok(generation) => generation,
 								Err(error) => {

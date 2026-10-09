@@ -69,6 +69,8 @@ pub struct Core {
 	shutdown_capture_requested: AtomicBool,
 	shutdown_recovery_studio_generation: Mutex<Option<String>>,
 	shutdown_coordinator: ShutdownCoordinator,
+	quick_save: Mutex<Option<Arc<crate::quick_save::QuickSaveCoordinator>>>,
+	quick_save_gate: Mutex<QuickSaveGate>,
 }
 
 #[derive(Default)]
@@ -588,6 +590,441 @@ mod manifest_capture_retry_tests {
 		);
 		std::fs::remove_dir_all(directory).unwrap();
 	}
+
+	#[test]
+	fn shutdown_capture_commits_a_studio_quick_save_without_waiting_for_auto_recovery() {
+		let directory = std::env::temp_dir().join(format!("carbon-shutdown-quick-save-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&directory).unwrap();
+		let project_path = directory.join("game.carbon.json");
+		let served_place = directory.join("served.rbxl");
+		let quick_save_file = directory.join("server.rbxl");
+		project::initialize(&project_path, "ShutdownQuickSave".to_owned()).unwrap();
+		let materialized = project::materialize(&project_path).unwrap();
+		let contract = artifact_store::WorktreeContract {
+			endpoint: String::new(),
+			project: "ShutdownQuickSave".to_owned(),
+			worktree_id: "quick-save-worktree".to_owned(),
+			session_token: "quick-save-session".to_owned(),
+			identity_exclusions: materialized.identity_exclusions.clone(),
+		};
+		artifact_store::compile_worktree(&materialized.manifest_path, &served_place, &contract).unwrap();
+		let core = Arc::new(
+			Core::new_project_with_worktree(
+				&project_path,
+				&materialized,
+				(
+					"ShutdownQuickSave".to_owned(),
+					"quick-save-worktree".to_owned(),
+					"quick-save-session".to_owned(),
+				),
+			)
+			.unwrap(),
+		);
+		core.queue()
+			.subscribe(
+				7,
+				"ShutdownQuickSave",
+				Some(queue::StudioRoute {
+					studio_session_id: "studio-session".to_owned(),
+					instance_id: "anon:quick-save".to_owned(),
+				}),
+			)
+			.unwrap();
+		let reaped = Arc::new(Mutex::new(Vec::<SystemTime>::new()));
+		let reaper_calls = Arc::clone(&reaped);
+		core.register_studio_quick_save(crate::quick_save::StudioQuickSaveHost {
+			quick_save_file: quick_save_file.clone(),
+			lock_file: directory.join("studio-quick-save.lock"),
+			reaper: Arc::new(move |since| {
+				reaper_calls.lock().unwrap().push(since);
+				Ok(1)
+			}),
+		})
+		.unwrap();
+
+		// Mirror the automatic monitor: an auto-recovery wait is already active and
+		// Studio writes no further recovery while the test runs.
+		let monitor = core
+			.begin_manifest_capture_internal(
+				ManifestCaptureSource {
+					sources: vec![core.quick_save_staging_source().unwrap().unwrap()],
+					started_at: SystemTime::now(),
+				},
+				false,
+				None,
+			)
+			.unwrap();
+		assert_eq!(monitor.state, "running");
+
+		let plugin_core = Arc::clone(&core);
+		let plugin = thread::spawn(move || {
+			let deadline = Instant::now() + Duration::from_secs(30);
+			while Instant::now() < deadline {
+				match plugin_core.queue().get_timeout(7).unwrap() {
+					Some(crate::server::Message::StudioChangeProbe(probe)) => plugin_core
+						.acknowledge_studio_change_generation(7, &probe.request_id, "studio-edit-1".to_owned())
+						.unwrap(),
+					Some(crate::server::Message::StudioQuickSave(request)) => {
+						assert!(!request.token.is_empty());
+						// Studio's Start Server action writes the edit DataModel here.
+						std::fs::copy(&served_place, &quick_save_file).unwrap();
+						return Some(request.token);
+					}
+					_ => {}
+				}
+			}
+			None
+		});
+
+		let started = Instant::now();
+		let message = core.capture_before_shutdown().unwrap();
+		let elapsed = started.elapsed();
+		let token = plugin.join().unwrap();
+		core.stop_automatic_capture_monitor();
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+
+		assert!(token.is_some(), "Studio never received a quick-save request");
+		assert!(message.contains("quick save"), "{message}");
+		assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+		assert_eq!(
+			reaped.lock().unwrap().len(),
+			1,
+			"the quick-save test server must be stopped exactly once"
+		);
+	}
+
+	struct QuickSaveSession {
+		core: Arc<Core>,
+		directory: PathBuf,
+		served_place: PathBuf,
+		quick_save_file: PathBuf,
+		reaped: Arc<Mutex<usize>>,
+	}
+
+	/// Rewrite `place` as Studio saves it at Studio change generation `generation`.
+	fn stamp_studio_change_generation(place: &Path, generation: &str) {
+		let database = util::get_reflection_database();
+		let mut dom = rbx_binary::Deserializer::new(database)
+			.deserialize(std::io::BufReader::new(std::fs::File::open(place).unwrap()))
+			.unwrap();
+		let workspace = dom
+			.root()
+			.children()
+			.iter()
+			.copied()
+			.find(|child| dom.get_by_ref(*child).unwrap().class.as_str() == "Workspace")
+			.unwrap();
+		let instance = dom.get_by_ref_mut(workspace).unwrap();
+		let key = Ustr::from("Attributes");
+		let mut attributes = match instance.properties.remove(&key) {
+			Some(Variant::Attributes(attributes)) => attributes,
+			None => Attributes::new(),
+			Some(other) => panic!("unexpected Workspace attributes {other:?}"),
+		};
+		attributes.insert(
+			"__StudioWorktree_StudioChangeGeneration".to_owned(),
+			Variant::String(generation.to_owned()),
+		);
+		instance.properties.insert(key, Variant::Attributes(attributes));
+		let roots = dom.root().children().to_vec();
+		let mut bytes = Vec::new();
+		rbx_binary::Serializer::new(database)
+			.serialize(&mut bytes, &dom, &roots)
+			.unwrap();
+		std::fs::write(place, bytes).unwrap();
+	}
+
+	/// A served session whose last capture committed at Studio change
+	/// generation `studio-clean-1`, with the automatic monitor waiting again.
+	/// With `unchanged_place`, the served place already holds a manual save
+	/// stamped with that generation when the monitor starts waiting.
+	fn idle_quick_save_session(name: &str, unchanged_place: bool) -> QuickSaveSession {
+		let directory = std::env::temp_dir().join(format!("carbon-{name}-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&directory).unwrap();
+		let project_path = directory.join("game.carbon.json");
+		let served_place = directory.join("served.rbxl");
+		let quick_save_file = directory.join("server.rbxl");
+		project::initialize(&project_path, "IdleQuickSave".to_owned()).unwrap();
+		let materialized = project::materialize(&project_path).unwrap();
+		let contract = artifact_store::WorktreeContract {
+			endpoint: String::new(),
+			project: "IdleQuickSave".to_owned(),
+			worktree_id: "idle-worktree".to_owned(),
+			session_token: "idle-session".to_owned(),
+			identity_exclusions: materialized.identity_exclusions.clone(),
+		};
+		let first_source = crate::recovery::RecoverySource::served_place(served_place.clone()).unwrap();
+		let first_started_at = SystemTime::now();
+		artifact_store::compile_worktree(&materialized.manifest_path, &served_place, &contract).unwrap();
+		let core = Arc::new(
+			Core::new_project_with_worktree(
+				&project_path,
+				&materialized,
+				(
+					"IdleQuickSave".to_owned(),
+					"idle-worktree".to_owned(),
+					"idle-session".to_owned(),
+				),
+			)
+			.unwrap(),
+		);
+		core.queue()
+			.subscribe(
+				7,
+				"IdleQuickSave",
+				Some(queue::StudioRoute {
+					studio_session_id: "studio-session".to_owned(),
+					instance_id: "anon:idle-quick-save".to_owned(),
+				}),
+			)
+			.unwrap();
+		let reaped = Arc::new(Mutex::new(0));
+		let reaper_calls = Arc::clone(&reaped);
+		core.register_studio_quick_save(crate::quick_save::StudioQuickSaveHost {
+			quick_save_file: quick_save_file.clone(),
+			lock_file: directory.join("studio-quick-save.lock"),
+			reaper: Arc::new(move |_| {
+				*reaper_calls.lock().unwrap() += 1;
+				Ok(1)
+			}),
+		})
+		.unwrap();
+
+		let completed = core
+			.begin_manifest_capture_internal(
+				ManifestCaptureSource {
+					sources: vec![first_source],
+					started_at: first_started_at,
+				},
+				false,
+				None,
+			)
+			.unwrap();
+		wait_for_automatic_capture(
+			|| Ok(completed),
+			|request_id| core.manifest_capture_status(request_id),
+			|| thread::sleep(Duration::from_millis(10)),
+		)
+		.unwrap();
+		core.studio_change_state.lock().unwrap().last_captured_generation = Some("studio-clean-1".to_owned());
+		if unchanged_place {
+			stamp_studio_change_generation(&served_place, "studio-clean-1");
+		}
+		let monitor = core
+			.begin_manifest_capture_internal(
+				ManifestCaptureSource {
+					sources: vec![
+						crate::recovery::RecoverySource::served_place(served_place.clone()).unwrap(),
+						core.quick_save_staging_source().unwrap().unwrap(),
+					],
+					started_at: SystemTime::now(),
+				},
+				false,
+				None,
+			)
+			.unwrap();
+		assert_eq!(monitor.state, "running");
+		QuickSaveSession {
+			core,
+			directory,
+			served_place,
+			quick_save_file,
+			reaped,
+		}
+	}
+
+	#[derive(Debug, Default)]
+	struct PluginReport {
+		quick_save_requested: bool,
+		probed: bool,
+	}
+
+	/// Answer every Studio change probe with an unchanged generation. Answer the
+	/// quick-save request by writing Studio's save after `save_delay`, or by
+	/// reporting that Studio could not start it and then serving the fallback probe.
+	fn unchanged_studio_plugin(
+		session: &QuickSaveSession,
+		can_quick_save: bool,
+		save_delay: Duration,
+	) -> thread::JoinHandle<PluginReport> {
+		let core = Arc::clone(&session.core);
+		let served_place = session.served_place.clone();
+		let quick_save_file = session.quick_save_file.clone();
+		thread::spawn(move || {
+			let mut report = PluginReport::default();
+			let deadline = Instant::now() + Duration::from_secs(30);
+			while Instant::now() < deadline {
+				match core.queue().get_timeout(7).unwrap() {
+					Some(crate::server::Message::StudioChangeProbe(probe)) => {
+						core.acknowledge_studio_change_generation(7, &probe.request_id, "studio-clean-1".to_owned())
+							.unwrap();
+						report.probed = true;
+						if report.quick_save_requested {
+							return report;
+						}
+					}
+					Some(crate::server::Message::StudioQuickSave(request)) => {
+						report.quick_save_requested = true;
+						if can_quick_save {
+							thread::sleep(save_delay);
+							std::fs::copy(&served_place, &quick_save_file).unwrap();
+							return report;
+						}
+						core.report_studio_quick_save_failure(
+							7,
+							&request.token,
+							"Studio is already running a test session".to_owned(),
+						)
+						.unwrap();
+						if report.probed {
+							return report;
+						}
+					}
+					_ => {}
+				}
+			}
+			report
+		})
+	}
+
+	#[test]
+	fn shutdown_quick_saves_edits_that_never_advanced_the_studio_change_generation() {
+		let session = idle_quick_save_session("shutdown-quick-save-idle", false);
+		let plugin = unchanged_studio_plugin(&session, true, Duration::ZERO);
+
+		let message = session.core.capture_before_shutdown().unwrap();
+		let plugin = plugin.join().unwrap();
+		let reaped = *session.reaped.lock().unwrap();
+		session.core.stop_automatic_capture_monitor();
+		let QuickSaveSession { core, directory, .. } = session;
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+
+		assert!(
+			plugin.quick_save_requested,
+			"shutdown must quick-save even when the change generation looks idle"
+		);
+		assert!(message.contains("quick save"), "{message}");
+		assert_eq!(reaped, 1);
+	}
+
+	#[test]
+	fn shutdown_retains_an_unchanged_capture_when_studio_cannot_quick_save() {
+		let session = idle_quick_save_session("shutdown-quick-save-unavailable", false);
+		let plugin = unchanged_studio_plugin(&session, false, Duration::ZERO);
+
+		let started = Instant::now();
+		let message = session.core.capture_before_shutdown().unwrap();
+		let elapsed = started.elapsed();
+		let plugin = plugin.join().unwrap();
+		let reaped = *session.reaped.lock().unwrap();
+		session.core.stop_automatic_capture_monitor();
+		let QuickSaveSession { core, directory, .. } = session;
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+
+		assert!(plugin.quick_save_requested);
+		assert!(
+			plugin.probed,
+			"only a failed quick save falls back to Studio's change generation"
+		);
+		assert!(message.contains("retained valid manifest"), "{message}");
+		assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+		assert_eq!(reaped, 0, "a test that never started has nothing to stop");
+	}
+
+	#[test]
+	fn shutdown_commits_its_own_quick_save_instead_of_an_unchanged_earlier_place() {
+		// The served place already holds a save stamped with the current change
+		// generation, so it looks unchanged. Stop must still wait for, and commit,
+		// the quick save it requested, even when Studio writes that save slowly.
+		let session = idle_quick_save_session("shutdown-quick-save-stale", true);
+		let plugin = unchanged_studio_plugin(&session, true, Duration::from_secs(1));
+
+		let message = session.core.capture_before_shutdown().unwrap();
+		let plugin = plugin.join().unwrap();
+		let reaped = *session.reaped.lock().unwrap();
+		session.core.stop_automatic_capture_monitor();
+		let QuickSaveSession { core, directory, .. } = session;
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+
+		assert!(plugin.quick_save_requested);
+		assert!(message.contains("Studio quick save"), "{message}");
+		assert_eq!(reaped, 1);
+	}
+
+	#[test]
+	fn shutdown_quick_save_never_consults_the_studio_change_generation() {
+		// The change generation is the legacy "unchanged" heuristic. A quick save
+		// captures Studio exactly, so stop must not even ask for the generation.
+		let session = idle_quick_save_session("shutdown-quick-save-no-probe", false);
+		let plugin = unchanged_studio_plugin(&session, true, Duration::ZERO);
+
+		let message = session.core.capture_before_shutdown().unwrap();
+		let plugin = plugin.join().unwrap();
+		session.core.stop_automatic_capture_monitor();
+		let QuickSaveSession { core, directory, .. } = session;
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+
+		assert!(plugin.quick_save_requested);
+		assert!(
+			!plugin.probed,
+			"a quick-saving stop must not probe the Studio change generation"
+		);
+		assert!(message.contains("Studio quick save"), "{message}");
+	}
+}
+
+/// Which recovery candidates the active capture may commit while an explicit
+/// capture's own quick save is outstanding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QuickSaveGate {
+	/// Commit the first verified candidate.
+	Open,
+	/// The explicit capture requested a quick save that is not staged yet.
+	Pending,
+	/// Only the explicit capture's own staged quick save may commit.
+	Require(PathBuf),
+}
+
+impl QuickSaveGate {
+	fn admits(&self, path: &Path) -> bool {
+		match self {
+			Self::Open => true,
+			Self::Pending => false,
+			Self::Require(required) => required == path,
+		}
+	}
+}
+
+/// Reopens the gate however an explicit capture ends.
+struct QuickSaveGateGuard<'a>(&'a Mutex<QuickSaveGate>);
+
+impl<'a> QuickSaveGateGuard<'a> {
+	fn close(gate: &'a Mutex<QuickSaveGate>) -> Self {
+		*gate.lock().unwrap() = QuickSaveGate::Pending;
+		Self(gate)
+	}
+}
+
+impl Drop for QuickSaveGateGuard<'_> {
+	fn drop(&mut self) {
+		*self.0.lock().unwrap() = QuickSaveGate::Open;
+	}
+}
+
+#[derive(Clone, Debug)]
+enum CaptureTrigger {
+	/// The background monitor consumes Studio's periodic auto-recovery files.
+	Monitor,
+	/// A project reload quick-saves, or waits for auto-recovery if it cannot.
+	Reload,
+	/// Stop quick-saves whenever it can. Only when Studio cannot does it keep a
+	/// capture Studio reports unchanged, or wait for auto-recovery.
+	Shutdown,
 }
 
 struct ManifestCaptureOperation {
@@ -862,6 +1299,8 @@ impl Core {
 			shutdown_capture_requested: AtomicBool::new(false),
 			shutdown_recovery_studio_generation: Mutex::new(None),
 			shutdown_coordinator: ShutdownCoordinator::new(),
+			quick_save: Mutex::new(None),
+			quick_save_gate: Mutex::new(QuickSaveGate::Open),
 		})
 	}
 
@@ -923,6 +1362,108 @@ impl Core {
 
 	pub fn register_served_place(&self, path: PathBuf) {
 		*self.served_place_path.lock().unwrap() = Some(path);
+	}
+
+	/// Let explicit captures ask Studio for an immediate quick save of the served
+	/// place instead of waiting for its next auto-recovery file. Returns the
+	/// session's private staging directory so the caller can remove it at exit.
+	pub(crate) fn register_studio_quick_save(&self, host: crate::quick_save::StudioQuickSaveHost) -> Result<PathBuf> {
+		let coordinator = crate::quick_save::QuickSaveCoordinator::new(host)?;
+		let staging_dir = coordinator.staging_dir().to_owned();
+		*self.quick_save.lock().unwrap() = Some(coordinator);
+		Ok(staging_dir)
+	}
+
+	fn studio_quick_save(&self) -> Option<Arc<crate::quick_save::QuickSaveCoordinator>> {
+		self.quick_save.lock().unwrap().clone()
+	}
+
+	fn quick_save_staging_source(&self) -> Result<Option<crate::recovery::RecoverySource>> {
+		self.studio_quick_save()
+			.map(|coordinator| crate::recovery::RecoverySource::studio_quick_save(coordinator.staging_dir().to_owned()))
+			.transpose()
+			.context("failed to record the Studio quick-save baseline")
+	}
+
+	/// Ask the connected plugin for a fresh Studio quick save and wait until it
+	/// is staged. A quick save already in flight finishes first, because it
+	/// shows Studio as it was when that save was requested.
+	fn request_studio_quick_save(&self, client_id: u32) -> Result<PathBuf> {
+		let coordinator = self
+			.studio_quick_save()
+			.context("Studio quick saves are not enabled for this session")?;
+		let ticket = coordinator.arm_after_in_flight(client_id)?;
+		let delivered = self.queue.push(
+			crate::server::Message::StudioQuickSave(crate::server::StudioQuickSave {
+				token: ticket.token.clone(),
+			}),
+			Some(client_id),
+		);
+		if let Err(error) = delivered {
+			coordinator.abandon(ticket);
+			return Err(error).context("failed to deliver the Studio quick-save request");
+		}
+		coordinator.finish(ticket)
+	}
+
+	/// Quick-save for an explicit capture whose recovery wait is already armed
+	/// behind a closed gate. Success admits only the new quick save. Failure
+	/// reopens the gate; stop then keeps a capture Studio reports unchanged,
+	/// because Studio never auto-saves an unchanged place.
+	fn quick_save_for_capture(&self, trigger: &CaptureTrigger) -> Result<()> {
+		let staged = self
+			.queue
+			.single_listener_id()
+			.and_then(|client_id| self.request_studio_quick_save(client_id));
+		let error = match staged {
+			Ok(staged) => {
+				crate::carbon_info!("Staged Studio quick save at {}", staged.display());
+				*self.quick_save_gate.lock().unwrap() = QuickSaveGate::Require(staged);
+				return Ok(());
+			}
+			Err(error) => error,
+		};
+		crate::carbon_warn!("Studio quick save did not complete; waiting for Studio auto-recovery instead: {error:#}");
+		*self.quick_save_gate.lock().unwrap() = QuickSaveGate::Open;
+		if matches!(trigger, CaptureTrigger::Shutdown) {
+			self.retain_unchanged_capture_for_shutdown()?;
+		}
+		Ok(())
+	}
+
+	/// Arm a quick save that the requesting plugin starts itself. The plugin may
+	/// still be capturing before its message loop starts, so it receives the
+	/// token in the capture response instead of through the message queue.
+	pub(crate) fn arm_plugin_studio_quick_save(&self) -> Option<String> {
+		let coordinator = self.studio_quick_save()?;
+		// A quick save already in flight shows Studio as it was when requested.
+		let armed = self
+			.queue
+			.single_listener_id()
+			.and_then(|client_id| coordinator.arm_after_in_flight(client_id));
+		match armed {
+			Ok(ticket) => {
+				let token = ticket.token.clone();
+				coordinator.complete_in_background(ticket);
+				Some(token)
+			}
+			Err(error) => {
+				crate::carbon_warn!(
+					"Could not arm a Studio quick save; waiting for Studio auto-recovery instead: {error:#}"
+				);
+				None
+			}
+		}
+	}
+
+	pub(crate) fn report_studio_quick_save_failure(&self, client_id: u32, token: &str, message: String) -> Result<()> {
+		ensure!(
+			self.queue.is_subscribed(client_id),
+			"Studio quick-save report is not subscribed"
+		);
+		self.studio_quick_save()
+			.context("Studio quick saves are not enabled for this session")?
+			.report_failure(client_id, token, message)
 	}
 
 	pub fn cleanup_ephemeral_paths(&self) {
@@ -1003,18 +1544,17 @@ impl Core {
 		self.shutdown_capture_requested.store(true, Ordering::Release);
 		let monitor_was_enabled = self.automatic_capture_enabled.swap(false, Ordering::AcqRel);
 		let result = self.shutdown_coordinator.execute_or_await(|| {
-			let studio_generation = if self.queue.has_subscribers() {
-				self.probe_studio_change_generation(self.queue.single_listener_id()?)?
-			} else {
-				None
-			};
-			if let Some(message) =
-				self.retain_last_successful_capture_for_idle_shutdown(studio_generation.as_deref())?
-			{
-				return Ok(message);
+			// Stop quick-saves whenever it can and never consults Studio's change
+			// generation for it: edits that never start a ChangeHistory recording
+			// leave that generation unchanged. Only without a quick save does stop
+			// keep the last capture Studio reports unchanged, because Studio never
+			// auto-saves an unchanged place.
+			if self.studio_quick_save().is_none() {
+				if let Some(message) = self.retain_unchanged_capture_for_shutdown()? {
+					return Ok(message);
+				}
 			}
-			*self.shutdown_recovery_studio_generation.lock().unwrap() = studio_generation;
-			self.do_automatic_capture()
+			self.do_automatic_capture(CaptureTrigger::Shutdown)
 		});
 		*self.shutdown_recovery_studio_generation.lock().unwrap() = None;
 		if result.is_err() {
@@ -1030,18 +1570,34 @@ impl Core {
 	}
 
 	pub fn capture_before_reload(self: &Arc<Self>) -> Result<String> {
-		self.do_automatic_capture()
+		self.do_automatic_capture(CaptureTrigger::Reload)
 	}
 
-	fn do_automatic_capture(self: &Arc<Self>) -> Result<String> {
+	/// Capture the connected Studio place. Stop and reload ask Studio for a
+	/// fresh quick save and commit only that save; the background monitor
+	/// consumes Studio's periodic auto-recovery files. Without a quick save,
+	/// every capture accepts the first verified auto-recovery or manual save.
+	fn do_automatic_capture(self: &Arc<Self>, trigger: CaptureTrigger) -> Result<String> {
+		let quick_save = !matches!(trigger, CaptureTrigger::Monitor) && self.studio_quick_save().is_some();
+		// Close the gate before joining an active capture, so it cannot commit
+		// an older candidate while Studio writes the requested quick save.
+		let _gate = quick_save.then(|| QuickSaveGateGuard::close(&self.quick_save_gate));
 		let capture_result = wait_for_automatic_capture(
 			|| {
 				let status = self.begin_manifest_capture_mode_internal(true, None)?;
 				crate::carbon_info!(
-					"Automatic capture request {} is waiting for Studio auto-recovery or a manual save to the temporary served place for served generation {}",
+					"Automatic capture request {} is waiting for {} for served generation {}",
 					status.request_id,
+					if quick_save {
+						"a fresh Studio quick save"
+					} else {
+						"Studio auto-recovery or a manual save to the temporary served place"
+					},
 					status.source_generation
 				);
+				if quick_save {
+					self.quick_save_for_capture(&trigger)?;
+				}
 				Ok(status)
 			},
 			|request_id| self.manifest_capture_status(request_id),
@@ -1156,6 +1712,19 @@ impl Core {
 		pending.acknowledged_generation = Some(generation);
 		self.studio_change_condvar.notify_all();
 		Ok(())
+	}
+
+	/// The fallback when stop cannot quick-save: ask Studio for its change
+	/// generation, keep the last capture when Studio reports it unchanged, and
+	/// otherwise let recovery files that already existed prove they match Studio.
+	fn retain_unchanged_capture_for_shutdown(&self) -> Result<Option<String>> {
+		let studio_generation = if self.queue.has_subscribers() {
+			self.probe_studio_change_generation(self.queue.single_listener_id()?)?
+		} else {
+			None
+		};
+		*self.shutdown_recovery_studio_generation.lock().unwrap() = studio_generation.clone();
+		self.retain_last_successful_capture_for_idle_shutdown(studio_generation.as_deref())
 	}
 
 	fn retain_last_successful_capture_for_idle_shutdown(
@@ -1281,10 +1850,10 @@ impl Core {
 			{
 				break;
 			}
-			match core.do_automatic_capture() {
-				Ok(message) => crate::carbon_info!("Automatic Studio auto-recovery capture completed: {message}"),
+			match core.do_automatic_capture(CaptureTrigger::Monitor) {
+				Ok(message) => crate::carbon_info!("Automatic Studio capture completed: {message}"),
 				Err(error) if core.is_studio_disconnected_error(&error) => break,
-				Err(error) => crate::carbon_error!("Automatic Studio auto-recovery capture failed: {error:#}"),
+				Err(error) => crate::carbon_error!("Automatic Studio capture failed: {error:#}"),
 			}
 			drop(core);
 			thread::sleep(AUTOMATIC_CAPTURE_POLL_INTERVAL);
@@ -1343,6 +1912,7 @@ impl Core {
 					.context("failed to record the served place baseline")?,
 			);
 		}
+		sources.extend(self.quick_save_staging_source()?);
 		let started_at = SystemTime::now();
 		self.begin_manifest_capture_internal(
 			ManifestCaptureSource { sources, started_at },
@@ -1385,13 +1955,20 @@ impl Core {
 				}
 				anyhow::bail!("another Capture Manifest operation is already running");
 			}
-			let message = if let Some(path) = self.served_place_path.lock().unwrap().as_ref() {
-				format!(
+			let quick_save = self.studio_quick_save().is_some();
+			let message = match (self.served_place_path.lock().unwrap().as_ref(), quick_save) {
+				(Some(path), true) => format!(
+					"Waiting up to six minutes for a Studio quick save, Studio auto-recovery, or a manual save to {}",
+					path.display()
+				),
+				(Some(path), false) => format!(
 					"Waiting up to six minutes for Studio auto-recovery or a manual save to {}",
 					path.display()
-				)
-			} else {
-				"Waiting up to six minutes for Studio to write a new auto-recovery place".to_owned()
+				),
+				(None, true) => {
+					"Waiting up to six minutes for a Studio quick save or a new auto-recovery place".to_owned()
+				}
+				(None, false) => "Waiting up to six minutes for Studio to write a new auto-recovery place".to_owned(),
 			};
 			*operation = Some(ManifestCaptureOperation {
 				request_id: request_id.clone(),
@@ -1475,11 +2052,21 @@ impl Core {
 			crate::recovery::CAPTURE_TIMEOUT,
 			|| phase.load(Ordering::Acquire) == CAPTURE_CANCELLED || !self.queue.is_subscribed(client_id),
 			|path, freshness| {
+				// While stop or reload waits for its own quick save, only that save
+				// may commit; every other candidate stays eligible for a fallback.
+				let required = {
+					let gate = self.quick_save_gate.lock().unwrap();
+					if !gate.admits(path) {
+						return Ok(crate::recovery::RecoveryAcceptance::Retry);
+					}
+					matches!(*gate, QuickSaveGate::Require(_))
+				};
 				let studio_generation = self.shutdown_recovery_studio_generation.lock().unwrap().clone();
 				if freshness == crate::recovery::RecoveryFreshness::Preexisting && studio_generation.is_none() {
 					return Ok(crate::recovery::RecoveryAcceptance::Retry);
 				}
-				match project::decode_captured_place(path, &expected, &canonical, &policy.mapped_roots) {
+				let acceptance = match project::decode_captured_place(path, &expected, &canonical, &policy.mapped_roots)
+				{
 					Ok(recovered)
 						if recovery_matches_studio_generation(
 							freshness,
@@ -1488,14 +2075,19 @@ impl Core {
 						) =>
 					{
 						claim_capture_recovery(&phase)?;
-						Ok(crate::recovery::RecoveryAcceptance::Accept(recovered))
+						crate::recovery::RecoveryAcceptance::Accept(recovered)
 					}
-					Ok(_) => Ok(crate::recovery::RecoveryAcceptance::Reject),
+					Ok(_) => crate::recovery::RecoveryAcceptance::Reject,
 					Err(error) if format!("{error:#}").contains("different Carbon Studio session") => {
-						Ok(crate::recovery::RecoveryAcceptance::Reject)
+						crate::recovery::RecoveryAcceptance::Reject
 					}
-					Err(error) => Err(error),
+					Err(error) => return Err(error),
+				};
+				if required && matches!(acceptance, crate::recovery::RecoveryAcceptance::Reject) {
+					// The staged save belongs to no current session state; fall back.
+					*self.quick_save_gate.lock().unwrap() = QuickSaveGate::Open;
 				}
+				Ok(acceptance)
 			},
 		)
 		.context("failed while waiting for Studio auto-recovery")?;

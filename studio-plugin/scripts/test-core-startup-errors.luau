@@ -70,12 +70,17 @@ local transitionReconcile = assert(
 	"managed reconnect must reconcile the replacement filesystem mappings"
 )
 local transitionCapture = assert(
-	string.find(core, "requestManifestCapture(nil, managedReloadTransitionId)", transitionReconcile, true),
+	string.find(
+		core,
+		"requestManifestCapture(nil, managedReloadTransitionId, self:__quickSaveTrigger())",
+		transitionReconcile,
+		true
+	),
 	"managed reconnect must prove the candidate contract with a transition-bound capture"
 )
 assert(
 	transitionReconcile < transitionCapture,
-	"managed reload must materialize mappings and then wait for the recovery-backed capture"
+	"managed reload must materialize mappings and then wait for the transition-bound capture"
 )
 
 print("PASS: Core startup preserves failures and proves managed reload topology before commit")

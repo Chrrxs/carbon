@@ -6,6 +6,7 @@ All notable Carbon Studio plugin changes are documented here.
 
 ### Changed
 
+- Stop, Ctrl+C, project reloads, and **Capture Manifest** capture immediately through a Studio quick save: the plugin starts a `StudioTestService` test whose Start Server action writes the edit DataModel, and a capture test server ends itself if `serve` could not stop it. Stop commits only its own fresh quick save and never consults the Studio change generation for it; auto-recovery remains the background capture and the fallback when Studio cannot quick-save. Quick saves work on Wine hosts too. Plugin protocol 5.
 - Serve continuously captures Studio's auto-recovery saves; stop and Ctrl+C accept either the next auto-recovery or a manual save over the temporary served place, while `carbon capture <PROJECT> <PLACE>` imports a file without a serve session.
 - Studio-owned reflection descriptors now come automatically from the exact installed Studio build; the bundled database only supplies Carbon-specific adapters and historical aliases.
 

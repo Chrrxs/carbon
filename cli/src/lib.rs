@@ -17,6 +17,7 @@ pub(crate) mod manifest_identity;
 pub mod place_diff;
 pub mod program;
 pub mod project;
+pub(crate) mod quick_save;
 pub(crate) mod recovery;
 pub mod resolution;
 pub mod server;

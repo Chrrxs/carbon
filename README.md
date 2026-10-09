@@ -8,7 +8,9 @@ else. Carbon captures Studio-owned state in a deterministic artifact and uses
 stable instance identities to merge independent changes.
 
 Mapped source syncs from the filesystem to Studio. While `serve` is connected,
-fresh Studio auto-recovery saves continuously capture Studio-owned changes.
+fresh Studio auto-recovery saves continuously capture Studio-owned changes, and
+`carbon stop` or a project reload asks Studio for an immediate quick save
+instead of waiting for the next auto-recovery.
 
 > [!IMPORTANT]
 > Carbon is pre-1.0. It supports Roblox Studio on x86_64 Windows, either
@@ -84,7 +86,8 @@ See [Usage and project format](USAGE.md) for the full mapping and capture rules.
 - `robloxstudio-mcp` running on loopback with Studio lifecycle protocol v3 and
   exact process identity enabled
 - [Rokit](https://github.com/rojo-rbx/rokit) in the CLI environment
-- Roblox Studio auto-recovery enabled
+- Roblox Studio auto-recovery enabled at any interval, including the default
+  five minutes, because explicit captures use Studio quick saves
 
 ## Install
 
@@ -116,7 +119,7 @@ carbon serve game.carbon.json
 # Import a place saved manually with Studio's File > Save to File command.
 carbon capture game.carbon.json manually-saved.rbxl
 
-# Wait for the next auto-recovery capture, then stop serve and Studio.
+# Capture Studio through an immediate quick save, then stop serve and Studio.
 carbon stop 'anon:550e8400-e29b-41d4-a716-446655440000'
 
 # Build a place file.

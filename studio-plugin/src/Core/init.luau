@@ -14,13 +14,14 @@ local TransientMetadata = require(Carbon.TransientMetadata)
 local Types = require(Carbon.Types)
 local StudioChangeTracker = require(Carbon.StudioChangeTracker)
 local manifest = require(Carbon.manifest)
+local QuickSave = require(Carbon.QuickSave)
 
 local BoundedRetry = require(script.BoundedRetry)
 local Error = require(script.Error)
 local InitialReconciliation = require(script.InitialReconciliation)
 local MappingReconciler = require(script.MappingReconciler)
 
-local PROTOCOL_VERSION = 4
+local PROTOCOL_VERSION = 5
 
 local Core = {
 	Status = {
@@ -143,16 +144,18 @@ function Core:run(): Promise.Promise
 		end
 
 		-- Carbon operates entirely through Studio's ordinary plugin surface. Capture
-		-- waits for Studio's next auto-recovery file on the server side.
+		-- uses a Studio quick save when serve can arm one, and otherwise waits for
+		-- Studio's next auto-recovery file on the server side.
 		if managedReloadTransitionId ~= nil then
-			-- Reconcile the replacement mapping contract before waiting for the
-			-- auto-recovery snapshot that acknowledges the managed reload.
+			-- Reconcile the replacement mapping contract before capturing the
+			-- snapshot that acknowledges the managed reload.
 			Log.trace("Reconciling replacement filesystem mappings before managed reload acknowledgement..")
 			local report = self:__reconcileMappings()
 			self.tree = self.reconciler.tree
 			Log.debug("Managed reload mapping reconciliation:", report.instances, "instances")
 
-			local captureStatus = self.client:requestManifestCapture(nil, managedReloadTransitionId):expect()
+			local captureStatus =
+				self.client:requestManifestCapture(nil, managedReloadTransitionId, self:__quickSaveTrigger()):expect()
 			self:__advanceSourceGeneration(captureStatus.sourceGeneration)
 			self.expectedWorktree.managedReloadTransitionId = nil
 			project = self.client:fetchDetails():expect()
@@ -164,10 +167,10 @@ function Core:run(): Promise.Promise
 			self.tree = self.reconciler.tree
 			Log.debug("Attached built mapping identities:", report.instances, "of", report.expected, "instances")
 		else
-			-- Preserve authored Studio state through auto-recovery before the
+			-- Preserve authored Studio state through a capture before the
 			-- source-authoritative mapped projection can overwrite mapped nodes.
 			Log.trace("Capturing the open Studio place before initial mapping reconciliation..")
-			local captureStatus = self.client:requestManifestCapture(nil):expect()
+			local captureStatus = self.client:requestManifestCapture(nil, nil, self:__quickSaveTrigger()):expect()
 			self:__advanceSourceGeneration(captureStatus.sourceGeneration)
 			project = self.client:fetchDetails():expect()
 			self:__verifyProject(project):expect()
@@ -240,7 +243,7 @@ function Core:captureManifest(
 	if self.status ~= Core.Status.Connected then
 		return Promise.reject(Error.new(Error.Terminated))
 	end
-	return self.client:requestManifestCapture(onStatus):andThen(function(status)
+	return self.client:requestManifestCapture(onStatus, nil, self:__quickSaveTrigger()):andThen(function(status)
 		self:__advanceSourceGeneration(status.sourceGeneration)
 		return self.client:fetchDetails():andThen(function(project)
 			self:__verifyProject(project):expect()
@@ -249,6 +252,24 @@ function Core:captureManifest(
 			return status
 		end)
 	end)
+end
+
+-- Start the StudioTestService test whose Start Server action writes Studio's
+-- save of this place. A failure is reported so serve stops waiting for it.
+function Core:__triggerQuickSave(token: string)
+	local studioTestService = RuntimeServices.get("StudioTestService")
+	QuickSave.trigger(studioTestService, token, function(reason)
+		Log.warn("Studio quick save unavailable; Carbon will use auto-recovery:", reason)
+		self.client:reportQuickSaveFailure(token, reason):catch(function(err)
+			Log.debug("Failed to report the Studio quick-save failure", err)
+		end)
+	end)
+end
+
+function Core:__quickSaveTrigger(): (token: string) -> ()
+	return function(token)
+		self:__triggerQuickSave(token)
+	end
 end
 
 function Core:__reconcileMappings()
@@ -406,6 +427,11 @@ function Core:__startSyncLoop()
 				self.client
 					:acknowledgeStudioChangeGeneration(data.requestId, self.studioChangeTracker:current())
 					:expect()
+			elseif kind == "StudioQuickSave" then
+				if type(data) ~= "table" or type(data.token) ~= "string" or data.token == "" then
+					return reject(Error.new(Error.UnknownEvent, kind, data))
+				end
+				self:__triggerQuickSave(data.token)
 			elseif kind == "ExecuteCode" then
 				self.executor:execute(data.code)
 			elseif kind == "Disconnect" then

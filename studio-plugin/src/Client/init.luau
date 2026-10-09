@@ -308,14 +308,26 @@ function Client:acknowledgeStudioChangeGeneration(requestId: string, changeGener
 	})
 end
 
+function Client:reportQuickSaveFailure(token: string, message: string): Promise.Promise
+	return Http.post(self:getUrl("studio/quick-save/failure"), {
+		clientId = self.clientId,
+		token = token,
+		message = message,
+	})
+end
+
 function Client:requestManifestCapture(
 	onStatus: ((status: Types.ManifestCaptureStatus) -> ())?,
-	managedReloadTransitionId: string?
+	managedReloadTransitionId: string?,
+	onQuickSave: ((token: string) -> ())?
 ): Promise.TypedPromise<Types.ManifestCaptureStatus>
 	Log.trace("Client request: Capture Manifest")
 	local query = {}
 	if managedReloadTransitionId ~= nil then
 		table.insert(query, `managedReloadTransitionId={HttpService:UrlEncode(managedReloadTransitionId)}`)
+	end
+	if onQuickSave ~= nil then
+		table.insert(query, "quickSave=true")
 	end
 	local endpoint = "capture/request"
 	if #query > 0 then
@@ -323,6 +335,11 @@ function Client:requestManifestCapture(
 	end
 	return Http.post(self:getUrl(endpoint)):andThen(function(response)
 		local started = HttpService:JSONDecode(response.Body) :: Types.ManifestCaptureStatus
+		-- The server armed a quick save for this capture. This plugin may not be
+		-- reading its message queue yet, so it starts the save itself.
+		if onQuickSave ~= nil and type(started.quickSaveToken) == "string" and started.quickSaveToken ~= "" then
+			onQuickSave(started.quickSaveToken)
+		end
 		local lastMessage = nil
 		local status = started
 		return Promise.new(function(resolve, reject, onCancel)

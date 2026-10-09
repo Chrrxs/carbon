@@ -551,6 +551,14 @@ impl ManagedStudio {
 		})
 	}
 
+	pub(crate) fn process_identity(&self) -> StudioProcessIdentity {
+		StudioProcessIdentity {
+			process_id: self.launch.process_id,
+			studio_executable: self.studio_executable.clone(),
+			creation_filetime: self.launch.creation_filetime,
+		}
+	}
+
 	fn finish_startup(&self) -> Result<()> {
 		let mut startup_guard = self.startup_guard.lock().unwrap();
 		if startup_guard.is_none() {
@@ -2025,6 +2033,87 @@ $process.Refresh()
 if (-not [string]::Equals($process.Path, $expected, [StringComparison]::OrdinalIgnoreCase)) {{ exit 3 }}
 if ($process.StartTime.ToUniversalTime().ToFileTimeUtc() -ne {creation_filetime}) {{ exit 3 }}
 "#
+	)
+}
+
+/// Stop the local test server, and any test clients it started, that Studio
+/// launched for a quick save of `studio`. Only processes created at or after
+/// `since` are considered, so an earlier user-started test is left running.
+pub(crate) fn stop_quick_save_test_sessions(
+	studio: &StudioProcessIdentity,
+	place_file_name: &str,
+	since: std::time::SystemTime,
+) -> Result<usize> {
+	let since_filetime = crate::quick_save::filetime(since);
+	#[cfg(target_os = "linux")]
+	if wine_host()?.is_some() {
+		// Wine detaches child processes from their Linux parent, so the test
+		// session is identified by its task and the served place it launched from.
+		return crate::studio_wine::stop_quick_save_test_sessions(place_file_name, since_filetime);
+	}
+	#[cfg(any(target_os = "linux", target_os = "windows"))]
+	{
+		let _ = place_file_name;
+		let script = quick_save_test_session_script(studio, since_filetime);
+		let output = powershell_command()?
+			.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+			.output()
+			.context("failed to stop the Studio quick-save test server")?;
+		ensure!(
+			output.status.success(),
+			"the Studio quick-save test server did not stop cleanly: {}",
+			String::from_utf8_lossy(&output.stderr).trim()
+		);
+		let stopped = String::from_utf8_lossy(&output.stdout);
+		let stopped = stopped.trim();
+		return if stopped.is_empty() {
+			Ok(0)
+		} else {
+			stopped
+				.parse()
+				.with_context(|| format!("unexpected quick-save test server stop report: {stopped}"))
+		};
+	}
+	#[allow(unreachable_code)]
+	{
+		let _ = (studio, place_file_name, since_filetime);
+		anyhow::bail!("stopping Studio quick-save test sessions is unsupported on this platform")
+	}
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn quick_save_test_session_script(studio: &StudioProcessIdentity, since_filetime: u64) -> String {
+	let executable_name = studio
+		.studio_executable
+		.rsplit(['\\', '/'])
+		.next()
+		.unwrap_or(&studio.studio_executable);
+	let encoded_name = BASE64_STANDARD.encode(executable_name.as_bytes());
+	let process_id = studio.process_id;
+	format!(
+		r#"
+{validation}
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_name}'))
+$since = [DateTime]::FromFileTimeUtc({since_filetime})
+function Get-CarbonTestSession([uint32]$parent, [string]$task) {{
+	$pattern = '(^|\s)-task\s+' + $task + '(\s|$)'
+	@(Get-CimInstance Win32_Process -Filter "ParentProcessId = $parent" | Where-Object {{
+		[string]::Equals($_.Name, $name, [StringComparison]::OrdinalIgnoreCase) -and
+		$_.CommandLine -match $pattern -and
+		$_.CreationDate.ToUniversalTime() -ge $since
+	}})
+}}
+$targets = @()
+foreach ($server in Get-CarbonTestSession {process_id} 'StartServer') {{
+	$targets += $server
+	$targets += Get-CarbonTestSession $server.ProcessId 'StartClient'
+}}
+foreach ($target in $targets) {{
+	Stop-Process -Id $target.ProcessId -Force -ErrorAction SilentlyContinue
+}}
+Write-Output $targets.Count
+"#,
+		validation = validate_process_script(process_id, &studio.studio_executable, studio.creation_filetime)
 	)
 }
 

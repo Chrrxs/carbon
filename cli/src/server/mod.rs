@@ -163,6 +163,7 @@ pub enum Message {
 	Disconnect(Disconnect),
 	ManagedReload(ManagedReload),
 	StudioChangeProbe(StudioChangeProbe),
+	StudioQuickSave(StudioQuickSave),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,6 +201,14 @@ pub struct ManagedReload {
 #[serde(rename_all = "camelCase")]
 pub struct StudioChangeProbe {
 	pub request_id: String,
+}
+
+/// Asks the plugin to start the StudioTestService test whose Start Server
+/// action writes Studio's own save of the complete edit DataModel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioQuickSave {
+	pub token: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -391,6 +400,7 @@ impl Server {
 				.service(exec::main)
 				.service(stop::main)
 				.service(studio_change::acknowledge)
+				.service(studio_change::report_quick_save_failure)
 				.service(home::main)
 				.default_service(web::to(Self::default_redirect))
 		})

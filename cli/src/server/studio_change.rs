@@ -21,3 +21,23 @@ pub(crate) async fn acknowledge(request: MsgPack<Acknowledgement>, core: Data<Ar
 		Err(error) => HttpResponse::Conflict().body(format!("{error:#}")),
 	}
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickSaveFailure {
+	client_id: u32,
+	token: String,
+	message: String,
+}
+
+#[post("/studio/quick-save/failure")]
+pub(crate) async fn report_quick_save_failure(
+	request: MsgPack<QuickSaveFailure>,
+	core: Data<Arc<Core>>,
+) -> impl Responder {
+	let request = request.0;
+	match core.report_studio_quick_save_failure(request.client_id, &request.token, request.message) {
+		Ok(()) => HttpResponse::Ok().body("Studio quick-save failure recorded"),
+		Err(error) => HttpResponse::Conflict().body(format!("{error:#}")),
+	}
+}

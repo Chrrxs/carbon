@@ -101,6 +101,8 @@ export type ManifestCaptureStatus = {
 	state: "running" | "complete" | "failed",
 	sourceGeneration: string,
 	message: string?,
+	-- Present only on a capture request that asked the plugin to quick-save.
+	quickSaveToken: string?,
 }
 
 -- Messages
@@ -113,6 +115,7 @@ export type Message =
 	| Disconnect
 	| ManagedReload
 	| StudioChangeProbe
+	| StudioQuickSave
 export type MessageKind =
 	"SyncChanges"
 	| "SyncDetails"
@@ -121,6 +124,7 @@ export type MessageKind =
 	| "Disconnect"
 	| "ManagedReload"
 	| "StudioChangeProbe"
+	| "StudioQuickSave"
 
 export type SyncChanges = {
 	SyncChanges: {
@@ -162,6 +166,12 @@ export type ManagedReload = {
 export type StudioChangeProbe = {
 	StudioChangeProbe: {
 		requestId: string,
+	},
+}
+
+export type StudioQuickSave = {
+	StudioQuickSave: {
+		token: string,
 	},
 }
 

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "carbon-production-readiness",
-  "description": "Blocking installed-build qualification for Carbon's CLI, Studio plugin, and auto-recovery capture path.",
+  "description": "Blocking installed-build qualification for Carbon's CLI, Studio plugin, and Studio quick-save capture path.",
   "variables": {
     "repo": "${suite_dir}/../..",
     "carbon": "carbon",
@@ -111,8 +111,8 @@
       ]
     },
     {
-      "name": "managed-studio-auto-recovery-capture",
-      "description": "Launches Studio through robloxstudio-mcp, routes Carbon focus and MCP edits by the final managed instance ID, waits for a new auto-recovery save, closes through the managed lifecycle, and rebuilds the captured project.",
+      "name": "managed-studio-quick-save-capture",
+      "description": "Launches Studio through robloxstudio-mcp, routes Carbon focus and MCP edits by the final managed instance ID, captures through an immediate Studio quick save, closes through the managed lifecycle, and rebuilds the captured project.",
       "tags": ["runtime", "lifecycle", "capture", "crash_safety", "determinism"],
       "steps": [
         {
@@ -168,19 +168,19 @@
           "arguments": {
             "instance_id": "${studio_instance}",
             "target": "edit",
-            "code": "local old = workspace:FindFirstChild('CarbonAutoRecoveryProbe'); if old then old:Destroy() end; local probe = Instance.new('Part'); probe.Name = 'CarbonAutoRecoveryProbe'; probe.Anchored = true; probe.Size = Vector3.new(7, 3, 5); probe:SetAttribute('CapturedThroughAutoRecovery', true); probe.Parent = workspace; return probe:GetFullName()"
+            "code": "local old = workspace:FindFirstChild('CarbonQuickSaveProbe'); if old then old:Destroy() end; local probe = Instance.new('Part'); probe.Name = 'CarbonQuickSaveProbe'; probe.Anchored = true; probe.Size = Vector3.new(7, 3, 5); probe:SetAttribute('CapturedThroughQuickSave', true); probe.Parent = workspace; return probe:GetFullName()"
           },
           "timeout_seconds": 30,
           "max_duration_ms": 2000
         },
         {
-          "name": "stop-after-next-auto-recovery",
+          "name": "stop-after-quick-save",
           "kind": "command",
           "program": "${carbon}",
           "args": ["stop", "${studio_instance}", "--color", "never"],
           "cwd": "${repo}",
-          "timeout_seconds": 390,
-          "stderr_contains": ["auto-recovery"]
+          "timeout_seconds": 120,
+          "stderr_contains": ["quick save"]
         },
         {
           "name": "wait-for-managed-serve-shutdown",
@@ -204,20 +204,20 @@
           "args": ["diff", "${build_output}", "${capture_rebuild_output}", "--json", "--no-fail", "--color", "never"],
           "cwd": "${repo}",
           "timeout_seconds": 300,
-          "stdout_contains": ["CarbonAutoRecoveryProbe"]
+          "stdout_contains": ["CarbonQuickSaveProbe"]
 		},
 		{
 		  "name": "verify-rebuilt-capture-state",
 		  "kind": "assert_place_instance",
 		  "path": "${capture_rebuild_output}",
-		  "instance_path": ["Workspace", "CarbonAutoRecoveryProbe"],
+		  "instance_path": ["Workspace", "CarbonQuickSaveProbe"],
 		  "class": "Part",
 		  "properties": {
 		    "Anchored": true,
 		    "Size": [7, 3, 5]
 		  },
 		  "attributes": {
-		    "CapturedThroughAutoRecovery": true
+		    "CapturedThroughQuickSave": true
 		  }
 		}
       ]
