@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
 use std::path::PathBuf;
 
-use crate::{sessions, studio};
+use crate::{sessions, studio, studio_desktop};
 
 use super::studio_session;
 
@@ -101,98 +101,57 @@ impl Focus {
 			)
 		})?;
 		let _focus_lock = studio::acquire_focus_lock()?;
-		let parked_processes = if session
+		let routing = if session
 			.studio_desktop
 			.as_deref()
 			.and_then(studio::requested_virtual_desktop_name)
 			.is_some()
 		{
 			let peers = sessions::get_repository_peers(&session)?;
-			let plan = desktop_routing_plan(&session, peers)?
-				.expect("a configured Studio desktop always produces a routing plan");
-			for warning in plan.warnings {
-				crate::carbon_warn!("{warning}");
-			}
-			studio::set_studio_parking_policy(&plan.target, studio::StudioParkingPolicy::Parked)
-				.with_context(|| format!("failed to mute the selected Studio before routing desktops for {target}"))?;
-			let mut guarded_peers = Vec::new();
-			let mut guarded_sessions = 0;
-			let mut newly_muted_sessions = 0;
-			let mut guarded_threads = 0;
-			for placement in plan.peers {
-				let guard = studio::set_studio_parking_policy(
-                    &placement.process,
-                    studio::StudioParkingPolicy::Parked,
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to mute sibling Studio PID {} before focusing {target}; already guarded Studios remain parked",
-                        placement.process.process_id
-                    )
-                })?;
-				guarded_sessions += guard.audio.matched_sessions;
-				newly_muted_sessions += guard.audio.changed_sessions;
-				guarded_threads += guard.guarded_threads;
-				guarded_peers.push(placement);
-			}
-			let report = studio::arrange_studios_for_focus(&plan.target, &guarded_peers).with_context(|| {
-				format!("failed to route Studio desktops for {target}; all selected Studios remain parked and muted")
-			})?;
-			let parked_processes = guarded_peers
-				.iter()
-				.map(|placement| placement.process.clone())
-				.collect::<Vec<_>>();
-			let target_guard = studio::set_studio_parking_policy(&plan.target, studio::StudioParkingPolicy::Active)
-				.with_context(|| format!("failed to activate focused Studio guards for {target}"))?;
-			for warning in report.warnings {
-				crate::carbon_warn!("{warning}");
-			}
-			log::debug!(
-				"Focused Studio guards restored {} audio session(s) with {} mute change(s); sibling guards matched {} session(s), changed {} mute state(s), and protected {} UI thread(s)",
-				target_guard.audio.matched_sessions,
-				target_guard.audio.changed_sessions,
-				guarded_sessions,
-				newly_muted_sessions,
-				guarded_threads
-			);
-			crate::carbon_info!(
-				"Moved Roblox Studio PID {studio_pid} to the active Windows desktop, restored its focus and audio, parked {} sibling Studio(s) with focus and audio guarded, and cleared attention from {} sibling window(s)",
-				report.parked,
-				report.attention_windows
-			);
-			Some(parked_processes)
+			desktop_routing_plan(&session, peers)?
 		} else {
 			None
 		};
-		studio::focus_process(
-			studio_pid,
-			session.creation_filetime,
-			session.studio_executable.as_deref(),
-			restore,
-		)
-		.with_context(|| format!("failed to focus the Studio process registered for {target}"))?;
-		if let Some(parked_processes) = parked_processes {
-			match studio::suppress_studio_attention(&parked_processes) {
-				Ok(report) => {
-					for warning in report.warnings {
-						crate::carbon_warn!("{warning}");
-					}
-					crate::carbon_info!(
-						"Cleared post-focus attention from {} parked sibling window(s)",
-						report.attention_windows
-					);
+		let report = match &routing {
+			Some(plan) => {
+				for warning in &plan.warnings {
+					crate::carbon_warn!("{warning}");
 				}
-				Err(error) => {
-					crate::carbon_warn!("Could not clear post-focus attention from parked sibling Studios: {error:#}")
-				}
+				studio_desktop::focus(
+					&plan.target,
+					studio_desktop::FocusRouting::Desktops { peers: &plan.peers },
+					restore,
+				)
+			}
+			None => {
+				let identity = studio_session::process_identity(&session, "the focused Carbon serve session")?;
+				studio_desktop::focus(&identity, studio_desktop::FocusRouting::None, restore)
 			}
 		}
+		.with_context(|| format!("failed to focus the Studio process registered for {target}"))?;
+		for warning in &report.warnings {
+			crate::carbon_warn!("{warning}");
+		}
+		log::debug!(
+			"Focus restored {} audio session(s) with {} mute change(s); sibling guards matched {} session(s), changed {} mute state(s), protected {} UI thread(s), and cleared attention from {} then {} window(s)",
+			report.target_audio_sessions,
+			report.target_audio_changes,
+			report.peer_audio_sessions,
+			report.peer_audio_changes,
+			report.peer_guarded_threads,
+			report.attention_windows,
+			report.post_focus_attention_windows
+		);
+		let siblings = match report.parked {
+			0 => String::new(),
+			parked => format!(" and parked {parked} sibling Studio(s)"),
+		};
 		if restore {
 			crate::carbon_info!(
-				"Activated Roblox Studio PID {studio_pid} for {target} and restored the previous window"
+				"Activated Roblox Studio PID {studio_pid} for {target}{siblings}, then restored the previous window"
 			);
 		} else {
-			crate::carbon_info!("Focused Roblox Studio PID {studio_pid} for {target}");
+			crate::carbon_info!("Focused Roblox Studio PID {studio_pid} for {target}{siblings}");
 		}
 		Ok(())
 	}

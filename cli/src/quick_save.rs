@@ -10,7 +10,7 @@
 use std::{
 	fs,
 	path::{Path, PathBuf},
-	sync::{Arc, Mutex},
+	sync::{Arc, Condvar, Mutex},
 	thread::{self, Builder},
 	time::{Duration, Instant, SystemTime},
 };
@@ -154,7 +154,7 @@ impl QuickSaveCoordinator {
 		let spawned = Builder::new()
 			.name(format!("carbon-quick-save-{token}"))
 			.spawn(move || match coordinator.finish(ticket) {
-				Ok(staged) => crate::carbon_info!("Staged Studio quick save at {}", staged.display()),
+				Ok(staged) => log::debug!("Staged Studio quick save at {}", staged.display()),
 				Err(error) => crate::carbon_warn!(
 					"Studio quick save did not complete; waiting for Studio auto-recovery instead: {error:#}"
 				),
@@ -340,6 +340,58 @@ fn stage(quick_save_file: &Path, staging_dir: &Path, expected: RecoveryFingerpri
 pub(crate) fn filetime(time: SystemTime) -> u64 {
 	let since_unix_epoch = time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
 	FILETIME_UNIX_EPOCH + u64::try_from(since_unix_epoch.as_nanos() / 100).unwrap_or(u64::MAX - FILETIME_UNIX_EPOCH)
+}
+
+/// How long an edit plugin's playtest stop request stays valid. A play server
+/// that starts polling later than this belongs to a newer playtest.
+const PLAYTEST_STOP_LIFETIME: Duration = Duration::from_secs(15);
+
+/// Hands the edit plugin's request to stop a running playtest to the play
+/// server, the only DataModel that can call `StudioTestService:EndTest`.
+pub(crate) struct PlaytestStopSignal {
+	requested_at: Mutex<Option<Instant>>,
+	changed: Condvar,
+	lifetime: Duration,
+}
+
+impl Default for PlaytestStopSignal {
+	fn default() -> Self {
+		Self::with_lifetime(PLAYTEST_STOP_LIFETIME)
+	}
+}
+
+impl PlaytestStopSignal {
+	pub(crate) fn with_lifetime(lifetime: Duration) -> Self {
+		Self {
+			requested_at: Mutex::new(None),
+			changed: Condvar::new(),
+			lifetime,
+		}
+	}
+
+	pub(crate) fn request(&self) {
+		*self.requested_at.lock().unwrap() = Some(Instant::now());
+		self.changed.notify_all();
+	}
+
+	/// Wait up to `timeout` for a live request and consume it.
+	pub(crate) fn wait(&self, timeout: Duration) -> bool {
+		let deadline = Instant::now() + timeout;
+		let mut requested_at = self.requested_at.lock().unwrap();
+		loop {
+			if let Some(at) = *requested_at {
+				*requested_at = None;
+				if at.elapsed() <= self.lifetime {
+					return true;
+				}
+			}
+			let now = Instant::now();
+			if now >= deadline {
+				return false;
+			}
+			requested_at = self.changed.wait_timeout(requested_at, deadline - now).unwrap().0;
+		}
+	}
 }
 
 #[cfg(test)]
@@ -543,5 +595,20 @@ mod tests {
 			fresh.token, earlier_token,
 			"the fresh request must not reuse the earlier save"
 		);
+	}
+
+	#[test]
+	fn a_stale_playtest_stop_request_never_ends_a_later_playtest() {
+		let signal = PlaytestStopSignal::with_lifetime(Duration::from_millis(50));
+		signal.request();
+		thread::sleep(Duration::from_millis(80));
+		assert!(
+			!signal.wait(Duration::from_millis(10)),
+			"a request older than its lifetime must not end a playtest that starts later"
+		);
+
+		signal.request();
+		assert!(signal.wait(Duration::from_millis(10)));
+		assert!(!signal.wait(Duration::from_millis(10)), "each request is consumed once");
 	}
 }

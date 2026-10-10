@@ -401,6 +401,8 @@ impl Server {
 				.service(stop::main)
 				.service(studio_change::acknowledge)
 				.service(studio_change::report_quick_save_failure)
+				.service(studio_change::request_playtest_stop)
+				.service(studio_change::await_playtest_stop)
 				.service(home::main)
 				.default_service(web::to(Self::default_redirect))
 		})

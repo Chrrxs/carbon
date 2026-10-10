@@ -204,7 +204,7 @@ fn capture_before_shutdown(core: &Arc<Core>) -> Result<()> {
 	}
 	crate::carbon_info!("End signal received; capturing the connected Studio place before shutdown");
 	let message = core.capture_before_shutdown()?;
-	crate::carbon_info!("Automatic Capture Manifest completed: {}", message.bold());
+	crate::carbon_info!("Captured Studio before shutdown: {}", message.bold());
 	Ok(())
 }
 
@@ -631,10 +631,17 @@ impl Serve {
 							}
 						}
 						crate::carbon_info!("Project manifest changed; capturing Studio before synchronization reload");
-						if let Err(error) = active_core.capture_before_reload() {
-							crate::carbon_error!("Capture Manifest before synchronization reload failed: {error:#}");
-							reload_control.fail_reload(true);
-							return false;
+						match active_core.capture_before_reload() {
+							Ok(message) => {
+								crate::carbon_info!("Captured Studio before synchronization reload: {message}")
+							}
+							Err(error) => {
+								crate::carbon_error!(
+									"Capture Manifest before synchronization reload failed: {error:#}"
+								);
+								reload_control.fail_reload(true);
+								return false;
+							}
 						}
 						if let Err(error) = persist_served_studio_domain(&reload_project, &reload_cleanup_paths) {
 							crate::carbon_error!(

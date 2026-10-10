@@ -263,7 +263,13 @@ function Core:__triggerQuickSave(token: string)
 		self.client:reportQuickSaveFailure(token, reason):catch(function(err)
 			Log.debug("Failed to report the Studio quick-save failure", err)
 		end)
-	end)
+	end, {
+		stopPlaytest = function()
+			Log.info("Stopping the running playtest so Carbon can quick-save the place")
+			local requested, err = self.client:requestPlaytestStop():await()
+			return requested, if requested then nil else tostring(err)
+		end,
+	})
 end
 
 function Core:__quickSaveTrigger(): (token: string) -> ()

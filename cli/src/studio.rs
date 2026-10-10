@@ -424,14 +424,12 @@ pub(crate) struct StudioDesktopPlacement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StudioAudioPolicy {
 	Parked,
-	Audible,
 }
 
 impl StudioAudioPolicy {
 	fn as_str(self) -> &'static str {
 		match self {
 			Self::Parked => "muted",
-			Self::Audible => "audible",
 		}
 	}
 }
@@ -439,14 +437,12 @@ impl StudioAudioPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StudioWindowPolicy {
 	Parked,
-	Active,
 }
 
 impl StudioWindowPolicy {
 	fn as_str(self) -> &'static str {
 		match self {
 			Self::Parked => "parked",
-			Self::Active => "active",
 		}
 	}
 }
@@ -454,7 +450,6 @@ impl StudioWindowPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StudioParkingPolicy {
 	Parked,
-	Active,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -474,20 +469,6 @@ struct StudioWindowPolicyReport {
 pub(crate) struct StudioParkingPolicyReport {
 	pub(crate) audio: StudioAudioPolicyReport,
 	pub(crate) guarded_threads: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub(crate) struct StudioDesktopRoutingReport {
-	pub(crate) parked: usize,
-	pub(crate) parked_process_ids: Vec<u32>,
-	pub(crate) attention_windows: usize,
-	pub(crate) warnings: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub(crate) struct StudioAttentionReport {
-	pub(crate) attention_windows: usize,
-	pub(crate) warnings: Vec<String>,
 }
 
 pub(crate) struct StudioFocusLock {
@@ -1253,7 +1234,7 @@ fn move_process_to_virtual_desktop(
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn install_windows_helper(stem: &str, extension: &str, contents: &[u8]) -> Result<PathBuf> {
+pub(crate) fn install_windows_helper(stem: &str, extension: &str, contents: &[u8]) -> Result<PathBuf> {
 	let digest = blake3::hash(contents).to_hex().to_string();
 	let directory = util::get_carbon_dir()?.join("windows");
 	fs::create_dir_all(&directory).with_context(|| {
@@ -1287,19 +1268,19 @@ fn install_windows_helper(stem: &str, extension: &str, contents: &[u8]) -> Resul
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn install_studio_audio_guard_script() -> Result<PathBuf> {
+pub(crate) fn install_studio_audio_guard_script() -> Result<PathBuf> {
 	install_windows_helper("studio-audio-guard", "ps1", STUDIO_AUDIO_GUARD_SCRIPT.as_bytes())
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn install_studio_window_guard_assets() -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn install_studio_window_guard_assets() -> Result<(PathBuf, PathBuf)> {
 	let script = install_windows_helper("studio-window-guard", "ps1", STUDIO_WINDOW_GUARD_SCRIPT.as_bytes())?;
 	let hook = install_windows_helper("studio-window-guard-hook", "dll", STUDIO_WINDOW_GUARD_HOOK)?;
 	Ok((script, hook))
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn native_windows_helper_path(path: &Path) -> Result<String> {
+pub(crate) fn native_windows_helper_path(path: &Path) -> Result<String> {
 	#[cfg(target_os = "linux")]
 	{
 		windows_path(path, "Carbon Windows helper")
@@ -1546,14 +1527,6 @@ fn set_studio_window_policy(
 				)?
 			}
 		};
-		if policy == StudioWindowPolicy::Active {
-			ensure!(
-				report.guarded_threads == 0,
-				"Carbon Studio window guard left {} UI thread(s) guarded for PID {}",
-				report.guarded_threads,
-				process.process_id
-			);
-		}
 		Ok(report)
 	}
 
@@ -1579,278 +1552,6 @@ pub(crate) fn set_studio_parking_policy(
 				guarded_threads: window.guarded_threads,
 			})
 		}
-		StudioParkingPolicy::Active => {
-			let audio = set_studio_audio_policy(process, StudioAudioPolicy::Audible)
-				.context("failed to enforce active Studio audio")?;
-			let window = set_studio_window_policy(process, StudioWindowPolicy::Active)
-				.context("failed to release parked Studio window activation guard after making it audible")?;
-			Ok(StudioParkingPolicyReport {
-				audio,
-				guarded_threads: window.guarded_threads,
-			})
-		}
-	}
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn desktop_arrangement_script(
-	target: Option<&StudioProcessIdentity>,
-	placements: &[StudioDesktopPlacement],
-) -> Result<String> {
-	let placement_values = placements
-		.iter()
-		.map(|placement| {
-			json!({
-				"process": {
-					"process_id": placement.process.process_id,
-					"studio_executable": placement.process.studio_executable,
-					"creation_filetime": placement.process.creation_filetime.to_string(),
-				},
-				"desktop_name": placement.desktop_name,
-			})
-		})
-		.collect::<Vec<_>>();
-	let target_value = target.map(|target| {
-		json!({
-			"process_id": target.process_id,
-			"studio_executable": target.studio_executable,
-			"creation_filetime": target.creation_filetime.to_string(),
-		})
-	});
-	let plan = json!({
-		"target": target_value,
-		"placements": placement_values,
-	});
-	let encoded_plan = BASE64_STANDARD.encode(serde_json::to_vec(&plan)?);
-	Ok(r#"
-$ErrorActionPreference = 'Stop'
-if ([Environment]::OSVersion.Version.Build -lt 26100) { throw 'automatic Studio desktop routing requires Windows 11 24H2 or newer' }
-$planText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_PLAN__'))
-$plan = ConvertFrom-Json -InputObject $planText
-Add-Type -TypeDefinition @'
-__CARBON_INTEROP__
-'@
-
-function Get-ExactStudioWindow([object]$identity) {
-    [uint32]$processId = $identity.process_id
-    [string]$expectedPath = $identity.studio_executable
-    [int64]$expectedCreation = $identity.creation_filetime
-    $studioProcess = Get-Process -Id $processId -ErrorAction SilentlyContinue
-    if ($null -eq $studioProcess) { throw "Roblox Studio process $processId is no longer running" }
-    $studioProcess.Refresh()
-    if (-not [string]::Equals($studioProcess.Path, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Roblox Studio process $processId path no longer matches"
-    }
-    if ($studioProcess.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $expectedCreation) {
-        throw "Roblox Studio process $processId creation time no longer matches"
-    }
-    $window = [IntPtr]::Zero
-    for ($attempt = 0; $attempt -lt 50; $attempt++) {
-        if ($studioProcess.HasExited) { throw "Roblox Studio process $processId exited before its window could be routed" }
-        $studioProcess.Refresh()
-        $window = $studioProcess.MainWindowHandle
-        if ($window -ne [IntPtr]::Zero) { break }
-        Start-Sleep -Milliseconds 100
-    }
-    if ($window -eq [IntPtr]::Zero) { throw "Roblox Studio process $processId has no main window" }
-    return $window
-}
-
-function Resolve-ParkingDesktop([string]$name) {
-    $root = 'Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\Desktops'
-    $matches = @(Get-ChildItem -LiteralPath $root -ErrorAction Stop | ForEach-Object {
-        $desktopName = (Get-ItemProperty -LiteralPath $_.PSPath -Name Name -ErrorAction SilentlyContinue).Name
-        if (-not [string]::IsNullOrEmpty([string]$desktopName) -and [string]::Equals([string]$desktopName, $name, [StringComparison]::OrdinalIgnoreCase)) {
-            $_.PSChildName
-        }
-    })
-    if ($matches.Count -eq 0) { throw "Windows virtual desktop '$name' was not found" }
-    if ($matches.Count -gt 1) { throw "Windows virtual desktop name '$name' is ambiguous" }
-    return [Guid]::Parse([string]$matches[0])
-}
-
-function Move-VerifiedDesktop([IntPtr]$window, [Guid]$desktopId) {
-    $actualDesktopId = [CarbonVirtualDesktopInterop]::GetWindowDesktopId($window)
-    if ($actualDesktopId -eq $desktopId) { return }
-    [CarbonVirtualDesktopInterop]::MoveWindow($window, $desktopId)
-    for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        $actualDesktopId = [CarbonVirtualDesktopInterop]::GetWindowDesktopId($window)
-        if ($actualDesktopId -eq $desktopId) { return }
-        Start-Sleep -Milliseconds 25
-    }
-    throw 'Windows did not move Roblox Studio to the requested virtual desktop'
-}
-
-if ($null -ne $plan.target) {
-    $activeDesktopId = [CarbonVirtualDesktopInterop]::GetCurrentDesktopId()
-    $targetWindow = Get-ExactStudioWindow $plan.target
-    Move-VerifiedDesktop $targetWindow $activeDesktopId
-}
-
-$warnings = [Collections.Generic.List[string]]::new()
-$parked = 0
-$parkedProcessIds = [Collections.Generic.List[uint32]]::new()
-$attentionWindows = 0
-foreach ($placement in @($plan.placements)) {
-    [uint32]$processId = $placement.process.process_id
-    [string]$desktopName = $placement.desktop_name
-    if ($null -ne $plan.target -and $processId -eq [uint32]$plan.target.process_id) {
-        $warnings.Add("Studio PID $processId was not parked because it is also the focus target") | Out-Null
-        continue
-    }
-    try {
-        $studioWindow = Get-ExactStudioWindow $placement.process
-        $parkingDesktopId = Resolve-ParkingDesktop $desktopName
-        Move-VerifiedDesktop $studioWindow $parkingDesktopId
-        $attentionWindows += [CarbonVirtualDesktopInterop]::StopFlashingForProcess($processId)
-		$parkedProcessIds.Add($processId) | Out-Null
-        $parked++
-    } catch {
-        $warnings.Add("Studio PID $processId was not parked on desktop '$desktopName': $($_.Exception.Message)") | Out-Null
-    }
-}
-
-[PSCustomObject]@{ parked = $parked; parked_process_ids = @($parkedProcessIds); attention_windows = $attentionWindows; warnings = @($warnings) } | ConvertTo-Json -Compress
-"#
-	.replace("__CARBON_PLAN__", &encoded_plan)
-	.replace("__CARBON_INTEROP__", WINDOWS_VIRTUAL_DESKTOP_INTEROP))
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn focus_desktop_arrangement_script(
-	target: &StudioProcessIdentity,
-	peers: &[StudioDesktopPlacement],
-) -> Result<String> {
-	desktop_arrangement_script(Some(target), peers)
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn park_studio_script(placement: &StudioDesktopPlacement) -> Result<String> {
-	desktop_arrangement_script(None, std::slice::from_ref(placement))
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn attention_suppression_script(processes: &[StudioProcessIdentity]) -> Result<String> {
-	let identities = processes
-		.iter()
-		.map(|process| {
-			json!({
-				"process_id": process.process_id,
-				"studio_executable": process.studio_executable,
-				"creation_filetime": process.creation_filetime.to_string(),
-			})
-		})
-		.collect::<Vec<_>>();
-	let encoded_plan = BASE64_STANDARD.encode(serde_json::to_vec(&identities)?);
-	Ok(r#"
-$ErrorActionPreference = 'Stop'
-$planText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CARBON_PLAN__'))
-$processes = @(ConvertFrom-Json -InputObject $planText)
-Add-Type -TypeDefinition @'
-__CARBON_INTEROP__
-'@
-
-$warnings = [Collections.Generic.List[string]]::new()
-$attentionWindows = 0
-foreach ($identity in $processes) {
-    [uint32]$processId = $identity.process_id
-    try {
-        $studioProcess = Get-Process -Id $processId -ErrorAction SilentlyContinue
-        if ($null -eq $studioProcess) { throw "Roblox Studio process $processId is no longer running" }
-        $studioProcess.Refresh()
-        if (-not [string]::Equals($studioProcess.Path, [string]$identity.studio_executable, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Roblox Studio process $processId path no longer matches"
-        }
-        if ($studioProcess.StartTime.ToUniversalTime().ToFileTimeUtc() -ne [int64]$identity.creation_filetime) {
-            throw "Roblox Studio process $processId creation time no longer matches"
-        }
-        $attentionWindows += [CarbonVirtualDesktopInterop]::StopFlashingForProcess($processId)
-    } catch {
-        $warnings.Add("Studio PID $processId attention was not cleared: $($_.Exception.Message)") | Out-Null
-    }
-}
-
-[PSCustomObject]@{ attention_windows = $attentionWindows; warnings = @($warnings) } | ConvertTo-Json -Compress
-"#
-	.replace("__CARBON_PLAN__", &encoded_plan)
-	.replace("__CARBON_INTEROP__", WINDOWS_VIRTUAL_DESKTOP_INTEROP))
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn run_desktop_arrangement(script: &str, description: &str) -> Result<StudioDesktopRoutingReport> {
-	let output = powershell_command()?
-		.args(["-Sta", "-NoProfile", "-NonInteractive", "-Command", script])
-		.output()
-		.with_context(|| format!("failed to invoke {description}"))?;
-	ensure!(
-		output.status.success(),
-		"{description} failed: {}",
-		String::from_utf8_lossy(&output.stderr).trim()
-	);
-	let stdout = String::from_utf8(output.stdout).context("Studio desktop routing returned non-UTF-8 output")?;
-	serde_json::from_str(stdout.trim()).context("Studio desktop routing returned an invalid report")
-}
-
-pub(crate) fn arrange_studios_for_focus(
-	target: &StudioProcessIdentity,
-	peers: &[StudioDesktopPlacement],
-) -> Result<StudioDesktopRoutingReport> {
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	{
-		let script = focus_desktop_arrangement_script(target, peers)?;
-		run_desktop_arrangement(&script, "automatic Studio desktop routing")
-	}
-
-	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-	{
-		let _ = (target, peers);
-		anyhow::bail!("automatic Studio desktop routing is supported only when Carbon runs on Windows or WSL")
-	}
-}
-
-pub(crate) fn park_studio(placement: &StudioDesktopPlacement) -> Result<StudioDesktopRoutingReport> {
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	{
-		let script = park_studio_script(placement)?;
-		let report = run_desktop_arrangement(&script, "Studio parking")?;
-		ensure!(
-			report.parked == 1,
-			"Studio was not parked on desktop {:?}: {}",
-			placement.desktop_name,
-			report.warnings.join("; ")
-		);
-		Ok(report)
-	}
-
-	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-	{
-		let _ = placement;
-		anyhow::bail!("Studio parking is supported only when Carbon runs on Windows or WSL")
-	}
-}
-
-pub(crate) fn suppress_studio_attention(processes: &[StudioProcessIdentity]) -> Result<StudioAttentionReport> {
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	{
-		let script = attention_suppression_script(processes)?;
-		let output = powershell_command()?
-			.args(["-NoProfile", "-NonInteractive", "-Command", &script])
-			.output()
-			.context("failed to invoke Studio attention suppression")?;
-		ensure!(
-			output.status.success(),
-			"Studio attention suppression failed: {}",
-			String::from_utf8_lossy(&output.stderr).trim()
-		);
-		let stdout =
-			String::from_utf8(output.stdout).context("Studio attention suppression returned non-UTF-8 output")?;
-		serde_json::from_str(stdout.trim()).context("Studio attention suppression returned an invalid report")
-	}
-
-	#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-	{
-		let _ = processes;
-		anyhow::bail!("Studio attention suppression is supported only when Carbon runs on Windows or WSL")
 	}
 }
 
@@ -2188,162 +1889,6 @@ pub fn wait_for_exit(process_id: u32) -> Result<()> {
 
 	#[allow(unreachable_code)]
 	Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn wsl_focus_script(process_id: u32, validation: &str, restore_previous: bool) -> String {
-	let restore = if restore_previous {
-		"if ($previous -ne [IntPtr]::Zero) { [CarbonWindow]::ShowWindow($previous, 9) | Out-Null; [CarbonWindow]::SetForegroundWindow($previous) | Out-Null }"
-	} else {
-		""
-	};
-	format!(
-		r#"
-{validation}
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class CarbonWindow {{
-	[StructLayout(LayoutKind.Sequential)]
-	public struct WindowRect {{ public int Left; public int Top; public int Right; public int Bottom; }}
-    public delegate bool EnumProc(IntPtr hwnd, IntPtr param);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc proc, IntPtr param);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
-	[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint command);
-	[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out WindowRect rect);
-	[DllImport("user32.dll")] public static extern IntPtr GetLastActivePopup(IntPtr hwnd);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command);
-    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hwnd);
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-
-	public static IntPtr FindFocusTarget(uint processId) {{
-		IntPtr root = IntPtr.Zero;
-		long largestArea = -1;
-		EnumWindows(delegate(IntPtr window, IntPtr parameter) {{
-			uint windowProcessId;
-			GetWindowThreadProcessId(window, out windowProcessId);
-			if (windowProcessId != processId || !IsWindowVisible(window) || GetWindow(window, 4) != IntPtr.Zero) return true;
-			WindowRect rect;
-			long area = 0;
-			if (GetWindowRect(window, out rect)) {{
-				area = Math.Max(0, rect.Right - rect.Left) * (long)Math.Max(0, rect.Bottom - rect.Top);
-			}}
-			if (root == IntPtr.Zero || area > largestArea) {{ root = window; largestArea = area; }}
-			return true;
-		}}, IntPtr.Zero);
-		if (root == IntPtr.Zero) return IntPtr.Zero;
-
-		var target = root;
-		for (var attempt = 0; attempt < 16; attempt++) {{
-			var popup = GetLastActivePopup(target);
-			if (popup == IntPtr.Zero || popup == target || !IsWindowVisible(popup)) break;
-			uint popupProcessId;
-			GetWindowThreadProcessId(popup, out popupProcessId);
-			if (popupProcessId != processId) break;
-			target = popup;
-		}}
-		return target;
-	}}
-}}
-'@
-$previous = [CarbonWindow]::GetForegroundWindow()
-$target = [CarbonWindow]::FindFocusTarget({process_id})
-if ($target -eq [IntPtr]::Zero) {{ throw 'Roblox Studio window was not found' }}
-[CarbonWindow]::ShowWindow($target, 9) | Out-Null
-[CarbonWindow]::SetForegroundWindow($target) | Out-Null
-if ([CarbonWindow]::GetForegroundWindow() -ne $target) {{
-    $currentThread = [CarbonWindow]::GetCurrentThreadId()
-    [uint32]$targetProcessId = 0
-    $targetThread = [CarbonWindow]::GetWindowThreadProcessId($target, [ref]$targetProcessId)
-    $foreground = [CarbonWindow]::GetForegroundWindow()
-    [uint32]$foregroundProcessId = 0
-    $foregroundThread = if ($foreground -ne [IntPtr]::Zero) {{ [CarbonWindow]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId) }} else {{ 0 }}
-    $attachedForeground = $false
-    $attachedTarget = $false
-    try {{
-        if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) {{
-            $attachedForeground = [CarbonWindow]::AttachThreadInput($currentThread, $foregroundThread, $true)
-        }}
-        if ($targetThread -ne 0 -and $targetThread -ne $currentThread -and $targetThread -ne $foregroundThread) {{
-            $attachedTarget = [CarbonWindow]::AttachThreadInput($currentThread, $targetThread, $true)
-        }}
-        [CarbonWindow]::BringWindowToTop($target) | Out-Null
-        [CarbonWindow]::SetForegroundWindow($target) | Out-Null
-        [CarbonWindow]::SetFocus($target) | Out-Null
-    }} finally {{
-        if ($attachedTarget) {{ [CarbonWindow]::AttachThreadInput($currentThread, $targetThread, $false) | Out-Null }}
-        if ($attachedForeground) {{ [CarbonWindow]::AttachThreadInput($currentThread, $foregroundThread, $false) | Out-Null }}
-    }}
-}}
-for ($attempt = 0; $attempt -lt 20 -and [CarbonWindow]::GetForegroundWindow() -ne $target; $attempt++) {{
-    Start-Sleep -Milliseconds 10
-}}
-if ([CarbonWindow]::GetForegroundWindow() -ne $target) {{ throw 'Roblox Studio rejected foreground activation' }}
-{restore}
-"#
-	)
-}
-
-pub fn focus_process(
-	process_id: u32,
-	creation_filetime: Option<u64>,
-	studio_executable: Option<&str>,
-	restore_previous: bool,
-) -> Result<()> {
-	let creation_filetime = creation_filetime.context("Studio process creation time is unavailable")?;
-	let studio_executable = studio_executable.context("Studio executable identity is unavailable")?;
-	#[cfg(target_os = "windows")]
-	{
-		return crate::studio_windows::focus_process(
-			process_id,
-			creation_filetime,
-			studio_executable,
-			restore_previous,
-		);
-	}
-	#[cfg(target_os = "linux")]
-	{
-		ensure!(
-			wine_host()?.is_none(),
-			"focusing a Roblox Studio window is unsupported on a Linux Wine host"
-		);
-		let validation = validate_process_script(process_id, studio_executable, creation_filetime);
-		let script = wsl_focus_script(process_id, &validation, restore_previous);
-		let output = powershell_command()?
-			.args(["-NoProfile", "-NonInteractive", "-Command", &script])
-			.output()?;
-		ensure!(
-			output.status.success(),
-			"Roblox Studio window activation failed: {}",
-			String::from_utf8_lossy(&output.stderr).trim()
-		);
-		Ok(())
-	}
-	#[cfg(target_os = "macos")]
-	{
-		let _ = creation_filetime;
-		let _ = studio_executable;
-		let script = format!(
-			r#"tell application "System Events"
-set matches to every process whose unix id is {process_id} and name is "RobloxStudio"
-if (count of matches) is not 1 then error "Roblox Studio process is not running"
-tell item 1 of matches
-set frontmost to true
-perform action "AXRaise" of window 1
-end tell
-end tell"#
-		);
-		let output = Command::new("osascript").args(["-e", &script]).output()?;
-		ensure!(output.status.success(), "Roblox Studio window activation failed");
-		return Ok(());
-	}
-	#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-	anyhow::bail!("Roblox Studio focus is unsupported on this platform")
 }
 
 #[allow(unused_variables)]
@@ -3182,7 +2727,7 @@ mod tests {
 		};
 		let error = verify_studio_audio_policy_report(
 			&process,
-			StudioAudioPolicy::Audible,
+			StudioAudioPolicy::Parked,
 			StudioAudioPolicyReport {
 				matched_sessions: 1,
 				changed_sessions: 0,
@@ -3192,7 +2737,7 @@ mod tests {
 		)
 		.unwrap_err();
 
-		assert!(format!("{error:#}").contains("left 1 session(s) outside the audible policy for PID 47312"));
+		assert!(format!("{error:#}").contains("left 1 session(s) outside the muted policy for PID 47312"));
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -3458,91 +3003,5 @@ mod tests {
 		assert!(script.contains("$window = $process.MainWindowHandle"));
 		assert!(script.contains("Start-Sleep -Milliseconds 100"));
 		assert!(script.contains("application view was not ready within 30 seconds"));
-	}
-
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	#[test]
-	fn focus_desktop_arrangement_captures_active_desktop_and_isolates_peer_failures() {
-		let executable = r"C:\Roblox\RobloxStudioBeta.exe";
-		let desktop = "Studios'); Stop-Process -Name RobloxStudioBeta; ('";
-		let target = StudioProcessIdentity {
-			process_id: 47_312,
-			studio_executable: executable.to_owned(),
-			creation_filetime: 133_700_123_456,
-		};
-		let peers = vec![StudioDesktopPlacement {
-			process: StudioProcessIdentity {
-				process_id: 47_313,
-				studio_executable: executable.to_owned(),
-				creation_filetime: 133_700_123_457,
-			},
-			desktop_name: desktop.to_owned(),
-		}];
-
-		let script = focus_desktop_arrangement_script(&target, &peers).unwrap();
-
-		assert!(script.contains("GetCurrentDesktopId"));
-		assert!(script.contains("Move-VerifiedDesktop $targetWindow $activeDesktopId"));
-		assert!(script.contains("foreach ($placement in @($plan.placements))"));
-		assert!(script.contains("StopFlashingForProcess($processId)"));
-		assert!(script.contains("catch"));
-		assert!(script.contains("$warnings.Add"));
-		assert!(script.contains("OSVersion.Version.Build -lt 26100"));
-		assert!(!script.contains(executable));
-		assert!(!script.contains(desktop));
-	}
-
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	#[test]
-	fn standalone_parking_does_not_activate_a_desktop_and_clears_the_complete_window_family() {
-		let executable = r"C:\Roblox\RobloxStudioBeta.exe";
-		let placement = StudioDesktopPlacement {
-			process: StudioProcessIdentity {
-				process_id: 47_313,
-				studio_executable: executable.to_owned(),
-				creation_filetime: 133_700_123_457,
-			},
-			desktop_name: "Studios".to_owned(),
-		};
-
-		let script = park_studio_script(&placement).unwrap();
-
-		assert!(script.contains("$null -ne $plan.target"));
-		assert!(script.contains("Resolve-ParkingDesktop $desktopName"));
-		assert!(script.contains("StopFlashingForProcess($processId)"));
-		assert!(script.contains("EnumWindows(delegate(IntPtr window"));
-		assert!(!script.contains(executable));
-		assert!(!script.contains("\"target\":{\"process_id\""));
-	}
-
-	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	#[test]
-	fn post_focus_attention_suppression_revalidates_every_exact_process() {
-		let executable = r"C:\Roblox\RobloxStudioBeta.exe";
-		let script = attention_suppression_script(&[StudioProcessIdentity {
-			process_id: 47_313,
-			studio_executable: executable.to_owned(),
-			creation_filetime: 133_700_123_457,
-		}])
-		.unwrap();
-
-		assert!(script.contains("Get-Process -Id $processId"));
-		assert!(script.contains("creation time no longer matches"));
-		assert!(script.contains("StopFlashingForProcess($processId)"));
-		assert!(script.contains("attention_windows"));
-		assert!(!script.contains(executable));
-	}
-
-	#[cfg(target_os = "linux")]
-	#[test]
-	fn wsl_focus_verifies_foreground_state_and_uses_thread_input_fallback() {
-		let script = wsl_focus_script(47_312, "# exact process validation", false);
-
-		assert!(script.contains("GetForegroundWindow() -ne $target"));
-		assert!(script.contains("AttachThreadInput"));
-		assert!(script.contains("BringWindowToTop"));
-		assert!(script.contains("SetFocus"));
-		assert!(script.contains("FindFocusTarget"));
-		assert!(script.contains("GetLastActivePopup"));
 	}
 }

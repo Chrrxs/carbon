@@ -3502,7 +3502,7 @@ pub(crate) fn stage_compiled_capture(
 		let _ = fs::remove_dir_all(&root);
 		return Err(error);
 	}
-	crate::carbon_info!(
+	log::debug!(
 		"Capture Manifest artifact stage: instances={}, total={:.1}ms",
 		ids.len(),
 		started.elapsed().as_secs_f64() * 1_000.0,

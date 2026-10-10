@@ -15,7 +15,7 @@ use std::{
 	path::Path,
 	path::PathBuf,
 	sync::{
-		atomic::{AtomicBool, AtomicU8, Ordering},
+		atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
 		Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
 	},
 	thread::{self, Builder},
@@ -67,6 +67,10 @@ pub struct Core {
 	managed_reload_transition: Mutex<Option<String>>,
 	automatic_capture_enabled: AtomicBool,
 	shutdown_capture_requested: AtomicBool,
+	/// Counts stop and reload captures. Each reports its own result, so the
+	/// background monitor stays quiet about a capture one of them joined.
+	explicit_captures: AtomicU64,
+	playtest_stop: crate::quick_save::PlaytestStopSignal,
 	shutdown_recovery_studio_generation: Mutex<Option<String>>,
 	shutdown_coordinator: ShutdownCoordinator,
 	quick_save: Mutex<Option<Arc<crate::quick_save::QuickSaveCoordinator>>>,
@@ -976,6 +980,76 @@ mod manifest_capture_retry_tests {
 		);
 		assert!(message.contains("Studio quick save"), "{message}");
 	}
+
+	#[test]
+	fn a_joined_quick_save_capture_is_reported_once_without_its_staging_path() {
+		// The background monitor and stop share one capture. Stop reports it, so
+		// the monitor must not report it a second time.
+		let session = idle_quick_save_session("shutdown-quick-save-report", false);
+		let plugin = unchanged_studio_plugin(&session, true, Duration::ZERO);
+		let monitor_started = session.core.explicit_capture_count();
+
+		let message = session.core.capture_before_shutdown().unwrap();
+		plugin.join().unwrap();
+		let reported_by_stop = session.core.explicit_capture_started_since(monitor_started);
+		session.core.stop_automatic_capture_monitor();
+		let QuickSaveSession { core, directory, .. } = session;
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+
+		assert!(reported_by_stop, "the monitor must leave a joined capture to stop");
+		assert_eq!(message, "Studio quick save was captured and committed atomically");
+	}
+
+	#[test]
+	fn a_play_server_ends_its_playtest_when_the_edit_plugin_requests_a_quick_save() {
+		let session = idle_quick_save_session("playtest-stop", false);
+		let core = Arc::clone(&session.core);
+
+		assert!(
+			core.await_playtest_stop("another-session", Duration::from_millis(10))
+				.is_err(),
+			"only a play server of this served session may wait for a stop"
+		);
+		assert!(
+			core.request_playtest_stop(99).is_err(),
+			"only the subscribed edit plugin may stop a playtest"
+		);
+		assert!(!core
+			.await_playtest_stop("idle-session", Duration::from_millis(20))
+			.unwrap());
+
+		let play_server = {
+			let core = Arc::clone(&core);
+			thread::spawn(move || core.await_playtest_stop("idle-session", Duration::from_secs(10)))
+		};
+		thread::sleep(Duration::from_millis(50));
+		let requested = Instant::now();
+		core.request_playtest_stop(7).unwrap();
+		assert!(
+			play_server.join().unwrap().unwrap(),
+			"the waiting play server must end its test"
+		);
+		assert!(requested.elapsed() < Duration::from_secs(1));
+		assert!(
+			!core
+				.await_playtest_stop("idle-session", Duration::from_millis(20))
+				.unwrap(),
+			"one request ends one playtest"
+		);
+
+		// A play server that starts polling shortly after the request still ends.
+		core.request_playtest_stop(7).unwrap();
+		assert!(core
+			.await_playtest_stop("idle-session", Duration::from_millis(20))
+			.unwrap());
+
+		session.core.stop_automatic_capture_monitor();
+		drop(core);
+		let QuickSaveSession { core, directory, .. } = session;
+		drop(core);
+		std::fs::remove_dir_all(directory).unwrap();
+	}
 }
 
 /// Which recovery candidates the active capture may commit while an explicit
@@ -1297,6 +1371,8 @@ impl Core {
 			managed_reload_transition: Mutex::new(None),
 			automatic_capture_enabled: AtomicBool::new(false),
 			shutdown_capture_requested: AtomicBool::new(false),
+			explicit_captures: AtomicU64::new(0),
+			playtest_stop: crate::quick_save::PlaytestStopSignal::default(),
 			shutdown_recovery_studio_generation: Mutex::new(None),
 			shutdown_coordinator: ShutdownCoordinator::new(),
 			quick_save: Mutex::new(None),
@@ -1417,7 +1493,7 @@ impl Core {
 			.and_then(|client_id| self.request_studio_quick_save(client_id));
 		let error = match staged {
 			Ok(staged) => {
-				crate::carbon_info!("Staged Studio quick save at {}", staged.display());
+				log::debug!("Staged Studio quick save at {}", staged.display());
 				*self.quick_save_gate.lock().unwrap() = QuickSaveGate::Require(staged);
 				return Ok(());
 			}
@@ -1464,6 +1540,44 @@ impl Core {
 		self.studio_quick_save()
 			.context("Studio quick saves are not enabled for this session")?
 			.report_failure(client_id, token, message)
+	}
+
+	/// The edit plugin asks the play server to end the running playtest so it
+	/// can quick-save.
+	pub(crate) fn request_playtest_stop(&self, client_id: u32) -> Result<()> {
+		ensure!(
+			self.queue.is_subscribed(client_id),
+			"Studio playtest stop request is not subscribed"
+		);
+		self.playtest_stop.request();
+		log::debug!("Asked the running Studio playtest to end for a quick save");
+		Ok(())
+	}
+
+	/// A play server copied from this served session waits up to `timeout` for
+	/// the edit plugin to ask it to end its playtest.
+	pub(crate) fn await_playtest_stop(&self, session_token: &str, timeout: Duration) -> Result<bool> {
+		let (_, expected) = self
+			.worktree
+			.as_ref()
+			.context("playtest stops require a managed Studio worktree")?;
+		ensure!(
+			!session_token.is_empty() && session_token == expected,
+			"the play server does not belong to this Carbon session"
+		);
+		Ok(self.playtest_stop.wait(timeout))
+	}
+
+	fn begin_explicit_capture(&self) {
+		self.explicit_captures.fetch_add(1, Ordering::AcqRel);
+	}
+
+	fn explicit_capture_count(&self) -> u64 {
+		self.explicit_captures.load(Ordering::Acquire)
+	}
+
+	fn explicit_capture_started_since(&self, count: u64) -> bool {
+		self.explicit_capture_count() != count
 	}
 
 	pub fn cleanup_ephemeral_paths(&self) {
@@ -1541,6 +1655,7 @@ impl Core {
 	}
 
 	pub fn capture_before_shutdown(self: &Arc<Self>) -> Result<String> {
+		self.begin_explicit_capture();
 		self.shutdown_capture_requested.store(true, Ordering::Release);
 		let monitor_was_enabled = self.automatic_capture_enabled.swap(false, Ordering::AcqRel);
 		let result = self.shutdown_coordinator.execute_or_await(|| {
@@ -1570,6 +1685,7 @@ impl Core {
 	}
 
 	pub fn capture_before_reload(self: &Arc<Self>) -> Result<String> {
+		self.begin_explicit_capture();
 		self.do_automatic_capture(CaptureTrigger::Reload)
 	}
 
@@ -1585,7 +1701,7 @@ impl Core {
 		let capture_result = wait_for_automatic_capture(
 			|| {
 				let status = self.begin_manifest_capture_mode_internal(true, None)?;
-				crate::carbon_info!(
+				log::debug!(
 					"Automatic capture request {} is waiting for {} for served generation {}",
 					status.request_id,
 					if quick_save {
@@ -1850,8 +1966,11 @@ impl Core {
 			{
 				break;
 			}
+			let explicit_captures = core.explicit_capture_count();
 			match core.do_automatic_capture(CaptureTrigger::Monitor) {
-				Ok(message) => crate::carbon_info!("Automatic Studio capture completed: {message}"),
+				// Stop and reload report the captures they join.
+				Ok(_) if core.explicit_capture_started_since(explicit_captures) => {}
+				Ok(message) => crate::carbon_info!("Captured Studio: {message}"),
 				Err(error) if core.is_studio_disconnected_error(&error) => break,
 				Err(error) => crate::carbon_error!("Automatic Studio capture failed: {error:#}"),
 			}
@@ -2197,10 +2316,16 @@ impl Core {
 				.context("Capture Manifest request disappeared after recovery commit")?;
 			operation.source_generation = generation;
 			operation.state = "complete".to_owned();
-			operation.message = Some(format!(
-				"{capture_label} {} was captured and committed atomically{archive_notice}",
-				capture_path.display(),
-			));
+			// A quick save is a private staged copy that no longer exists.
+			operation.message = Some(match capture_kind {
+				crate::recovery::RecoveryKind::StudioQuickSave => {
+					format!("{capture_label} was captured and committed atomically{archive_notice}")
+				}
+				_ => format!(
+					"{capture_label} {} was captured and committed atomically{archive_notice}",
+					capture_path.display(),
+				),
+			});
 		}
 		if let Some(transition_id) = managed_reload_transition_id {
 			self.complete_managed_reload_transition(&transition_id)?;

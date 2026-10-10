@@ -316,6 +316,12 @@ function Client:reportQuickSaveFailure(token: string, message: string): Promise.
 	})
 end
 
+function Client:requestPlaytestStop(): Promise.Promise
+	return Http.post(self:getUrl("studio/playtest/stop"), {
+		clientId = self.clientId,
+	})
+end
+
 function Client:requestManifestCapture(
 	onStatus: ((status: Types.ManifestCaptureStatus) -> ())?,
 	managedReloadTransitionId: string?,

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
 use std::path::PathBuf;
 
-use crate::studio;
+use crate::{studio, studio_desktop};
 
 use super::studio_session;
 
@@ -48,24 +48,16 @@ impl Park {
 			desktop_name: desktop_name.clone(),
 		};
 		let _focus_lock = studio::acquire_focus_lock()?;
-		let guard = studio::set_studio_parking_policy(&placement.process, studio::StudioParkingPolicy::Parked)
-			.with_context(|| format!("failed to guard parked Studio for {target}"))?;
-		let report = studio::park_studio(&placement).with_context(|| {
-			format!("failed to move the Studio process registered for {target}; it remains muted and guarded for retry")
-		})?;
-		for warning in report.warnings {
-			crate::carbon_warn!("{warning}");
-		}
+		let report = studio_desktop::park(&placement)
+			.with_context(|| format!("failed to park the Studio process registered for {target}"))?;
 		log::debug!(
-			"Parked Studio guard protected {} UI thread(s), matched {} audio session(s), and changed {} mute state(s)",
-			guard.guarded_threads,
-			guard.audio.matched_sessions,
-			guard.audio.changed_sessions
+			"Parked Studio guard protected {} UI thread(s), matched {} audio session(s), changed {} mute state(s), and cleared attention from {} window(s)",
+			report.guarded_threads,
+			report.audio_sessions,
+			report.audio_changes,
+			report.attention_windows
 		);
-		crate::carbon_info!(
-			"Parked Roblox Studio PID {studio_pid} for {target} on Windows desktop {desktop_name:?}, guarded its focus and audio, and cleared attention from {} window(s)",
-			report.attention_windows,
-		);
+		crate::carbon_info!("Parked Roblox Studio PID {studio_pid} for {target} on Windows desktop {desktop_name:?}");
 		Ok(())
 	}
 }

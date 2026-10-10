@@ -25,8 +25,8 @@ pub mod sessions;
 pub mod source;
 mod source_wire;
 pub mod studio;
+pub(crate) mod studio_desktop;
 pub(crate) mod studio_plugin;
-pub mod studio_windows;
 #[cfg(target_os = "linux")]
 pub(crate) mod studio_wine;
 pub mod util;

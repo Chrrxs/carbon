@@ -66,7 +66,7 @@ async fn main(
 					actix_web::rt::time::sleep(Duration::from_millis(50)).await;
 					stop_handle.stop(false).await;
 				});
-				info!("Automatic Capture Manifest completed before Carbon stop: {message}");
+				info!("Captured Studio before Carbon stop: {message}");
 				HttpResponse::Ok().body(format!(
 					"Capture Manifest completed: {message}. Carbon stopped successfully"
 				))

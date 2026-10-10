@@ -126,6 +126,15 @@ never dismisses or answers that dialog. `carbon focus` repeats the parked
 sibling attention pass after activating the selected Studio because Windows
 can relatch a shared taskbar group during activation.
 
+One Windows PowerShell process runs a complete focus or park, including the
+guardian policy changes, desktop routing, and activation, so either command
+normally finishes in well under a second. Carbon compiles its helper once per
+Carbon version into `%LOCALAPPDATA%\Carbon\studio-desktop`. Focus succeeds once
+any window of the exact Studio process is in the foreground, because Studio may
+hand activation to its own active dialog or tool window. When Windows keeps
+another window in front, Carbon retries for up to two seconds and then reports
+which process kept the foreground or that Studio is not responding.
+
 If Studio owns an active modal dialog, Carbon focuses that dialog instead of the
 disabled main window. Pass `--restore` to verify Studio activation and then
 return to the previously foreground window. A worktree target may be the
@@ -279,7 +288,13 @@ Quick saves need a managed `serve` session. Every Studio on a host writes the
 same `server.rbxl`, so Carbon serializes quick saves across sessions with
 `~/.carbon/studio-quick-save.lock`, and the session identity embedded in each
 save rejects a file from any other Studio. Studio cannot start the test while a
-playtest is running; Carbon then falls back to the next auto-recovery file.
+playtest is running, so an explicit capture first ends the playtest. Only a
+playtest's server can call `StudioTestService:EndTest`, so the Carbon plugin in
+the play server of a served place waits on serve and ends its playtest when the
+edit Studio asks. The edit Studio quick-saves as soon as it is back in edit
+mode. If the playtest does not end within 15 seconds, Carbon falls back to the
+next auto-recovery file. The background auto-recovery capture never ends a
+playtest.
 
 `carbon capture game.carbon.json manually-saved.rbxl` is the explicit offline
 path. It validates and commits that existing binary place immediately without
