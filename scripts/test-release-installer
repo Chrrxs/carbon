@@ -53,6 +53,20 @@ if component_is_current carbon source-fingerprint "$target" "$runner"; then
 	die "component stamp accepted a modified installed target"
 fi
 
+# scripts/update-release defines no state directory of its own. Its plugin
+# stamp must not crash and must land where qualification later reads it.
+default_state="${root}/default-state"
+(
+	unset state_dir
+	export CARBON_QUALIFY_STATE_DIR="$default_state"
+	write_component_stamp carbon-plugin plugin-fingerprint "$runner"
+) || die "a component stamp without a caller-defined state directory failed"
+(
+	export CARBON_QUALIFY_STATE_DIR="$default_state"
+	state_dir="$(component_state_dir)"
+	component_is_current carbon-plugin plugin-fingerprint "$runner"
+) || die "qualification did not find the stamp written without a state directory"
+
 tree_artifact="${root}/qualified-tree"
 tree_target="${root}/state/tree/build"
 mkdir -p "${tree_artifact}/runtime"

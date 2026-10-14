@@ -49,11 +49,24 @@ fingerprint_tree() {
 	) | sha256sum | cut -d ' ' -f 1
 }
 
+# Directory of installed-component stamps. Qualification and
+# scripts/update-release must agree on it so either one can tell whether an
+# installed component is current.
+component_state_dir() {
+	printf '%s\n' "${CARBON_QUALIFY_STATE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/carbon-production-readiness}"
+}
+
+# Callers may set `state_dir` to override the shared default.
+component_stamp_dir() {
+	printf '%s\n' "${state_dir:-$(component_state_dir)}"
+}
+
 component_is_current() {
 	local name="$1"
 	local fingerprint="$2"
 	shift 2
-	local stamp="${state_dir}/${name}.stamp"
+	local stamp
+	stamp="$(component_stamp_dir)/${name}.stamp"
 	local -a stamp_values
 	[[ -f "$stamp" ]] || return 1
 	mapfile -t stamp_values < "$stamp"
@@ -72,9 +85,11 @@ write_component_stamp() {
 	local name="$1"
 	local fingerprint="$2"
 	shift 2
+	local directory
 	local temporary_stamp
-	mkdir -p "$state_dir"
-	temporary_stamp="$(mktemp "${state_dir}/${name}.XXXXXX")"
+	directory="$(component_stamp_dir)"
+	mkdir -p "$directory"
+	temporary_stamp="$(mktemp "${directory}/${name}.XXXXXX")"
 	{
 		printf '%s\n' "$fingerprint"
 		local file
@@ -82,7 +97,7 @@ write_component_stamp() {
 			sha256sum "$file" | cut -d ' ' -f 1
 		done
 	} > "$temporary_stamp"
-	mv -f "$temporary_stamp" "${state_dir}/${name}.stamp"
+	mv -f "$temporary_stamp" "${directory}/${name}.stamp"
 }
 
 component_status() {

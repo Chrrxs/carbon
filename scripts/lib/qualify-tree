@@ -180,7 +180,7 @@ fi
 [[ -n "$studio_exe" && -f "$studio_exe" ]] || die "RobloxStudioBeta.exe was not found; set ROBLOX_STUDIO_EXE"
 studio_dir="$(dirname "$studio_exe")"
 
-state_dir="${CARBON_QUALIFY_STATE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/carbon-production-readiness}"
+state_dir="$(component_state_dir)"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${CARBON_REPO}/target}"
 worktree_key="$(qualification_worktree_key "$CARBON_REPO")"
 carbon_component="carbon-${worktree_key}"
