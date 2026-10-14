@@ -356,7 +356,15 @@ git merge --continue
 ```
 
 Decisions can take the base, current, or incoming value, set a typed property
-value, or remove an eligible property or metadata value. Carbon validates and
+value, or remove an eligible property or metadata value.
+
+NaN values compare by their stored bits, so an unchanged NaN never conflicts.
+When both sides add a same-named child under the same parent, for example by
+regenerating it, Carbon reports a `siblings` conflict instead of keeping both
+copies. Taking `current` or `incoming` keeps that side's children and drops
+the other side's along with their descendants; a custom value lists the
+sibling identities to keep. Duplicate names that already existed in the base,
+or that only one side added, merge as before. Carbon validates and
 stages the result but leaves the final Git operation to the user.
 
 ## Embedded Studio component

@@ -382,3 +382,84 @@ fn git_driver_auto_merges_external_values_through_the_canonical_path() {
 	assert!(status.stdout.is_empty(), "{}", String::from_utf8_lossy(&status.stdout));
 	fs::remove_dir_all(repository).unwrap();
 }
+
+fn write_sectioned_artifact(path: &Path, root: Ref, model: Ref, section: Ref) {
+	let snapshot = Snapshot::new()
+		.with_id(root)
+		.with_name("Game")
+		.with_class("DataModel")
+		.with_children(vec![Snapshot::new()
+			.with_id(model)
+			.with_name("Model")
+			.with_class("Model")
+			.with_children(vec![Snapshot::new()
+				.with_id(section)
+				.with_name("Section")
+				.with_class("Folder")])]);
+	artifact_store::extract_snapshot(snapshot, "Game".to_owned(), path).unwrap();
+}
+
+#[test]
+fn git_driver_reports_and_resolves_same_named_children_replaced_on_both_sides() {
+	let repository = temporary_repository();
+	let carbon = Path::new(env!("CARGO_BIN_EXE_carbon"));
+	initialize_repository(&repository, carbon);
+	let artifact = repository.join("game.carbon.data/state.carbon");
+	let root = Ref::new();
+	let model = Ref::new();
+	let current_section = Ref::new();
+	let incoming_section = Ref::new();
+	write_sectioned_artifact(&artifact, root, model, Ref::new());
+	git(&repository, ["add", "-A"]);
+	git(&repository, ["commit", "-m", "base"]);
+
+	git(&repository, ["checkout", "-b", "incoming"]);
+	write_sectioned_artifact(&artifact, root, model, incoming_section);
+	git(&repository, ["add", "-A"]);
+	git(&repository, ["commit", "-m", "incoming regeneration"]);
+
+	git(&repository, ["checkout", "main"]);
+	write_sectioned_artifact(&artifact, root, model, current_section);
+	git(&repository, ["add", "-A"]);
+	git(&repository, ["commit", "-m", "current regeneration"]);
+
+	let merge = run(Path::new("git"), &repository, ["merge", "incoming"]);
+	assert!(!merge.status.success(), "merge kept both regenerated sections");
+	let discovery = run(carbon, &repository, ["conflicts", "--json"]);
+	assert!(
+		discovery.status.success(),
+		"{}",
+		String::from_utf8_lossy(&discovery.stderr)
+	);
+	let mut document: JsonValue = serde_json::from_slice(&discovery.stdout).unwrap();
+	let conflicts = document["conflicts"].as_array().unwrap();
+	assert_eq!(conflicts.len(), 1);
+	let details = &conflicts[0]["details"];
+	assert_eq!(details["identity"], model.to_string());
+	assert_eq!(details["field"], json!({"kind": "siblings", "name": "Section"}));
+	assert_eq!(details["context"]["current"]["path"], json!(["Model"]));
+	assert_eq!(details["current"]["value"][0]["identity"], current_section.to_string());
+	assert_eq!(
+		details["incoming"]["value"][0]["identity"],
+		incoming_section.to_string()
+	);
+	assert_eq!(details["allowed"], json!(["current", "incoming", "custom"]));
+	document["decisions"] = json!([{
+		"conflict": conflicts[0]["id"],
+		"action": "take",
+		"side": "current"
+	}]);
+	let plan = repository.join("resolution.json");
+	fs::write(&plan, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+	let resolved = run(carbon, &repository, ["resolve", "--plan", plan.to_str().unwrap()]);
+	assert!(
+		resolved.status.success(),
+		"stdout: {}\nstderr: {}",
+		String::from_utf8_lossy(&resolved.stdout),
+		String::from_utf8_lossy(&resolved.stderr)
+	);
+	let loaded = artifact_store::load_tree(&artifact).unwrap();
+	assert_eq!(loaded.tree.get_instance(model).unwrap().children(), [current_section]);
+	fs::remove_dir_all(repository).unwrap();
+}

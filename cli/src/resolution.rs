@@ -418,6 +418,23 @@ fn decode_f32(value: &str) -> anyhow::Result<f32> {
 	}
 }
 
+/// Equality for stored values: ordinary `==`, except that values carrying
+/// NaN (or other bit-significant floats) are equal when their bit-preserving
+/// MessagePack encodings match. `Variant`'s derived `==` treats every NaN as
+/// unequal to itself, so an unchanged NaN property would otherwise look edited.
+pub(crate) fn variant_bits_eq(left: &Variant, right: &Variant) -> bool {
+	if left == right {
+		return true;
+	}
+	if !variant_requires_bit_preserving_float(left) || !variant_requires_bit_preserving_float(right) {
+		return false;
+	}
+	match (rmp_serde::to_vec(left), rmp_serde::to_vec(right)) {
+		(Ok(left), Ok(right)) => left == right,
+		_ => false,
+	}
+}
+
 fn variant_requires_bit_preserving_float(value: &Variant) -> bool {
 	fn f32_requires_bits(value: f32) -> bool {
 		!value.is_finite() || (value == 0.0 && value.is_sign_negative())

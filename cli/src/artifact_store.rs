@@ -30,7 +30,7 @@ use crate::{
 	core::{changes::Changes, snapshot::Snapshot, tree::Tree},
 	ext::PathExt,
 	manifest_identity::{IdentityColumn, ManifestIdentityAllocator},
-	resolution::UnresolvedValue,
+	resolution::{variant_bits_eq, UnresolvedValue},
 	util,
 };
 
@@ -1739,7 +1739,7 @@ impl PartialEq for SemanticProperty {
 	fn eq(&self, other: &Self) -> bool {
 		match (&self.external, &other.external) {
 			(Some(left), Some(right)) => left == right,
-			(None, None) => self.value == other.value,
+			(None, None) => variant_bits_eq(&self.value, &other.value),
 			_ => false,
 		}
 	}
@@ -1762,6 +1762,20 @@ enum ConflictTarget {
 	Property(Ref, Ustr),
 	ArtifactName,
 	Metadata(String),
+	/// Same-named children of the conflict's identity (their parent) that the
+	/// merge itself would create: additions present only on current and only
+	/// on incoming.
+	Siblings {
+		current: Vec<Ref>,
+		incoming: Vec<Ref>,
+	},
+}
+
+#[derive(Clone, Debug)]
+struct SiblingCandidate {
+	id: Ref,
+	class: Ustr,
+	descendants: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1772,6 +1786,7 @@ enum MergeValue {
 	Class(Ustr),
 	Property(Option<SemanticProperty>),
 	Metadata(Option<String>),
+	Siblings(Vec<SiblingCandidate>),
 }
 
 #[derive(Clone, Debug)]
@@ -1844,16 +1859,28 @@ fn semantic_nodes(tree: &Tree, artifact: &Artifact) -> Result<HashMap<Ref, Seman
 }
 
 fn merge_value<T: Clone + PartialEq>(base: &T, current: &T, incoming: &T) -> (T, bool) {
-	if current == incoming {
+	merge_value_by(base, current, incoming, T::eq)
+}
+
+fn merge_value_by<T: Clone>(base: &T, current: &T, incoming: &T, eq: impl Fn(&T, &T) -> bool) -> (T, bool) {
+	if eq(current, incoming) {
 		return (current.clone(), false);
 	}
-	if current == base {
+	if eq(current, base) {
 		return (incoming.clone(), false);
 	}
-	if incoming == base {
+	if eq(incoming, base) {
 		return (current.clone(), false);
 	}
 	(current.clone(), true)
+}
+
+fn optional_variant_bits_eq(left: &Option<Variant>, right: &Option<Variant>) -> bool {
+	match (left, right) {
+		(Some(left), Some(right)) => variant_bits_eq(left, right),
+		(None, None) => true,
+		_ => false,
+	}
 }
 
 fn merge_attribute_property(
@@ -1891,7 +1918,8 @@ fn merge_attribute_property(
 		let base_value = base_attributes.get(key.as_str()).cloned();
 		let current_value = current_attributes.get(key.as_str()).cloned();
 		let incoming_value = incoming_attributes.get(key.as_str()).cloned();
-		let (value, conflicted) = merge_value(&base_value, &current_value, &incoming_value);
+		let (value, conflicted) =
+			merge_value_by(&base_value, &current_value, &incoming_value, optional_variant_bits_eq);
 		if conflicted {
 			return Some((current.clone(), true));
 		}
@@ -2086,6 +2114,12 @@ fn field_view(field: &str) -> MergeFieldView {
 			name: Some(name.to_owned()),
 		};
 	}
+	if let Some(name) = field.strip_prefix("siblings.") {
+		return MergeFieldView {
+			kind: "siblings".to_owned(),
+			name: Some(name.to_owned()),
+		};
+	}
 	if field == "artifact.name" {
 		return MergeFieldView {
 			kind: "artifactName".to_owned(),
@@ -2151,6 +2185,22 @@ fn value_view(
 			state: "value".to_owned(),
 			value: Some(JsonValue::String(value.clone())),
 		},
+		MergeValue::Siblings(candidates) if candidates.is_empty() => absent(),
+		MergeValue::Siblings(candidates) => MergeValueView {
+			state: "present".to_owned(),
+			value: Some(JsonValue::Array(
+				candidates
+					.iter()
+					.map(|candidate| {
+						json!({
+							"identity": candidate.id.to_string(),
+							"class": candidate.class.as_str(),
+							"descendants": candidate.descendants,
+						})
+					})
+					.collect(),
+			)),
+		},
 	})
 }
 
@@ -2170,6 +2220,9 @@ impl ArtifactConflict {
 			ConflictTarget::Class(_) | ConflictTarget::Name(_) => 2,
 			ConflictTarget::ArtifactName | ConflictTarget::Metadata(_) => 3,
 			ConflictTarget::Property(_, _) => 4,
+			// Dropping a losing side's subtree runs last so decisions about
+			// fields inside that subtree never target an already removed node.
+			ConflictTarget::Siblings { .. } => 5,
 		}
 	}
 }
@@ -2197,7 +2250,10 @@ impl ArtifactMergePlan {
 					incoming: subject_view(conflict.identity, &self.incoming_nodes, self.root),
 				};
 				let field = field_view(&conflict.field);
-				let mut allowed = vec!["base".to_owned(), "current".to_owned(), "incoming".to_owned()];
+				let mut allowed = match conflict.target {
+					ConflictTarget::Siblings { .. } => vec!["current".to_owned(), "incoming".to_owned()],
+					_ => vec!["base".to_owned(), "current".to_owned(), "incoming".to_owned()],
+				};
 				if !matches!(conflict.target, ConflictTarget::Node(_)) {
 					allowed.push("custom".to_owned());
 				}
@@ -2261,9 +2317,33 @@ impl ArtifactMergePlan {
 					self.metadata.remove(key);
 				}
 			}
+			(ConflictTarget::Siblings { current, incoming, .. }, MergeValue::Siblings(kept)) => {
+				let kept = kept.iter().map(|candidate| candidate.id).collect::<HashSet<_>>();
+				let dropped = current
+					.iter()
+					.chain(incoming)
+					.copied()
+					.filter(|id| !kept.contains(id))
+					.collect::<Vec<_>>();
+				self.remove_merged_subtrees(&dropped);
+			}
 			_ => bail!("resolution value does not match its semantic field"),
 		}
 		Ok(())
+	}
+
+	/// Remove each root and every merged descendant currently beneath it.
+	fn remove_merged_subtrees(&mut self, roots: &[Ref]) {
+		let mut children = HashMap::<Ref, Vec<Ref>>::new();
+		for (id, node) in &self.merged {
+			children.entry(node.parent).or_default().push(*id);
+		}
+		let mut pending = roots.to_vec();
+		while let Some(id) = pending.pop() {
+			if self.merged.remove(&id).is_some() {
+				pending.extend(children.get(&id).into_iter().flatten().copied());
+			}
+		}
 	}
 
 	fn restore_implicit_ancestors(&mut self, node: &SemanticNode, side: ResolutionSide) -> Result<()> {
@@ -2300,6 +2380,9 @@ impl ArtifactMergePlan {
 			.get(index)
 			.context("merge conflict index is out of range")?
 			.clone();
+		if matches!(conflict.target, ConflictTarget::Siblings { .. }) && side == ResolutionSide::Base {
+			bail!("sibling collisions must keep current, incoming, or a custom list of identities");
+		}
 		if let MergeValue::Node(Some(node)) = conflict.side(side) {
 			self.restore_implicit_ancestors(node, side)?;
 		}
@@ -2334,6 +2417,33 @@ impl ArtifactMergePlan {
 				let unresolved: UnresolvedValue = serde_json::from_value(value)?;
 				let value = unresolved.resolve(class.as_str(), name.as_str())?;
 				MergeValue::Property(Some(SemanticProperty { value, external: None }))
+			}
+			ConflictTarget::Siblings { .. } => {
+				let candidates = match (&conflict.current, &conflict.incoming) {
+					(MergeValue::Siblings(current), MergeValue::Siblings(incoming)) => {
+						current.iter().chain(incoming).cloned().collect::<Vec<_>>()
+					}
+					_ => bail!("sibling collision lost its candidates"),
+				};
+				let identities = value
+					.as_array()
+					.context("custom sibling resolution must be an array of identities to keep")?;
+				let mut kept = Vec::new();
+				for identity in identities {
+					let identity: Ref = identity
+						.as_str()
+						.context("custom sibling identity must be a string")?
+						.parse()
+						.context("custom sibling identity is not a manifest identity")?;
+					let candidate = candidates
+						.iter()
+						.find(|candidate| candidate.id == identity)
+						.with_context(|| format!("{identity} is not one of this collision's sibling identities"))?;
+					if !kept.iter().any(|kept: &SiblingCandidate| kept.id == identity) {
+						kept.push(candidate.clone());
+					}
+				}
+				MergeValue::Siblings(kept)
 			}
 			ConflictTarget::Node(_) => bail!("add/delete conflicts must select base, current, or incoming"),
 		};
@@ -2399,6 +2509,99 @@ impl ArtifactMergePlan {
 			instances: report.instances,
 			properties: report.properties,
 		})
+	}
+}
+
+fn children_index(nodes: &HashMap<Ref, SemanticNode>) -> HashMap<Ref, Vec<Ref>> {
+	let mut children = HashMap::<Ref, Vec<Ref>>::new();
+	for (id, node) in nodes {
+		children.entry(node.parent).or_default().push(*id);
+	}
+	children
+}
+
+fn sibling_candidate(
+	id: Ref,
+	nodes: &HashMap<Ref, SemanticNode>,
+	children: &HashMap<Ref, Vec<Ref>>,
+) -> SiblingCandidate {
+	let mut descendants = 0;
+	let mut pending = children.get(&id).cloned().unwrap_or_default();
+	while let Some(child) = pending.pop() {
+		descendants += 1;
+		pending.extend(children.get(&child).into_iter().flatten().copied());
+	}
+	SiblingCandidate {
+		id,
+		class: nodes[&id].class,
+		descendants,
+	}
+}
+
+/// Identity-based merging keeps an addition made on only one side. When both
+/// sides independently add a same-named child under one parent, typically by
+/// regenerating or replacing it, the merged parent would hold both copies and
+/// match neither side. Report each such collision; pre-existing duplicates and
+/// one-sided additions still merge as before.
+fn push_sibling_collisions(
+	base_nodes: &HashMap<Ref, SemanticNode>,
+	current_nodes: &HashMap<Ref, SemanticNode>,
+	incoming_nodes: &HashMap<Ref, SemanticNode>,
+	merged: &HashMap<Ref, SemanticNode>,
+	conflicts: &mut Vec<ArtifactConflict>,
+) {
+	let mut groups = BTreeMap::<(String, String), (Ref, Vec<Ref>, Vec<Ref>)>::new();
+	for (id, node) in merged {
+		if base_nodes.contains_key(id) {
+			continue;
+		}
+		let side = match (current_nodes.contains_key(id), incoming_nodes.contains_key(id)) {
+			(true, false) => ResolutionSide::Current,
+			(false, true) => ResolutionSide::Incoming,
+			_ => continue,
+		};
+		let group = groups
+			.entry((node.parent.to_string(), node.name.clone()))
+			.or_insert_with(|| (node.parent, Vec::new(), Vec::new()));
+		match side {
+			ResolutionSide::Current => group.1.push(*id),
+			_ => group.2.push(*id),
+		}
+	}
+	let base_children = children_index(base_nodes);
+	let current_children = children_index(current_nodes);
+	let incoming_children = children_index(incoming_nodes);
+	for ((_, name), (parent, mut current, mut incoming)) in groups {
+		if current.is_empty() || incoming.is_empty() {
+			continue;
+		}
+		current.sort_unstable_by_key(ToString::to_string);
+		incoming.sort_unstable_by_key(ToString::to_string);
+		let mut base = base_children
+			.get(&parent)
+			.into_iter()
+			.flatten()
+			.copied()
+			.filter(|id| base_nodes[id].name == name)
+			.collect::<Vec<_>>();
+		base.sort_unstable_by_key(ToString::to_string);
+		let candidates = |ids: &[Ref], nodes, children| {
+			ids.iter()
+				.map(|id| sibling_candidate(*id, nodes, children))
+				.collect::<Vec<_>>()
+		};
+		push_conflict(
+			conflicts,
+			parent,
+			format!("siblings.{name}"),
+			ConflictTarget::Siblings {
+				current: current.clone(),
+				incoming: incoming.clone(),
+			},
+			MergeValue::Siblings(candidates(&base, base_nodes, &base_children)),
+			MergeValue::Siblings(candidates(&current, current_nodes, &current_children)),
+			MergeValue::Siblings(candidates(&incoming, incoming_nodes, &incoming_children)),
+		);
 	}
 }
 
@@ -2524,6 +2727,7 @@ fn plan_artifact_merge_impl(
 			merged.insert(id, node);
 		}
 	}
+	push_sibling_collisions(&base_nodes, &current_nodes, &incoming_nodes, &merged, &mut conflicts);
 	let (name, name_conflict) = merge_value(
 		&base_artifact.sideband.name,
 		&current_artifact.sideband.name,
@@ -4597,6 +4801,259 @@ mod tests {
 			merged.tree.get_instance(constraint).unwrap().properties[&Ustr::from("Transform")],
 			Variant::CFrame(canonical)
 		);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	fn mesh_part(id: Ref, properties: UstrMap<Variant>) -> Snapshot {
+		Snapshot::new()
+			.with_id(id)
+			.with_name("Mesh")
+			.with_class("MeshPart")
+			.with_properties(properties)
+	}
+
+	fn nan_physics(volume: f32) -> UstrMap<Variant> {
+		use rbx_dom_weak::types::Vector3;
+
+		UstrMap::from_iter([
+			(
+				Ustr::from("UnscaledCofm"),
+				Variant::Vector3(Vector3::new(f32::NAN, f32::NAN, f32::NAN)),
+			),
+			(Ustr::from("UnscaledVolume"), Variant::Float32(volume)),
+			(
+				Ustr::from("Attributes"),
+				Variant::Attributes(Attributes::new().with("Cached", Variant::Float64(f64::NAN))),
+			),
+		])
+	}
+
+	fn game(root: Ref, children: Vec<Snapshot>) -> Snapshot {
+		Snapshot::new()
+			.with_id(root)
+			.with_name("Game")
+			.with_class("DataModel")
+			.with_children(children)
+	}
+
+	#[test]
+	fn merge_regression_identical_nan_values_never_conflict() {
+		let directory = temp("merge-identical-nan");
+		let root = Ref::new();
+		let part = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		for path in [&base, &current, &incoming] {
+			write(path, game(root, vec![mesh_part(part, nan_physics(f32::NAN))]));
+		}
+		let loaded = load_tree(&base).unwrap();
+		let stored = &loaded.tree.get_instance(part).unwrap().properties;
+		assert!(
+			matches!(stored.get(&Ustr::from("UnscaledVolume")), Some(Variant::Float32(value)) if value.is_nan()),
+			"fixture lost its NaN property: {stored:?}"
+		);
+
+		let outcome = merge_artifacts(&base, &current, &incoming).unwrap();
+		assert!(matches!(outcome, MergeOutcome::Merged(_)), "{outcome:?}");
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn merge_regression_nan_edits_merge_by_bits() {
+		let directory = temp("merge-nan-edits");
+		let root = Ref::new();
+		let part = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let volume = |value| {
+			game(
+				root,
+				vec![mesh_part(
+					part,
+					UstrMap::from_iter([(Ustr::from("UnscaledVolume"), Variant::Float32(value))]),
+				)],
+			)
+		};
+
+		write(&base, volume(0.0));
+		write(&current, volume(f32::NAN));
+		write(&incoming, volume(0.0));
+		let outcome = merge_artifacts(&base, &current, &incoming).unwrap();
+		assert!(matches!(outcome, MergeOutcome::Merged(_)), "{outcome:?}");
+		let merged = load_tree(&current).unwrap();
+		assert!(matches!(
+			merged.tree.get_instance(part).unwrap().properties[&Ustr::from("UnscaledVolume")],
+			Variant::Float32(value) if value.is_nan()
+		));
+
+		write(&base, volume(0.0));
+		write(&current, volume(f32::NAN));
+		write(&incoming, volume(1.0));
+		let MergeOutcome::Conflicted(conflicts) = merge_artifacts(&base, &current, &incoming).unwrap() else {
+			panic!("divergent NaN edit unexpectedly merged");
+		};
+		assert_eq!(conflicts.len(), 1);
+		assert_eq!(conflicts[0].field, "property.UnscaledVolume");
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn merge_regression_identical_nan_additions_never_conflict() {
+		let directory = temp("merge-nan-addition");
+		let root = Ref::new();
+		let part = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		write(&base, game(root, Vec::new()));
+		write(&current, game(root, vec![mesh_part(part, nan_physics(f32::NAN))]));
+		write(&incoming, game(root, vec![mesh_part(part, nan_physics(f32::NAN))]));
+
+		let outcome = merge_artifacts(&base, &current, &incoming).unwrap();
+		assert!(matches!(outcome, MergeOutcome::Merged(_)), "{outcome:?}");
+		assert!(load_tree(&current).unwrap().tree.exists(part));
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	fn folder(id: Ref, name: &str, children: Vec<Snapshot>) -> Snapshot {
+		Snapshot::new()
+			.with_id(id)
+			.with_name(name)
+			.with_class("Folder")
+			.with_children(children)
+	}
+
+	fn children_named(tree: &Tree, parent: Ref, name: &str) -> Vec<Ref> {
+		let mut children = tree
+			.get_instance(parent)
+			.unwrap()
+			.children()
+			.iter()
+			.copied()
+			.filter(|child| tree.get_instance(*child).unwrap().name == name)
+			.collect::<Vec<_>>();
+		children.sort_unstable_by_key(ToString::to_string);
+		children
+	}
+
+	#[test]
+	fn merge_regression_replacing_a_child_on_both_sides_is_a_sibling_conflict() {
+		let directory = temp("merge-sibling-replace");
+		let root = Ref::new();
+		let model = Ref::new();
+		let base_section = Ref::new();
+		let current_section = Ref::new();
+		let current_detail = Ref::new();
+		let incoming_section = Ref::new();
+		let incoming_detail = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let resolved_current = directory.join("resolved-current.carbon");
+		let resolved_incoming = directory.join("resolved-incoming.carbon");
+		let place = |section, detail: Option<Ref>| {
+			let children = detail
+				.map(|detail| vec![folder(detail, "Detail", Vec::new())])
+				.unwrap_or_default();
+			game(
+				root,
+				vec![folder(model, "Model", vec![folder(section, "Section", children)])],
+			)
+		};
+		write(&base, place(base_section, None));
+		write(&current, place(current_section, Some(current_detail)));
+		write(&incoming, place(incoming_section, Some(incoming_detail)));
+
+		let MergeOutcome::Conflicted(conflicts) = merge_artifacts(&base, &current, &incoming).unwrap() else {
+			panic!("both-sides replacement silently kept two same-named siblings");
+		};
+		assert_eq!(conflicts.len(), 1);
+		assert_eq!(conflicts[0].identity, model.to_string());
+		assert_eq!(conflicts[0].field, "siblings.Section");
+
+		let mut plan = plan_artifact_merge(&base, &base, &current, &current, &incoming, &incoming).unwrap();
+		let planned = plan.conflicts().unwrap();
+		assert_eq!(planned.len(), 1);
+		assert_eq!(planned[0].field.kind, "siblings");
+		assert_eq!(planned[0].field.name.as_deref(), Some("Section"));
+		assert_eq!(planned[0].allowed, ["current", "incoming", "custom"]);
+		assert!(plan.take(0, ResolutionSide::Base).is_err());
+		plan.take(0, ResolutionSide::Current).unwrap();
+		plan.finish(&resolved_current).unwrap();
+		let tree = load_tree(&resolved_current).unwrap().tree;
+		assert_eq!(children_named(&tree, model, "Section"), [current_section]);
+		assert!(tree.exists(current_detail));
+		assert!(!tree.exists(incoming_detail));
+		assert!(!tree.exists(base_section));
+
+		let mut plan = plan_artifact_merge(&base, &base, &current, &current, &incoming, &incoming).unwrap();
+		plan.take(0, ResolutionSide::Incoming).unwrap();
+		plan.finish(&resolved_incoming).unwrap();
+		let tree = load_tree(&resolved_incoming).unwrap().tree;
+		assert_eq!(children_named(&tree, model, "Section"), [incoming_section]);
+		assert!(tree.exists(incoming_detail));
+		assert!(!tree.exists(current_detail));
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn merge_regression_adding_a_same_named_child_on_both_sides_is_a_sibling_conflict() {
+		let directory = temp("merge-sibling-add");
+		let root = Ref::new();
+		let parent = Ref::new();
+		let current_child = Ref::new();
+		let incoming_child = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let resolved = directory.join("resolved.carbon");
+		let place = |children| game(root, vec![folder(parent, "P", children)]);
+		write(&base, place(Vec::new()));
+		write(&current, place(vec![folder(current_child, "B", Vec::new())]));
+		write(&incoming, place(vec![folder(incoming_child, "B", Vec::new())]));
+
+		let mut plan = plan_artifact_merge(&base, &base, &current, &current, &incoming, &incoming).unwrap();
+		assert_eq!(plan.conflict_count(), 1);
+		assert!(plan.set(0, json!([Ref::new().to_string()])).is_err());
+		plan.set(0, json!([current_child.to_string(), incoming_child.to_string()]))
+			.unwrap();
+		plan.finish(&resolved).unwrap();
+		let tree = load_tree(&resolved).unwrap().tree;
+		let mut expected = vec![current_child, incoming_child];
+		expected.sort_unstable_by_key(ToString::to_string);
+		assert_eq!(children_named(&tree, parent, "B"), expected);
+		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn merge_regression_one_sided_and_preexisting_duplicate_siblings_still_merge() {
+		let directory = temp("merge-sibling-benign");
+		let root = Ref::new();
+		let parent = Ref::new();
+		let first_c = Ref::new();
+		let second_c = Ref::new();
+		let added = Ref::new();
+		let base = directory.join("base.carbon");
+		let current = directory.join("current.carbon");
+		let incoming = directory.join("incoming.carbon");
+		let place = |extra: Vec<Snapshot>| {
+			let mut children = vec![folder(first_c, "C", Vec::new()), folder(second_c, "C", Vec::new())];
+			children.extend(extra);
+			game(root, vec![folder(parent, "P", children)])
+		};
+		write(&base, place(Vec::new()));
+		write(&current, place(vec![folder(added, "B", Vec::new())]));
+		write(&incoming, place(Vec::new()));
+
+		let outcome = merge_artifacts(&base, &current, &incoming).unwrap();
+		assert!(matches!(outcome, MergeOutcome::Merged(_)), "{outcome:?}");
+		let tree = load_tree(&current).unwrap().tree;
+		assert_eq!(children_named(&tree, parent, "B"), [added]);
+		let mut duplicates = vec![first_c, second_c];
+		duplicates.sort_unstable_by_key(ToString::to_string);
+		assert_eq!(children_named(&tree, parent, "C"), duplicates);
 		fs::remove_dir_all(directory).unwrap();
 	}
 
