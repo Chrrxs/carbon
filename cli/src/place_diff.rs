@@ -1357,6 +1357,16 @@ fn engine_serialization_equivalent(
 	left_properties: &UstrMap<Variant>,
 	right_properties: &UstrMap<Variant>,
 ) -> bool {
+	// Studio saves engine-only properties that reflection has no default for,
+	// such as SerializedOverrides, on every instance. Absent and the
+	// serializer's type default load as the same value.
+	if !absence_changes_engine_load(node.class.as_str(), property) {
+		if let (Some(value), None) | (None, Some(value)) = (left_value, right_value) {
+			if rbx_binary::fallback_default_value(value.ty()) == Some(value) {
+				return true;
+			}
+		}
+	}
 	if matches!(node.class.as_str(), "Script" | "LocalScript" | "ModuleScript") && property == "ScriptGuid" {
 		return true;
 	}
@@ -1644,6 +1654,30 @@ mod tests {
 		assert_eq!(report.blocking_differences, 0);
 		assert_eq!(report.non_gameplay_differences, 0);
 		let _ = fs::remove_file(path);
+	}
+
+	#[test]
+	fn studio_serialized_override_padding_is_non_gameplay() {
+		let place = |overrides: Option<&[u8]>| {
+			let mut folder = InstanceBuilder::new("Folder").with_name("Same");
+			if let Some(overrides) = overrides {
+				folder = folder.with_property("SerializedOverrides", BinaryString::from(overrides.to_vec()));
+			}
+			InstanceBuilder::new("DataModel").with_child(folder)
+		};
+		let absent = write_fixture("overrides-absent", place(None));
+		let padded = write_fixture("overrides-padded", place(Some(b"")));
+		let authored = write_fixture("overrides-authored", place(Some(b"authored")));
+
+		let report = compare(&absent, &padded, 100).unwrap();
+		assert_eq!(report.blocking_differences, 0);
+		assert_eq!(report.non_gameplay_differences, 1);
+
+		let report = compare(&absent, &authored, 100).unwrap();
+		assert_eq!(report.blocking_differences, 1);
+		for path in [absent, padded, authored] {
+			let _ = fs::remove_file(path);
+		}
 	}
 
 	#[test]

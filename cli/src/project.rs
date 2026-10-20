@@ -4700,6 +4700,7 @@ pub(crate) fn decode_captured_place(
 	);
 	let studio_change_generation = normalize_recovery_identities(&mut snapshot, expected, canonical.id)?;
 	sanitize_recovery_runtime_state(&mut snapshot, canonical);
+	retain_canonical_absence_of_serializer_defaults(&mut snapshot, canonical);
 	restore_recovery_mapped_roots(&mut snapshot, canonical, mapped_roots)?;
 	validate_unique_snapshot_ids(&snapshot)?;
 	validate_snapshot_references(&snapshot)?;
@@ -4733,10 +4734,38 @@ fn decode_project_captured_place(
 	);
 	let _ = normalize_recovery_identities_for_scope(&mut snapshot, project_name, None, canonical.id)?;
 	sanitize_recovery_runtime_state(&mut snapshot, canonical);
+	retain_canonical_absence_of_serializer_defaults(&mut snapshot, canonical);
 	restore_recovery_mapped_roots(&mut snapshot, canonical, mapped_roots)?;
 	validate_unique_snapshot_ids(&snapshot)?;
 	validate_snapshot_references(&snapshot)?;
 	Ok(Tree::new(snapshot))
+}
+
+/// Studio saves engine-only properties that reflection has no default for,
+/// such as SerializedOverrides, on every instance it writes. Where the
+/// canonical instance omits such a property and Studio saved only the
+/// serializer's type default, both describe the same place: a build omits the
+/// property or pads it with that same default. Keeping the canonical absence
+/// stops every capture from rewriting each instance in the artifact. A value
+/// other than the type default, a property the canonical instance already
+/// has, and instances new to the place are captured as Studio saved them.
+fn retain_canonical_absence_of_serializer_defaults(snapshot: &mut Snapshot, canonical: &Snapshot) {
+	fn visit(snapshot: &mut Snapshot, canonical: &HashMap<Ref, FlatNode<'_>>) {
+		if let Some(node) = canonical.get(&snapshot.id) {
+			if node.snapshot.class == snapshot.class {
+				let class = snapshot.class;
+				snapshot.properties.retain(|name, value| {
+					node.snapshot.properties.contains_key(name)
+						|| reflection_default(class.as_str(), name.as_str()).is_some()
+						|| rbx_binary::fallback_default_value(value.ty()) != Some(&*value)
+				});
+			}
+		}
+		for child in &mut snapshot.children {
+			visit(child, canonical);
+		}
+	}
+	visit(snapshot, &flatten_snapshot(canonical));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4944,6 +4973,91 @@ mod recovery_capture_tests {
 		assert_eq!(
 			fs::read_to_string(root.join("src/ServerScriptService/Server.server.luau")).unwrap(),
 			"-- Server entry point.\n"
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn capture_keeps_canonical_absence_of_studio_serialized_override_padding() {
+		let root = std::env::temp_dir().join(format!("carbon-serialized-overrides-{}", Uuid::new_v4()));
+		fs::create_dir_all(&root).unwrap();
+		let project_path = root.join("game.carbon.json");
+		let saved_place = root.join("saved.rbxl");
+		let rebuilt_place = root.join("rebuilt.rbxl");
+		initialize(&project_path, "SerializedOverrides".to_owned()).unwrap();
+		let contract = artifact_store::WorktreeContract {
+			endpoint: "http://127.0.0.1:8000".to_owned(),
+			project: "SerializedOverrides".to_owned(),
+			worktree_id: "offline-worktree".to_owned(),
+			session_token: "offline-session".to_owned(),
+			identity_exclusions: HashSet::new(),
+		};
+		compile(&project_path, &saved_place, Some(&contract)).unwrap();
+
+		// Studio's save writes an empty SerializedOverrides on every instance,
+		// including the ones the artifact built without it.
+		let overrides = Ustr::from("SerializedOverrides");
+		let mut place = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&saved_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let mut pending = vec![place.root_ref()];
+		while let Some(referent) = pending.pop() {
+			let instance = place.get_by_ref_mut(referent).unwrap();
+			let value = match instance.class.as_str() {
+				"ReplicatedStorage" => b"authored".to_vec(),
+				_ => Vec::new(),
+			};
+			if instance.class.as_str() == "Workspace" {
+				instance
+					.properties
+					.insert(Ustr::from("Gravity"), Variant::Float32(123.0));
+			}
+			instance
+				.properties
+				.insert(overrides, Variant::BinaryString(value.into()));
+			pending.extend(instance.children().iter().copied());
+		}
+		let roots = place.root().children().to_vec();
+		rbx_binary::to_writer_with_database(
+			File::create(&saved_place).unwrap(),
+			&place,
+			&roots,
+			util::get_reflection_database(),
+		)
+		.unwrap();
+
+		capture_saved_place(&project_path, &saved_place, &|| false).unwrap();
+		compile(&project_path, &rebuilt_place, None).unwrap();
+		let rebuilt = rbx_binary::from_reader_with_database(
+			BufReader::new(File::open(&rebuilt_place).unwrap()),
+			util::get_reflection_database(),
+		)
+		.unwrap();
+		let service = |class: &str| {
+			rebuilt
+				.root()
+				.children()
+				.iter()
+				.filter_map(|child| rebuilt.get_by_ref(*child))
+				.find(|instance| instance.class.as_str() == class)
+				.unwrap()
+		};
+		let workspace = service("Workspace");
+		assert_eq!(
+			workspace.properties.get(&Ustr::from("Gravity")),
+			Some(&Variant::Float32(123.0))
+		);
+		assert_eq!(
+			workspace.properties.get(&overrides),
+			None,
+			"Studio's empty SerializedOverrides replaced the canonical absence"
+		);
+		assert_eq!(
+			service("ReplicatedStorage").properties.get(&overrides),
+			Some(&Variant::BinaryString(b"authored".to_vec().into())),
+			"a non-default SerializedOverrides must be captured"
 		);
 		fs::remove_dir_all(root).unwrap();
 	}
