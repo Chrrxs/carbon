@@ -10,8 +10,9 @@ pub(super) fn resolve(
 ) -> Result<(sessions::Session, String)> {
 	match (instance_id, port, worktree) {
 		(Some(instance_id), None, None) => {
-			let session = sessions::get(Some(instance_id.clone()), None, None)?
-				.with_context(|| format!("no running Carbon serve instance has ID {instance_id}"))?;
+			let Some(session) = sessions::get(Some(instance_id.clone()), None, None)? else {
+				anyhow::bail!(missing_instance_message(&instance_id));
+			};
 			Ok((session, format!("instance ID {instance_id}")))
 		}
 		(None, Some(port), None) => {
@@ -32,6 +33,16 @@ pub(super) fn resolve(
 	}
 }
 
+/// A bare number is more likely a port than an instance ID; say so.
+fn missing_instance_message(instance_id: &str) -> String {
+	match instance_id.parse::<u16>() {
+		Ok(port) => format!(
+			"no running Carbon serve instance has ID {instance_id}; to select the serve session on port {port}, pass `--port {port}`"
+		),
+		Err(_) => format!("no running Carbon serve instance has ID {instance_id}"),
+	}
+}
+
 pub(super) fn process_identity(
 	session: &sessions::Session,
 	description: &str,
@@ -48,4 +59,16 @@ pub(super) fn process_identity(
 			.creation_filetime
 			.with_context(|| format!("{description} does not record the Studio process creation time"))?,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn numeric_instance_ids_suggest_the_port_flag() {
+		assert!(missing_instance_message("8002").contains("pass `--port 8002`"));
+		assert!(!missing_instance_message("anon:studio-a").contains("--port"));
+		assert!(!missing_instance_message("99999").contains("--port"));
+	}
 }

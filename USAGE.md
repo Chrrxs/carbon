@@ -113,7 +113,9 @@ repository back to the parking desktop each session recorded at launch. Run
 `carbon focus` from the desktop where you want to work; that desktop does not
 need a configured name. Routing is serialized so concurrent focus commands do
 not interleave. Moving the selected Studio is strict, while a stale sibling is
-reported as a warning and does not block focus.
+reported as a warning and does not block focus. The warning names the sibling's
+serve session by port and worktree; when its Studio has exited, stop that
+session with `carbon stop --port <port>` from its worktree.
 
 `carbon park` moves only the selected exact managed Studio back to the
 `studio_desktop` recorded when its serve session started. It does not activate

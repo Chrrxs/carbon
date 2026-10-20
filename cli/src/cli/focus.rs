@@ -9,7 +9,7 @@ use super::studio_session;
 #[derive(Debug, PartialEq, Eq)]
 struct DesktopRoutingPlan {
 	target: studio::StudioProcessIdentity,
-	peers: Vec<studio::StudioDesktopPlacement>,
+	peers: Vec<studio_desktop::FocusPeer>,
 	warnings: Vec<String>,
 }
 
@@ -21,6 +21,16 @@ fn session_description(session: &sessions::Session) -> String {
 		return format!("serve session on port {port}");
 	}
 	format!("serve process PID {}", session.pid)
+}
+
+/// Names a sibling session by everything `carbon stop` can target it with.
+fn peer_label(session: &sessions::Session) -> String {
+	match (session.port, &session.worktree) {
+		(Some(port), Some(worktree)) => format!("the serve session on port {port} (worktree {})", worktree.display()),
+		(Some(port), None) => format!("the serve session on port {port}"),
+		(None, Some(worktree)) => format!("the serve session for worktree {}", worktree.display()),
+		(None, None) => format!("the serve session with process PID {}", session.pid),
+	}
 }
 
 fn desktop_routing_plan(
@@ -47,9 +57,9 @@ fn desktop_routing_plan(
 			.map(str::to_owned);
 		let identity = studio_session::process_identity(&peer, &description);
 		match (identity, desktop_name) {
-			(Ok(process), Some(desktop_name)) => placements.push(studio::StudioDesktopPlacement {
-				process,
-				desktop_name,
+			(Ok(process), Some(desktop_name)) => placements.push(studio_desktop::FocusPeer {
+				label: peer_label(&peer),
+				placement: studio::StudioDesktopPlacement { process, desktop_name },
 			}),
 			(Err(error), _) => warnings.push(format!("Did not park sibling Studio for {description}: {error:#}")),
 			(Ok(_), None) => warnings.push(format!(
@@ -197,8 +207,12 @@ mod tests {
 
 		assert_eq!(plan.target.process_id, 101);
 		assert_eq!(plan.peers.len(), 1);
-		assert_eq!(plan.peers[0].process.process_id, 102);
-		assert_eq!(plan.peers[0].desktop_name, "Feature Studios");
+		assert_eq!(plan.peers[0].placement.process.process_id, 102);
+		assert_eq!(plan.peers[0].placement.desktop_name, "Feature Studios");
+		assert_eq!(
+			plan.peers[0].label,
+			"the serve session on port 8102 (worktree /tmp/game-feature)"
+		);
 		assert_eq!(plan.warnings.len(), 1);
 		assert!(plan.warnings[0].contains("game-legacy"));
 	}

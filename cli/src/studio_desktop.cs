@@ -165,6 +165,7 @@ namespace CarbonStudioDesktop
 	{
 		internal Identity Process;
 		internal string DesktopName;
+		internal string Label;
 	}
 
 	internal sealed class Plan
@@ -215,6 +216,7 @@ namespace CarbonStudioDesktop
 						Placement placement = new Placement();
 						placement.Process = ParseIdentity(fields, 1);
 						placement.DesktopName = Decode(fields[4]);
+						placement.Label = fields.Length > 5 ? Decode(fields[5]) : "Studio PID " + placement.Process.ProcessId;
 						plan.Peers.Add(placement);
 						break;
 					case "audio-guard": plan.AudioGuard = Decode(fields[1]); break;
@@ -922,6 +924,14 @@ namespace CarbonStudioDesktop
 						warnings.Add("Studio PID " + peer.Process.ProcessId + " was not parked because it is also the focus target");
 						continue;
 					}
+					// A sibling session whose Studio exited or was replaced cannot
+					// be muted or parked, and must not block focusing the target.
+					string unavailable = Studio.Validate(peer.Process);
+					if (unavailable != null)
+					{
+						warnings.Add(SkippedPeer(peer, unavailable));
+						continue;
+					}
 					try
 					{
 						GuardReport guard = Guards.Apply(plan, peer.Process, true);
@@ -931,8 +941,14 @@ namespace CarbonStudioDesktop
 					}
 					catch (Exception error)
 					{
+						unavailable = Studio.Validate(peer.Process);
+						if (unavailable != null)
+						{
+							warnings.Add(SkippedPeer(peer, unavailable));
+							continue;
+						}
 						throw new InvalidOperationException(
-							"failed to mute sibling Studio PID " + peer.Process.ProcessId +
+							"failed to mute sibling Studio PID " + peer.Process.ProcessId + " for " + peer.Label +
 							"; already guarded Studios remain parked: " + error.Message, error);
 					}
 					guardedPeers.Add(peer);
@@ -985,7 +1001,7 @@ namespace CarbonStudioDesktop
 					}
 					catch (Exception error)
 					{
-						warnings.Add("Studio PID " + peer.Process.ProcessId + " was not parked on desktop '" + peer.DesktopName + "': " + error.Message);
+						warnings.Add("Studio PID " + peer.Process.ProcessId + " for " + peer.Label + " was not parked on desktop '" + peer.DesktopName + "': " + error.Message);
 					}
 				}
 
@@ -1043,6 +1059,12 @@ namespace CarbonStudioDesktop
 				.Number("peer_guarded_threads", peerThreads)
 				.Strings("warnings", warnings)
 				.ToString();
+		}
+
+		private static string SkippedPeer(Placement peer, string reason)
+		{
+			return "Did not park sibling Studio PID " + peer.Process.ProcessId + " for " + peer.Label + ": " + reason +
+				"; stop that Carbon serve session if its Studio has exited";
 		}
 
 		private static string Park(Plan plan)

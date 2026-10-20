@@ -39,13 +39,22 @@ pub(crate) struct ParkReport {
 	pub(crate) guarded_threads: usize,
 }
 
+/// A sibling Studio to park, with the serve session it belongs to so a
+/// skipped or failed sibling is named in warnings and errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FocusPeer {
+	pub(crate) placement: StudioDesktopPlacement,
+	pub(crate) label: String,
+}
+
 /// What `carbon focus` should do besides activating the target Studio.
 pub(crate) enum FocusRouting<'a> {
 	/// Activate the Studio where it is.
 	None,
 	/// Bring the parked Studio to the active desktop with its audio and
-	/// activation restored, and park these sibling Studios.
-	Desktops { peers: &'a [StudioDesktopPlacement] },
+	/// activation restored, and park these sibling Studios. Siblings whose
+	/// Studio is no longer running are skipped with a warning.
+	Desktops { peers: &'a [FocusPeer] },
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -109,9 +118,10 @@ fn focus_plan(
 	if let FocusRouting::Desktops { peers } = routing {
 		for peer in peers.iter() {
 			extra.push(format!(
-				"peer {} {}",
-				identity_fields(&peer.process),
-				encode(&peer.desktop_name)
+				"peer {} {} {}",
+				identity_fields(&peer.placement.process),
+				encode(&peer.placement.desktop_name),
+				encode(&peer.label)
 			));
 		}
 		extra.extend(guards);
@@ -156,7 +166,14 @@ try {
     [void][Reflection.Assembly]::LoadFrom($assembly)
     [Console]::Out.Write([CarbonStudioDesktop.Helper]::Run('__PLAN__'))
 } catch {
-    [Console]::Error.Write($_.Exception.GetBaseException().Message)
+    # PowerShell wraps exceptions thrown by .NET methods; report the helper's
+    # own message, which already carries its context, rather than the innermost
+    # cause, which can name a sibling Studio without saying so.
+    $exception = $_.Exception
+    while (($exception -is [Management.Automation.MethodInvocationException] -or $exception -is [Reflection.TargetInvocationException]) -and $null -ne $exception.InnerException) {
+        $exception = $exception.InnerException
+    }
+    [Console]::Error.Write($exception.Message)
     exit 1
 }
 "#
@@ -234,9 +251,12 @@ mod tests {
 	#[test]
 	fn focus_helper_plan_encodes_every_free_form_value() {
 		let desktop = "Studios'); Stop-Process -Name RobloxStudioBeta; ('";
-		let peers = vec![StudioDesktopPlacement {
-			process: identity(102),
-			desktop_name: desktop.to_owned(),
+		let peers = vec![FocusPeer {
+			placement: StudioDesktopPlacement {
+				process: identity(102),
+				desktop_name: desktop.to_owned(),
+			},
+			label: "port 8004 (worktree /tmp/o'neil)".to_owned(),
 		}];
 		let plan = focus_plan(
 			&identity(101),
@@ -250,10 +270,12 @@ mod tests {
 		assert!(plan.contains("route 1"));
 		assert!(plan.contains("target 101 133700000101 "));
 		assert!(plan.contains(&format!(
-			"peer 102 133700000102 {} {}",
+			"peer 102 133700000102 {} {} {}",
 			encode(&identity(102).studio_executable),
-			encode(desktop)
+			encode(desktop),
+			encode("port 8004 (worktree /tmp/o'neil)")
 		)));
+		assert!(!plan.contains("o'neil"));
 		assert!(!plan.contains("Roblox's Studio"));
 		assert!(!plan.contains(desktop));
 
@@ -275,7 +297,8 @@ mod tests {
 		assert!(script.contains("if (-not [IO.File]::Exists($assembly))"));
 		assert!(script.contains("-OutputAssembly $temporary"));
 		assert!(script.contains("[Reflection.Assembly]::LoadFrom($assembly)"));
-		assert!(script.contains("GetBaseException().Message"));
+		assert!(script.contains("MethodInvocationException"));
+		assert!(!script.contains("GetBaseException"));
 		assert!(!script.contains("o'neil"));
 		assert!(script.contains(&encode("mode probe")));
 	}
@@ -310,5 +333,15 @@ mod tests {
 		}
 		let report = run(&plan_text("probe", None, &[])).unwrap();
 		assert_eq!(report.trim(), r#"{"protocol":1}"#);
+	}
+
+	#[test]
+	fn focus_helper_reports_its_own_error_message() {
+		#[cfg(target_os = "linux")]
+		if std::env::var_os("WSL_DISTRO_NAME").is_none() {
+			return;
+		}
+		let error = run(&plan_text("bogus", None, &[])).unwrap_err();
+		assert_eq!(error.to_string(), "unknown Studio desktop helper mode 'bogus'");
 	}
 }
