@@ -2904,6 +2904,7 @@ fn strip_matching_mcp_place_id(value: &mut Variant, marker: &str) -> Result<bool
 struct ProjectSourceCandidate {
 	snapshot: snapshot::Snapshot,
 	routes: Vec<Vec<String>>,
+	anchor_routes: Vec<Vec<String>>,
 	watch_roots: Vec<PathBuf>,
 	generation: String,
 }
@@ -2914,7 +2915,12 @@ fn read_project_candidate(
 	previous_projected: &snapshot::Snapshot,
 	mapped_refs: &HashSet<Ref>,
 ) -> std::result::Result<ProjectSourceCandidate, String> {
-	let (snapshot, routes, watch_roots) = project::reevaluate_projected_frozen_tracked(
+	let project::ProjectedReevaluation {
+		snapshot,
+		barrier_routes: routes,
+		anchor_routes,
+		watch_roots,
+	} = project::reevaluate_projected_frozen_tracked(
 		project_path,
 		frozen_project_document,
 		previous_projected,
@@ -2926,6 +2932,7 @@ fn read_project_candidate(
 	Ok(ProjectSourceCandidate {
 		snapshot,
 		routes,
+		anchor_routes,
 		watch_roots,
 		generation: blake3::hash(&encoded).to_hex().to_string(),
 	})
@@ -3197,7 +3204,12 @@ fn watch_project_source(
 					continue;
 				}
 			};
-			let routing_refs = match project::routing_refs(&candidate_tree, &mapped_roots) {
+			let routing_refs = match project::routing_refs(
+				&candidate_tree,
+				&mapped_refs,
+				&mapped_roots,
+				&candidate.anchor_routes,
+			) {
 				Ok(routing) => routing,
 				Err(error) => {
 					log::error!("Project source has an invalid engine route: {error:#}");

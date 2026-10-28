@@ -616,10 +616,12 @@ fn materialize_for_build(project_path: &Path, exact_generation: bool) -> Result<
 	let Evaluation {
 		snapshot,
 		barrier_routes,
+		anchor_routes,
 		mapped_traversal,
 		..
 	} = evaluation;
-	let (mapped_refs, mapped_roots, routing_refs) = snapshot_refs_for_routes(&snapshot, &barrier_routes)?;
+	let (mapped_refs, mapped_roots, routing_refs) =
+		snapshot_refs_for_routes(&snapshot, &barrier_routes, &anchor_routes)?;
 	validate_no_cross_domain_references(&snapshot, &mapped_refs)?;
 	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs, &mapped_roots);
 	let tree = Tree::new(snapshot);
@@ -1313,6 +1315,7 @@ fn materialize_mode(project_path: &Path, allow_transitions: bool) -> Result<Mate
 	let Evaluation {
 		snapshot,
 		barrier_routes,
+		anchor_routes,
 		mapped_traversal,
 		..
 	} = evaluation;
@@ -1323,7 +1326,7 @@ fn materialize_mode(project_path: &Path, allow_transitions: bool) -> Result<Mate
 		.context("failed to stage composed hybrid source")?;
 	let route_tree = artifact_store::load_tree(&manifest_path)?.tree;
 	let (mapped_refs, mapped_roots) = refs_for_routes(&route_tree, &barrier_routes)?;
-	let routing_refs = routing_refs(&route_tree, &mapped_roots)?;
+	let routing_refs = routing_refs(&route_tree, &mapped_refs, &mapped_roots, &anchor_routes)?;
 	validate_no_cross_domain_references(&snapshot, &mapped_refs)?;
 	let identity_exclusions = managed_build_identity_exclusions(&snapshot, &mapped_refs, &mapped_roots);
 	let mapped_watch_roots = mapped_traversal.watch_roots.into_iter().collect();
@@ -2336,9 +2339,16 @@ pub(crate) fn reevaluate_projected_frozen(
 	previous_projected: &Snapshot,
 	mapped_refs: &HashSet<Ref>,
 ) -> Result<(Snapshot, Vec<Vec<String>>)> {
-	let (snapshot, routes, _) =
+	let reevaluation =
 		reevaluate_projected_frozen_tracked(project_path, frozen_project_document, previous_projected, mapped_refs)?;
-	Ok((snapshot, routes))
+	Ok((reevaluation.snapshot, reevaluation.barrier_routes))
+}
+
+pub(crate) struct ProjectedReevaluation {
+	pub snapshot: Snapshot,
+	pub barrier_routes: Vec<Vec<String>>,
+	pub anchor_routes: Vec<Vec<String>>,
+	pub watch_roots: Vec<PathBuf>,
 }
 
 pub(crate) fn reevaluate_projected_frozen_tracked(
@@ -2346,7 +2356,7 @@ pub(crate) fn reevaluate_projected_frozen_tracked(
 	frozen_project_document: &[u8],
 	previous_projected: &Snapshot,
 	mapped_refs: &HashSet<Ref>,
-) -> Result<(Snapshot, Vec<Vec<String>>, Vec<PathBuf>)> {
+) -> Result<ProjectedReevaluation> {
 	fn prune_mapped(mut snapshot: Snapshot, mapped_refs: &HashSet<Ref>) -> Result<Snapshot> {
 		let children = std::mem::take(&mut snapshot.children);
 		let mut retained = Vec::with_capacity(children.len());
@@ -2364,11 +2374,12 @@ pub(crate) fn reevaluate_projected_frozen_tracked(
 	let studio_snapshot = prune_mapped(previous_projected.clone(), mapped_refs)?;
 	let mut evaluation = Evaluation::new(project_path, &project, studio_snapshot, true)?;
 	evaluation.apply()?;
-	Ok((
-		evaluation.snapshot,
-		evaluation.barrier_routes,
-		evaluation.mapped_traversal.watch_roots.into_iter().collect(),
-	))
+	Ok(ProjectedReevaluation {
+		snapshot: evaluation.snapshot,
+		barrier_routes: evaluation.barrier_routes,
+		anchor_routes: evaluation.anchor_routes,
+		watch_roots: evaluation.mapped_traversal.watch_roots.into_iter().collect(),
+	})
 }
 
 #[derive(Debug, Default)]
@@ -2808,6 +2819,10 @@ struct Evaluation<'a> {
 	project: &'a Project,
 	snapshot: Snapshot,
 	barrier_routes: Vec<Vec<String>>,
+	/// Every engine anchor the project names, mapped or not. Anchors are part
+	/// of the serve projection so re-evaluation joins them instead of creating
+	/// them again; they are never ownership barriers.
+	anchor_routes: Vec<Vec<String>>,
 	explicit_ids: HashMap<String, String>,
 	mapped_traversal: MappedTraversal,
 	allow_transitions: bool,
@@ -2824,6 +2839,7 @@ impl<'a> Evaluation<'a> {
 			project,
 			snapshot,
 			barrier_routes: Vec::new(),
+			anchor_routes: Vec::new(),
 			explicit_ids: HashMap::new(),
 			mapped_traversal: MappedTraversal::default(),
 			allow_transitions,
@@ -2857,6 +2873,7 @@ impl<'a> Evaluation<'a> {
 				self.project_path,
 				self.allow_transitions,
 				&mut self.barrier_routes,
+				&mut self.anchor_routes,
 				&mut self.explicit_ids,
 				&mut self.mapped_traversal,
 				anchor,
@@ -2876,6 +2893,7 @@ impl<'a> Evaluation<'a> {
 		project_path: &Path,
 		_allow_transitions: bool,
 		barrier_routes: &mut Vec<Vec<String>>,
+		anchor_routes: &mut Vec<Vec<String>>,
 		explicit_ids: &mut HashMap<String, String>,
 		mapped_traversal: &mut MappedTraversal,
 		anchor: &mut Snapshot,
@@ -2890,6 +2908,7 @@ impl<'a> Evaluation<'a> {
 			route.join(".")
 		);
 		apply_node_metadata(anchor, node, anchor.class.as_str(), explicit_ids)?;
+		anchor_routes.push(route.clone());
 		if let Some(relative) = &node.path {
 			let path = resolve_mapped_path(root, relative)?;
 			ensure!(
@@ -2915,6 +2934,7 @@ impl<'a> Evaluation<'a> {
 					project_path,
 					_allow_transitions,
 					barrier_routes,
+					anchor_routes,
 					explicit_ids,
 					mapped_traversal,
 					child,
@@ -6138,12 +6158,24 @@ fn remove_route(snapshot: &mut Snapshot, route: &[String]) -> Result<()> {
 fn snapshot_refs_for_routes(
 	snapshot: &Snapshot,
 	routes: &[Vec<String>],
+	anchors: &[Vec<String>],
 ) -> Result<(HashSet<Ref>, Vec<Ref>, HashSet<Ref>)> {
 	fn collect(snapshot: &Snapshot, refs: &mut HashSet<Ref>) {
 		refs.insert(snapshot.id);
 		for child in &snapshot.children {
 			collect(child, refs);
 		}
+	}
+	fn resolve<'a>(snapshot: &'a Snapshot, route: &[String]) -> Result<&'a Snapshot> {
+		let mut node = snapshot;
+		for component in route {
+			node = node
+				.children
+				.iter()
+				.find(|child| child.name == *component)
+				.with_context(|| format!("composed route {} is missing", route.join(".")))?;
+		}
+		Ok(node)
 	}
 
 	let mut refs = HashSet::new();
@@ -6164,29 +6196,50 @@ fn snapshot_refs_for_routes(
 		roots.push(node.id);
 		collect(node, &mut refs);
 	}
+	for route in anchors {
+		let id = resolve(snapshot, route)?.id;
+		if !refs.contains(&id) {
+			routing.insert(id);
+		}
+	}
 	Ok((refs, roots, routing))
+}
+
+fn resolve_route(tree: &Tree, route: &[String]) -> Result<Ref> {
+	let mut id = tree.root_ref();
+	for component in route {
+		let node = tree.get_instance(id).context("composed route parent is missing")?;
+		id = *node
+			.children()
+			.iter()
+			.find(|child| tree.get_instance(**child).is_some_and(|node| node.name == *component))
+			.with_context(|| format!("composed mapping route {} is missing", route.join(".")))?;
+	}
+	Ok(id)
 }
 
 pub(crate) fn refs_for_routes(tree: &Tree, routes: &[Vec<String>]) -> Result<(HashSet<Ref>, Vec<Ref>)> {
 	let mut refs = HashSet::new();
 	let mut roots = Vec::new();
 	for route in routes {
-		let mut id = tree.root_ref();
-		for component in route {
-			let node = tree.get_instance(id).context("composed route parent is missing")?;
-			id = *node
-				.children()
-				.iter()
-				.find(|child| tree.get_instance(**child).is_some_and(|node| node.name == *component))
-				.with_context(|| format!("composed mapping route {} is missing", route.join(".")))?;
-		}
+		let id = resolve_route(tree, route)?;
 		roots.push(id);
 		refs.extend(tree.subtree_refs(id)?);
 	}
 	Ok((refs, roots))
 }
 
-pub(crate) fn routing_refs(tree: &Tree, roots: &[Ref]) -> Result<HashSet<Ref>> {
+/// Engine route identities that are projected for a serve session: every
+/// ancestor of a mapped root plus every engine anchor the project names. A
+/// properties-only anchor such as `Lighting` must be projected, or source
+/// re-evaluation would create it again as an addition. Anchors inside a
+/// filesystem-owned subtree remain mapped, never routing.
+pub(crate) fn routing_refs(
+	tree: &Tree,
+	mapped_refs: &HashSet<Ref>,
+	roots: &[Ref],
+	anchors: &[Vec<String>],
+) -> Result<HashSet<Ref>> {
 	let mut result = HashSet::new();
 	for root in roots {
 		let mut current = tree.get_instance(*root).context("mapped root is missing")?.parent();
@@ -6196,6 +6249,12 @@ pub(crate) fn routing_refs(tree: &Tree, roots: &[Ref]) -> Result<HashSet<Ref>> {
 				.get_instance(current)
 				.context("mapping route ancestor is missing")?
 				.parent();
+		}
+	}
+	for route in anchors {
+		let id = resolve_route(tree, route)?;
+		if !mapped_refs.contains(&id) {
+			result.insert(id);
 		}
 	}
 	Ok(result)
@@ -8277,6 +8336,70 @@ mod tests {
 		}
 		assert!(!changed.contains(&opaque));
 		assert!(changed.iter().all(|id| allowed.contains(id)));
+
+		fs::remove_dir_all(materialized.directory).unwrap();
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn projected_watcher_edit_keeps_properties_only_engine_anchor_in_projection() {
+		fn find_named<'a>(snapshot: &'a Snapshot, name: &str) -> Option<&'a Snapshot> {
+			snapshot.children.iter().find(|child| child.name == name)
+		}
+
+		let root = temp("projected-watcher-properties-only-anchor");
+		fs::create_dir_all(&root).unwrap();
+		let project_path = root.join("game.carbon.json");
+		initialize(&project_path, "Game".to_owned()).unwrap();
+		let mut value: Value = serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+		value["tree"]["Lighting"] = serde_json::json!({
+			"$properties": {
+				"Technology": "Future",
+				"LightingStyle": "Realistic",
+				"PrioritizeLightingQuality": true
+			}
+		});
+		write_json(&project_path, &value).unwrap();
+		install_data_store(&project_path, &empty_studio_snapshot(), "Game").unwrap();
+
+		let materialized = materialize_for_capture(&project_path).unwrap();
+		let policy = live_policy(&project_path, &materialized);
+		let mut projected =
+			artifact_store::load_projected_live(&materialized.manifest_path, &policy.mapped_refs, &policy.routing_refs)
+				.unwrap();
+		let previous = snapshot_from_tree(&projected.tree).unwrap();
+		let lighting =
+			find_named(&previous, "Lighting").expect("properties-only anchor is missing from the projection");
+		assert_eq!(
+			lighting.properties.get(&Ustr::from("PrioritizeLightingQuality")),
+			Some(&Variant::Bool(true)),
+			"properties-only anchor lost its authored properties"
+		);
+
+		fs::write(
+			root.join("src/ServerScriptService/Server.server.luau"),
+			"print('projected watcher edit')\n",
+		)
+		.unwrap();
+		let frozen = frozen_project_document(&project_path).unwrap();
+		let (candidate, _) =
+			reevaluate_projected_frozen(&project_path, &frozen, &previous, &policy.mapped_refs).unwrap();
+		let changes = diff_snapshots(&previous, &candidate).unwrap();
+		assert!(
+			changes.additions.is_empty(),
+			"a source edit re-added a properties-only engine anchor: {:?}",
+			changes
+				.additions
+				.iter()
+				.map(|addition| (&addition.name, addition.id))
+				.collect::<Vec<_>>()
+		);
+		assert!(changes.removals.is_empty());
+		assert!(!changes.updates.is_empty(), "the source edit was not observed");
+		projected
+			.store
+			.apply(&mut projected.tree, changes)
+			.expect("the source edit could not be committed");
 
 		fs::remove_dir_all(materialized.directory).unwrap();
 		fs::remove_dir_all(root).unwrap();
